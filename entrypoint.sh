@@ -204,19 +204,33 @@ fi
 # 2. 强力洗白与内核兼容性处理 (防正则误杀版)
 # ==========================================
 
-# 1. 智能提取出纯 IPv4 地址 (防止 wgcf v2.2.30 将双栈 IP 写在同一行导致误杀)
+# 1. 提取 IPv4 / IPv6 地址，并根据环境变量决定路由栈
+WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 IPV4_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
+IPV6_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+/[0-9]{1,3}' | head -n 1)
 
 # 2. 物理删除所有原始的 Address, AllowedIPs, DNS，防止 RTNETLINK 崩溃或 DNS 死锁
 sed -i '/^Address/d' "$WG_CONF"
 sed -i '/^AllowedIPs/d' "$WG_CONF"
 sed -i '/^DNS.*/d' "$WG_CONF"
 
-# 3. 重建最纯净的 IPv4 路由规则
-if [ -n "$IPV4_ADDR" ]; then
-    sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
-fi
-sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
+# 3. 重建路由规则，默认双栈并偏向 IPv6
+case "$WARP_STACK_MODE" in
+    ipv4-only)
+        [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
+        ;;
+    ipv6-only)
+        [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
+        ;;
+    ipv6-preferred|dual|*)
+        [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR" "$WG_CONF"
+        [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
+        ;;
+esac
 
 # 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
 sed -i '/src_valid_mark/d' /usr/bin/wg-quick
@@ -240,6 +254,10 @@ if [ -n "$ENDPOINT_IP" ]; then
 fi
 
 print_warp_identity_summary
+if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
+    echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
+    echo "==> [MicroWARP] 已启用 IPv6 优先地址选择策略"
+fi
 
 # ==========================================
 # 3. 拉起内核网卡
