@@ -15,7 +15,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner != 'ccbkkb' && format('{0}/microwarp-fork', github.repository_owner) || github.repository }}
+  IMAGE_NAME: ${{ github.repository_owner != 'ccbkkb' && format('{0}/microwarp-fork-{1}', github.repository_owner, github.event.repository.id) || github.repository }}
 
 jobs:
   build-and-push:
