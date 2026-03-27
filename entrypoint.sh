@@ -152,22 +152,34 @@ ensure_trace_ip() {
     done
 }
 
-ensure_grok_http_ready() {
+check_test_urls() {
+    TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
+    TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+    [ -n "$TEST_URLS_LIST" ] || return 0
+
+    printf '%s\n' "$TEST_URLS_LIST" | while IFS= read -r TEST_URL; do
+        [ -n "$TEST_URL" ] || continue
+        TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
+        echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+
+        case "$TEST_HTTP_CODE" in
+            4*|5*|000|"")
+                return 1
+                ;;
+        esac
+    done
+}
+
+ensure_test_urls_ready() {
     while true; do
         ensure_trace_ip || return 1
 
-        GROK_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 https://grok.com || true)
-        echo "==> [MicroWARP] grok.com HTTP 状态码: ${GROK_HTTP_CODE}"
+        if check_test_urls; then
+            return 0
+        fi
 
-        case "$GROK_HTTP_CODE" in
-            4*|5*|000|"")
-                echo "==> [MicroWARP] grok.com 返回错误状态，正在重新注册并重试..."
-                restart_warp_with_new_identity
-                ;;
-            *)
-                return 0
-                ;;
-        esac
+        echo "==> [MicroWARP] 存在测试 URL 未通过，正在重新注册并重试..."
+        restart_warp_with_new_identity
     done
 }
 
@@ -229,7 +241,7 @@ print_warp_identity_summary
 # 3. 拉起内核网卡
 # ==========================================
 start_warp_interface
-ensure_grok_http_ready
+ensure_test_urls_ready
 
 # ==========================================
 # 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)

@@ -90,6 +90,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP, or a comma/semicolon-separated candidate list
       - GH_PROXY=https://github.ednovas.xyz # Prefix only the wgcf binary download URL
       - ROTATE_IP_ON_START=1 # Re-register a fresh WARP device on every container start to refresh the egress IP (default: 0)
+      - TEST_URLS=https://grok.com,https://example.com # Comma/semicolon-separated URLs; all must avoid 4xx/5xx before startup succeeds
 ```
 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
@@ -176,6 +177,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - SOCKS_PASS=123456     # SOCKS5 认证密码
       - GH_PROXY=https://github.ednovas.xyz # 仅代理 wgcf 二进制下载地址，不代理 GitHub API 版本查询
       - ROTATE_IP_ON_START=1 # 每次容器启动时重新注册 WARP 设备并刷新出口 IP (默认: 0)
+      - TEST_URLS=https://grok.com,https://example.com # 逗号/分号分隔的测试 URL；必须全部不返回 4xx/5xx 才算通过
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
