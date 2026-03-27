@@ -84,6 +84,65 @@ generate_warp_config() {
     echo "==> [MicroWARP] 节点配置生成成功！"
 }
 
+start_warp_interface() {
+    PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
+    PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
+    PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
+
+    echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
+    wg-quick up wg0 > /dev/null 2>&1
+
+    TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
+    if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
+        if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
+            echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+        fi
+    fi
+}
+
+restart_warp_with_new_identity() {
+    wg-quick down wg0 > /dev/null 2>&1 || true
+    generate_warp_config
+
+    if [ -n "$ENDPOINT_IP" ]; then
+        if pick_endpoint_ip; then
+            echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
+            sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP_SELECTED/g" "$WG_CONF"
+        else
+            echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
+            sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
+        fi
+    fi
+
+    print_warp_identity_summary
+    start_warp_interface
+}
+
+ensure_trace_ip() {
+    TRACE_ATTEMPTS=${TRACE_ATTEMPTS:-3}
+    ATTEMPT=1
+
+    while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
+        echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
+        TRACE_OUTPUT=$(curl -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
+        TRACE_IP=$(printf '%s\n' "$TRACE_OUTPUT" | grep '^ip=' || true)
+
+        if [ -n "$TRACE_IP" ]; then
+            printf '%s\n' "$TRACE_IP"
+            return 0
+        fi
+
+        if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
+            echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+            return 1
+        fi
+
+        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP，正在重新注册并重试..."
+        ATTEMPT=$((ATTEMPT + 1))
+        restart_warp_with_new_identity
+    done
+}
+
 # ==========================================
 # 1. 账号全自动申请与配置生成 (可选每次启动刷新设备身份)
 # ==========================================
@@ -141,25 +200,8 @@ print_warp_identity_summary
 # ==========================================
 # 3. 拉起内核网卡
 # ==========================================
-# 在启用 WARP 前记录 100.64.0.0/10 的原始回程路径，避免发布端口后 Tailscale 客户端握手卡死
-PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
-PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
-PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
-
-echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-wg-quick up wg0 > /dev/null 2>&1
-
-# 仅在 WARP 启动前确实存在原始回程路径时恢复 100.64.0.0/10，减少对非 Tailscale 场景的影响
-TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
-if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
-    if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
-        echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
-    fi
-fi
-
-echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-# 获取最新的 CF 溯源 IP (加入 5 秒强制超时，完美替代有缺陷的 & 后台执行)
-curl -s -m 5 https://1.1.1.1/cdn-cgi/trace | grep ip= || echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+start_warp_interface
+ensure_trace_ip
 
 # ==========================================
 # 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
