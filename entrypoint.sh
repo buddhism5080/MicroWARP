@@ -29,6 +29,33 @@ is_enabled() {
     esac
 }
 
+print_warp_identity_summary() {
+    PRIVATE_KEY=$(awk -F ' = ' '/^PrivateKey = / {print $2; exit}' "$WG_CONF")
+    IPV4_ADDRESS=$(awk -F ' = ' '/^Address = / && $2 ~ /^[0-9]/ {print $2; exit}' "$WG_CONF")
+    IPV6_ADDRESS=$(awk -F ' = ' '/^Address = / && $2 ~ /:/ {print $2; exit}' "$WG_CONF")
+    ENDPOINT=$(awk -F ' = ' '/^Endpoint = / {print $2; exit}' "$WG_CONF")
+    PUBKEY_FINGERPRINT=$(printf '%s' "$PRIVATE_KEY" | sha256sum | awk '{print substr($1,1,16)}')
+
+    echo "==> [MicroWARP] WARP 设备身份摘要:"
+    echo "==> [MicroWARP]   PrivateKey SHA256/16: ${PUBKEY_FINGERPRINT}"
+    [ -n "$IPV4_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv4: ${IPV4_ADDRESS}"
+    [ -n "$IPV6_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv6: ${IPV6_ADDRESS}"
+    [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
+}
+
+pick_endpoint_ip() {
+    CLEAN_ENDPOINTS=$(printf '%s' "$ENDPOINT_IP" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+    [ -z "$CLEAN_ENDPOINTS" ] && return 1
+
+    ENDPOINT_COUNT=$(printf '%s\n' "$CLEAN_ENDPOINTS" | wc -l | tr -d ' ')
+    SELECTED_INDEX=$(( ($(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ') % ENDPOINT_COUNT) + 1 ))
+    SELECTED_ENDPOINT=$(printf '%s\n' "$CLEAN_ENDPOINTS" | sed -n "${SELECTED_INDEX}p")
+    [ -n "$SELECTED_ENDPOINT" ] || return 1
+
+    ENDPOINT_IP_SELECTED="$SELECTED_ENDPOINT"
+    return 0
+}
+
 generate_warp_config() {
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -100,9 +127,16 @@ fi
 
 # 【新增：防阻断绝杀】针对 HK/US 强校验机房，注入自定义优选 Endpoint IP
 if [ -n "$ENDPOINT_IP" ]; then
-    echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
-    sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
+    if pick_endpoint_ip; then
+        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
+        sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP_SELECTED/g" "$WG_CONF"
+    else
+        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
+        sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
+    fi
 fi
+
+print_warp_identity_summary
 
 # ==========================================
 # 3. 拉起内核网卡

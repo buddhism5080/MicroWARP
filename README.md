@@ -87,7 +87,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - BIND_PORT=1080        # Custom SOCKS5 port (default: 1080)
       - SOCKS_USER=admin      # Enable authentication (leave empty for no auth)
       - SOCKS_PASS=123456     # Auth password
-      - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP (Bypass regional blocks)
+      - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP, or a comma/semicolon-separated candidate list
       - GH_PROXY=https://github.ednovas.xyz # Prefix only the wgcf binary download URL
       - ROTATE_IP_ON_START=1 # Re-register a fresh WARP device on every container start to refresh the egress IP (default: 0)
 ```
@@ -95,6 +95,8 @@ MicroWARP supports powerful environment variables to customize your setup while 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
 
 *(If `ROTATE_IP_ON_START=1`, MicroWARP will overwrite the persisted `wg0.conf` on each container start by registering a fresh WARP device. Leave it off if you prefer a stable device identity and fewer rate-limit risks.)*
+
+*(Startup logs now print a short WARP identity summary, including a private-key fingerprint, interface addresses, and the selected peer endpoint. If you pass multiple endpoints in `ENDPOINT_IP`, separated by commas or semicolons, MicroWARP will randomly pick one on each start.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -177,9 +179,12 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
+      - ENDPOINT_IP=162.159.193.10:2408,188.114.98.7:2408 # 也可以传多个候选，启动时随机选择一个
 ```
 
 > 如果启用 `ROTATE_IP_ON_START=1`，MicroWARP 会在每次容器启动时重新注册一个新的 WARP 设备，并覆盖持久化卷里的 `wg0.conf`。如果你更在意设备身份稳定和降低限频/风控概率，就保持默认关闭。
+>
+> 现在启动日志还会打印一份简短的身份摘要，包括私钥指纹、接口地址和最终采用的 Peer Endpoint，方便你确认“设备身份是否真的变了”。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 
