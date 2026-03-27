@@ -14,6 +14,26 @@ build_wgcf_download_url() {
     echo "$RAW_URL"
 }
 
+prepare_wgcf_binary() {
+    if [ -x ./wgcf ]; then
+        return 0
+    fi
+
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) WGCF_ARCH="amd64" ;;
+        aarch64) WGCF_ARCH="arm64" ;;
+        *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
+    esac
+
+    WGCF_VER=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
+    echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
+
+    rm -f wgcf
+    wget --timeout=15 -qO wgcf "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
+    chmod +x wgcf
+}
+
 if [ "${MICROWARP_TEST_MODE:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -57,19 +77,8 @@ pick_endpoint_ip() {
 }
 
 generate_warp_config() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) WGCF_ARCH="amd64" ;;
-        aarch64) WGCF_ARCH="arm64" ;;
-        *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
-    esac
-
-    WGCF_VER=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
-    echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
-
-    rm -f wgcf wgcf-account.toml wgcf-profile.conf
-    wget --timeout=15 -qO wgcf "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
-    chmod +x wgcf
+    prepare_wgcf_binary
+    rm -f wgcf-account.toml wgcf-profile.conf
 
     echo "==> [MicroWARP] 正在向 CF 注册新设备..."
     ./wgcf register --accept-tos > /dev/null
@@ -79,8 +88,8 @@ generate_warp_config() {
 
     mv -f wgcf-profile.conf "$WG_CONF"
 
-    # 【核心安全】阅后即焚：删除注册工具和生成的账号明文文件
-    rm -f wgcf wgcf-account.toml wgcf-profile.conf
+    # 【核心安全】阅后即焚：删除生成的账号明文文件
+    rm -f wgcf-account.toml wgcf-profile.conf
     echo "==> [MicroWARP] 节点配置生成成功！"
 }
 
