@@ -161,17 +161,24 @@ check_test_urls() {
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
     [ -n "$TEST_URLS_LIST" ] || return 0
 
-    printf '%s\n' "$TEST_URLS_LIST" | while IFS= read -r TEST_URL; do
+    OLD_IFS=$IFS
+    IFS='
+'
+    for TEST_URL in $TEST_URLS_LIST; do
         [ -n "$TEST_URL" ] || continue
         TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
         echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
         case "$TEST_HTTP_CODE" in
             4*|5*|000|"")
+                IFS=$OLD_IFS
                 return 1
                 ;;
         esac
     done
+
+    IFS=$OLD_IFS
+    return 0
 }
 
 ensure_test_urls_ready() {
@@ -184,6 +191,24 @@ ensure_test_urls_ready() {
 
         echo "==> [MicroWARP] 存在测试 URL 未通过，正在重新注册并重试..."
         restart_warp_with_new_identity
+    done
+}
+
+periodic_test_url_monitor() {
+    while true; do
+        sleep 900
+        echo "==> [MicroWARP] 正在执行 15 分钟 TEST_URLS 巡检..."
+
+        if check_test_urls; then
+            echo "==> [MicroWARP] 15 分钟 TEST_URLS 巡检通过"
+            continue
+        fi
+
+        echo "==> [MicroWARP] TEST_URLS 巡检未通过，正在重新注册并恢复..."
+        while ! ensure_test_urls_ready; do
+            echo "==> [MicroWARP] 恢复流程未完成，60 秒后继续重试..."
+            sleep 60
+        done
     done
 }
 
@@ -264,6 +289,7 @@ fi
 # ==========================================
 start_warp_interface
 ensure_test_urls_ready
+periodic_test_url_monitor &
 
 # ==========================================
 # 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
