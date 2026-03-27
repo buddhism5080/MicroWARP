@@ -133,11 +133,15 @@ ensure_trace_ip() {
 
     while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
         echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-        TRACE_OUTPUT=$(curl -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
-        TRACE_IP=$(printf '%s\n' "$TRACE_OUTPUT" | grep '^ip=' || true)
+        TRACE_OUTPUT_V4=$(curl -4 -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
+        TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
+        TRACE_OUTPUT_V6=$(curl -6 -s -m 5 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
+        TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
 
-        if [ -n "$TRACE_IP" ]; then
-            printf '%s\n' "$TRACE_IP"
+        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
+        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
+
+        if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
             return 0
         fi
 
