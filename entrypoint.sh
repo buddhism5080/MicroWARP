@@ -143,6 +143,25 @@ ensure_trace_ip() {
     done
 }
 
+ensure_grok_http_ready() {
+    while true; do
+        ensure_trace_ip || return 1
+
+        GROK_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 https://grok.com || true)
+        echo "==> [MicroWARP] grok.com HTTP 状态码: ${GROK_HTTP_CODE}"
+
+        case "$GROK_HTTP_CODE" in
+            4*|5*|000|"")
+                echo "==> [MicroWARP] grok.com 返回错误状态，正在重新注册并重试..."
+                restart_warp_with_new_identity
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+}
+
 # ==========================================
 # 1. 账号全自动申请与配置生成 (可选每次启动刷新设备身份)
 # ==========================================
@@ -201,7 +220,7 @@ print_warp_identity_summary
 # 3. 拉起内核网卡
 # ==========================================
 start_warp_interface
-ensure_trace_ip
+ensure_grok_http_ready
 
 # ==========================================
 # 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
