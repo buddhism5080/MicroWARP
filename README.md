@@ -65,6 +65,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
       - warp-data:/etc/wireguard # Keep account data to avoid rate limits
+    environment:
+      - ROTATE_IP_ON_START=0 # Set to 1 to refresh the WARP exit IP on each container start
 
 volumes:
   warp-data:
@@ -87,9 +89,12 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - SOCKS_PASS=123456     # Auth password
       - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP (Bypass regional blocks)
       - GH_PROXY=https://github.ednovas.xyz # Prefix only the wgcf binary download URL
+      - ROTATE_IP_ON_START=1 # Re-register a fresh WARP device on every container start to refresh the egress IP (default: 0)
 ```
 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
+
+*(If `ROTATE_IP_ON_START=1`, MicroWARP will overwrite the persisted `wg0.conf` on each container start by registering a fresh WARP device. Leave it off if you prefer a stable device identity and fewer rate-limit risks.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -143,6 +148,8 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
       - warp-data:/etc/wireguard # 持久化保存账号凭证，防止重启触发风控
+    environment:
+      - ROTATE_IP_ON_START=0 # 改成 1 则每次容器启动时都刷新一次 WARP 出口 IP
 
 volumes:
   warp-data:
@@ -166,10 +173,13 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - SOCKS_USER=admin      # SOCKS5 认证用户名 (留空则为无密码模式)
       - SOCKS_PASS=123456     # SOCKS5 认证密码
       - GH_PROXY=https://github.ednovas.xyz # 仅代理 wgcf 二进制下载地址，不代理 GitHub API 版本查询
-      
+      - ROTATE_IP_ON_START=1 # 每次容器启动时重新注册 WARP 设备并刷新出口 IP (默认: 0)
+
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
 ```
+
+> 如果启用 `ROTATE_IP_ON_START=1`，MicroWARP 会在每次容器启动时重新注册一个新的 WARP 设备，并覆盖持久化卷里的 `wg0.conf`。如果你更在意设备身份稳定和降低限频/风控概率，就保持默认关闭。
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 

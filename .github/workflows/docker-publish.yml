@@ -6,13 +6,16 @@ name: Build and Publish MicroWARP
 # 2. 手动点击触发按钮 (方便随时测试打包)
 # ==========================================
 on:
+  push:
+    branches:
+      - '**'
   release:
     types: [published]
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository_owner }}/microwarp
 
 jobs:
   build-and-push:
@@ -47,12 +50,15 @@ jobs:
           tags: |
             # 1. 如果是打 Tag 发版，生成严格的版本号标签 (如 1.0.0)
             type=semver,pattern={{version}}
-            
-            # 2. 【核心隔离】仅当 Push 到 main/master，或发版时，才打 latest 标签！
+
+            # 2. 任何分支推送都生成对应分支标签，方便在 fork 上直接测试
+            type=ref,event=branch
+
+            # 3. 主分支或 Release 事件额外发布 latest 标签
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'release' }}
-            
-            # 3. 【新增分支】仅当 Push 到 dev 分支时，才打 dev 标签！(绝不污染 latest)
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+
+            # 4. 始终附带 commit sha 标签，方便精确回滚
+            type=sha,prefix=sha-
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5

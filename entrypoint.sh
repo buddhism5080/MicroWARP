@@ -19,14 +19,17 @@ if [ "${MICROWARP_TEST_MODE:-0}" = "1" ]; then
 fi
 
 WG_CONF="/etc/wireguard/wg0.conf"
+ROTATE_IP_ON_START="${ROTATE_IP_ON_START:-0}"
 mkdir -p /etc/wireguard
 
-# ==========================================
-# 1. 账号全自动申请与配置生成 (阅后即焚)
-# ==========================================
-if [ ! -f "$WG_CONF" ]; then
-    echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
+is_enabled() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
+generate_warp_config() {
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64) WGCF_ARCH="amd64" ;;
@@ -34,22 +37,35 @@ if [ ! -f "$WG_CONF" ]; then
         *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
     esac
 
-    WGCF_VER=$(curl -sL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
+    WGCF_VER=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
     echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
+
+    rm -f wgcf wgcf-account.toml wgcf-profile.conf
     wget --timeout=15 -qO wgcf "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
     chmod +x wgcf
 
-    echo "==> [MicroWARP] 正在向 CF 注册设备..."
+    echo "==> [MicroWARP] 正在向 CF 注册新设备..."
     ./wgcf register --accept-tos > /dev/null
 
     echo "==> [MicroWARP] 正在生成 WireGuard 配置文件..."
     ./wgcf generate > /dev/null
 
-    mv wgcf-profile.conf "$WG_CONF"
+    mv -f wgcf-profile.conf "$WG_CONF"
 
     # 【核心安全】阅后即焚：删除注册工具和生成的账号明文文件
-    rm -f wgcf wgcf-account.toml
+    rm -f wgcf wgcf-account.toml wgcf-profile.conf
     echo "==> [MicroWARP] 节点配置生成成功！"
+}
+
+# ==========================================
+# 1. 账号全自动申请与配置生成 (可选每次启动刷新设备身份)
+# ==========================================
+if [ ! -f "$WG_CONF" ]; then
+    echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
+    generate_warp_config
+elif is_enabled "$ROTATE_IP_ON_START"; then
+    echo "==> [MicroWARP] 检测到 ROTATE_IP_ON_START=${ROTATE_IP_ON_START}，正在重新注册 WARP 设备以刷新出口 IP..."
+    generate_warp_config
 else
     echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
 fi
