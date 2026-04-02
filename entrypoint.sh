@@ -57,40 +57,31 @@ generate_warp_config() {
         if curl --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
             "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$raw_conf"; then
 
-            # 去掉 CRLF，防止隐藏字符
             sed -i 's/\r$//' "$raw_conf"
 
-            # 基础校验
             if grep -q '^\[Interface\]' "$raw_conf" &&
                grep -q '^\[Peer\]' "$raw_conf" &&
                grep -q '^PrivateKey[[:space:]]*=' "$raw_conf" &&
                grep -q '^PublicKey[[:space:]]*=' "$raw_conf" &&
                grep -q '^Endpoint[[:space:]]*=' "$raw_conf"; then
 
-                PRIVATE_KEY=$(awk -F '[[:space:]]*=[[:space:]]*' '/^PrivateKey[[:space:]]*=/{print $2; exit}' "$raw_conf")
-                PUBLIC_KEY=$(awk -F '[[:space:]]*=[[:space:]]*' '/^PublicKey[[:space:]]*=/{print $2; exit}' "$raw_conf")
-                ENDPOINT=$(awk -F '[[:space:]]*=[[:space:]]*' '/^Endpoint[[:space:]]*=/{print $2; exit}' "$raw_conf")
-                MTU=$(awk -F '[[:space:]]*=[[:space:]]*' '/^MTU[[:space:]]*=/{print $2; exit}' "$raw_conf")
+                PRIVATE_KEY=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$raw_conf" | head -n1)
+                PUBLIC_KEY=$(sed -n 's/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*//p' "$raw_conf" | head -n1)
+                ENDPOINT=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$raw_conf" | head -n1)
+                MTU=$(sed -n 's/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*//p' "$raw_conf" | head -n1)
 
-                IPV4_ADDR=$(awk -F '[[:space:]]*=[[:space:]]*' '
-                    /^Address[[:space:]]*=/ {
-                        if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                            print $2; exit
-                        }
-                    }' "$raw_conf")
+                IPV4_ADDR=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$raw_conf" \
+                    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+                    | head -n1)
 
-                IPV6_ADDR=$(awk -F '[[:space:]]*=[[:space:]]*' '
-                    /^Address[[:space:]]*=/ {
-                        if ($2 ~ /:/) {
-                            print $2; exit
-                        }
-                    }' "$raw_conf")
+                IPV6_ADDR=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$raw_conf" \
+                    | grep ':' \
+                    | head -n1)
 
                 [ -n "$PRIVATE_KEY" ] || { echo "==> [ERROR] PrivateKey 提取失败"; rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
                 [ -n "$PUBLIC_KEY" ]  || { echo "==> [ERROR] PublicKey 提取失败";  rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
                 [ -n "$ENDPOINT" ]    || { echo "==> [ERROR] Endpoint 提取失败";   rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
 
-                # 自定义 Endpoint 覆盖
                 if [ -n "$ENDPOINT_IP" ]; then
                     if pick_endpoint_ip; then
                         echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
