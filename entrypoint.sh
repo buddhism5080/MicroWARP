@@ -289,11 +289,6 @@ else
     echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
 fi
 
-# ==========================================
-# 2. 强力洗白（每次启动都执行，确保格式一致）
-# ==========================================
-wash_warp_config
-
 print_warp_identity_summary
 if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
