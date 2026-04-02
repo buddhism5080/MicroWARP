@@ -91,8 +91,90 @@ restart_warp_with_new_identity() {
     start_warp_interface
 }
 
-# ...（ensure_trace_ip、check_test_urls、ensure_test_urls_ready、periodic_test_url_monitor 保持完全不变）...
-# （下面这四个函数我就不重复贴了，你原来的保持原样即可）
+ensure_trace_ip() {
+    TRACE_ATTEMPTS=${TRACE_ATTEMPTS:-3}
+    ATTEMPT=1
+
+    while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
+        echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
+        TRACE_OUTPUT_V4=$(curl -4 -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
+        TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
+        TRACE_OUTPUT_V6=$(curl -6 -s -m 5 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
+        TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
+
+        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
+        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
+
+        if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
+            return 0
+        fi
+
+        if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
+            echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+            return 1
+        fi
+
+        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP，正在重新注册并重试..."
+        ATTEMPT=$((ATTEMPT + 1))
+        restart_warp_with_new_identity
+    done
+}
+
+check_test_urls() {
+    TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
+    TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+    [ -n "$TEST_URLS_LIST" ] || return 0
+
+    OLD_IFS=$IFS
+    IFS='
+'
+    for TEST_URL in $TEST_URLS_LIST; do
+        [ -n "$TEST_URL" ] || continue
+        TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
+        echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+
+        case "$TEST_HTTP_CODE" in
+            4*|5*|000|"")
+                IFS=$OLD_IFS
+                return 1
+                ;;
+        esac
+    done
+
+    IFS=$OLD_IFS
+    return 0
+}
+
+ensure_test_urls_ready() {
+    while true; do
+        ensure_trace_ip || return 1
+
+        if check_test_urls; then
+            return 0
+        fi
+
+        echo "==> [MicroWARP] 存在测试 URL 未通过，正在重新注册并重试..."
+        restart_warp_with_new_identity
+    done
+}
+
+periodic_test_url_monitor() {
+    while true; do
+        sleep 900
+        echo "==> [MicroWARP] 正在执行 15 分钟 TEST_URLS 巡检..."
+
+        if check_test_urls; then
+            echo "==> [MicroWARP] 15 分钟 TEST_URLS 巡检通过"
+            continue
+        fi
+
+        echo "==> [MicroWARP] TEST_URLS 巡检未通过，正在重新注册并恢复..."
+        while ! ensure_test_urls_ready; do
+            echo "==> [MicroWARP] 恢复流程未完成，60 秒后继续重试..."
+            sleep 60
+        done
+    done
+}
 
 # ==========================================
 # 1. 账号全自动申请与配置生成
@@ -114,14 +196,63 @@ if [ -f "$WG_CONF" ] && ! (grep -q "^\[Interface\]" "$WG_CONF" && grep -q "Priva
 fi
 
 # ==========================================
-# 2. 强力洗白与内核兼容性处理（你原来的代码保持不变，从这里开始往下全部保留）
+# 2. 强力洗白与内核兼容性处理
 # ==========================================
-# 1. 提取 IPv4 / IPv6 地址...
-# （后面所有 sed、PersistentKeepalive、print_warp_identity_summary、gai.conf、start_warp_interface 等全部照旧）
 
-# ...（把你原来的第 2、3、4 部分完整复制粘贴在这里，我只在上面加了修复代码）
+# 1. 提取 IPv4 / IPv6 地址，并根据环境变量决定路由栈
+WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
+IPV4_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
+IPV6_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+/[0-9]{1,3}' | head -n 1)
 
-# 最终启动 SOCKS5 的部分也保持不变
+# 2. 物理删除所有原始的 Address, AllowedIPs, DNS，防止 RTNETLINK 崩溃或 DNS 死锁
+sed -i '/^Address/d' "$WG_CONF"
+sed -i '/^AllowedIPs/d' "$WG_CONF"
+sed -i '/^DNS.*/d' "$WG_CONF"
+
+# 3. 重建路由规则，默认双栈并偏向 IPv6
+case "$WARP_STACK_MODE" in
+    ipv4-only)
+        [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
+        ;;
+    ipv6-only)
+        [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
+        ;;
+    ipv6-preferred|dual|*)
+        [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR" "$WG_CONF"
+        [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
+        sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
+        ;;
+esac
+
+# 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
+sed -i '/src_valid_mark/d' /usr/bin/wg-quick
+
+# 【抗断流绝杀】强制注入 15 秒 UDP 心跳保活
+if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
+    sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
+else
+    sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$WG_CONF"
+fi
+
+print_warp_identity_summary
+if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
+    echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
+    echo "==> [MicroWARP] 已启用 IPv6 优先地址选择策略"
+fi
+
+# ==========================================
+# 3. 拉起内核网卡
+# ==========================================
+start_warp_interface
+ensure_test_urls_ready
+periodic_test_url_monitor &
+
+# ==========================================
+# 4. 启动 C 语言 SOCKS5 代理服务
+# ==========================================
 LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
 LISTEN_PORT=${BIND_PORT:-"1080"}
 
