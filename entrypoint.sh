@@ -8,6 +8,8 @@ fi
 WG_CONF="/etc/wireguard/wg0.conf"
 ROTATE_IP_ON_START="${ROTATE_IP_ON_START:-0}"
 WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
+WARP_API_URL="${WARP_API_URL:-https://warp.cloudflare.nyc.mn/?run=register&format=wireguard}"
+WARP_API_PROXY="${WARP_API_PROXY:-}"
 mkdir -p /etc/wireguard
 
 # SOCKS5 代理配置
@@ -49,16 +51,48 @@ pick_endpoint_ip() {
     return 0
 }
 
+fetch_warp_config() {
+    API_URLS=$(printf '%s' "$WARP_API_URL" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+    [ -n "$API_URLS" ] || return 1
+
+    OLD_IFS=$IFS
+    IFS='
+'
+    for API_URL in $API_URLS; do
+        [ -n "$API_URL" ] || continue
+        echo "==> [MicroWARP] API 地址: ${API_URL}"
+
+        if [ -n "$WARP_API_PROXY" ]; then
+            echo "==> [MicroWARP] API 请求将通过已配置代理发起"
+            curl --proxy "$WARP_API_PROXY" --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
+                "$API_URL" > "$raw_conf" && {
+                IFS=$OLD_IFS
+                return 0
+            }
+        else
+            curl --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
+                "$API_URL" > "$raw_conf" && {
+                IFS=$OLD_IFS
+                return 0
+            }
+        fi
+
+        echo "==> [MicroWARP] [WARN] API 请求失败，尝试下一个地址..."
+    done
+
+    IFS=$OLD_IFS
+    return 1
+}
+
 generate_warp_config() {
     local max_retries=3
     local attempt=1
     local raw_conf="/tmp/wg0.api.$$"
 
     while [ "$attempt" -le "$max_retries" ]; do
-        echo "==> [MicroWARP] 正在向 CF 注册新设备 (API, 第${attempt}次尝试)..."
+        echo "==> [MicroWARP] 正在向 API 注册新设备 (第${attempt}次尝试)..."
 
-        if curl --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
-            "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$raw_conf"; then
+        if fetch_warp_config; then
 
             sed -i 's/\r$//' "$raw_conf"
 
