@@ -30,7 +30,7 @@ print_warp_identity_summary() {
     [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
 }
 
-# ==================== 核心修复：带重试 + 验证的生成函数 ====================
+# ==================== 核心修复：带重试 + 智能验证 + 自动清理 ====================
 generate_warp_config() {
     local max_retries=3
     local attempt=1
@@ -42,9 +42,17 @@ generate_warp_config() {
              -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; MicroWARP/1.0) AppleWebKit/537.36" \
              "https://warp.cloudflare.now.cc/?run=register&format=wireguard" > "$WG_CONF"
 
-        # 严格验证是否是合法 WireGuard 配置
-        if grep -q "^\[Interface\]" "$WG_CONF" && grep -q "PrivateKey =" "$WG_CONF"; then
-            echo "==> [MicroWARP] 节点配置生成成功！(验证通过)"
+        # 更宽松的验证（兼容双空格、任意空白）
+        if grep -q '^\[Interface\]' "$WG_CONF" && grep -q 'PrivateKey[[:space:]]*=' "$WG_CONF"; then
+            echo "==> [MicroWARP] 原始配置获取成功，正在清理格式..."
+
+            # === 关键清理步骤 ===
+            # 1. 把所有连续空格/制表符统一成单个空格
+            sed -i 's/[[:space:]]\{2,\}/ /g' "$WG_CONF"
+            # 2. 删除尾部的 ## Warp account ## 账号信息（wg-quick 不需要）
+            sed -i '/^## Warp account ##/,$d' "$WG_CONF"
+
+            echo "==> [MicroWARP] 节点配置生成成功！(已标准化)"
             return 0
         fi
 
