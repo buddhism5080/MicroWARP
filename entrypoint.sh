@@ -166,7 +166,7 @@ start_warp_interface() {
     PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
 
     echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-    wg-quick up wg0
+    wg-quick up wg0 > /dev/null 2>&1
 
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
