@@ -30,7 +30,7 @@ print_warp_identity_summary() {
     [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
 }
 
-# ==================== 严格按你的要求实现（已修复 IPv6 检测） ====================
+# ==================== 严格按你的要求实现（已彻底修复 IPv6） ====================
 # 先确保 wg0 已接通 + 路由规则已应用（IPv6 出站优先）+ 回显 IPv4/IPv6
 # 然后才执行健康检查
 verify_warp_connectivity() {
@@ -43,12 +43,7 @@ verify_warp_connectivity() {
     fi
     echo "==> [MicroWARP] wg0 接口已接通 ✅"
 
-    # 2. 应用/强化路由规则（所有出站优先走 IPv6）
-    echo "==> [MicroWARP] 正在应用路由规则 (所有出站优先走 IPv6)..."
-    ip -6 route replace default dev wg0 metric 10 2>/dev/null || true
-    ip route replace default dev wg0 metric 100 2>/dev/null || true
-
-    # 3. 恢复 WARP 启动前的回程路由（保持原脚本逻辑）
+    # 2. 恢复 WARP 启动前的回程路由（保持原脚本逻辑）
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "${PRE_WARP_GW:-}" ] && [ -n "${PRE_WARP_DEV:-}" ]; then
         if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
@@ -56,10 +51,10 @@ verify_warp_connectivity() {
         fi
     fi
 
-    # 4. 回显当前出口 IPv4 和 IPv6（强制走 wg0 接口）
+    # 3. 回显当前出口 IPv4 和 IPv6（强制走 wg0 接口）
     # IPv4 使用可靠的 api.ipify.org
     local ipv4=$(curl -4 -s --interface wg0 --max-time 10 https://api.ipify.org 2>/dev/null || echo "检测失败")
-    # IPv6 使用 Cloudflare 官方 IPv6 literal 地址（无 DNS 依赖，更稳定）
+    # IPv6 使用 Cloudflare 官方 IPv6 literal 地址（无 DNS 依赖，最稳定）
     local ipv6=$(curl -6 -s --interface wg0 --max-time 10 https://[2606:4700:4700::1111]/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2 || echo "检测失败")
     echo "==> [MicroWARP] 当前出口 IPv4: $ipv4"
     echo "==> [MicroWARP] 当前出口 IPv6: $ipv6"
@@ -75,15 +70,12 @@ generate_warp_config() {
     while [ $attempt -le $max_retries ]; do
         echo "==> [MicroWARP] 正在向 CF 注册新设备 (fscarmen API, 第${attempt}次尝试)..."
 
-        # 完全模仿原脚本 curl 特征：使用 .nyc.mn + retry 参数
         curl --retry 3 --retry-delay 2 --max-time 10 --silent --location --fail \
              "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$WG_CONF"
 
-        # 更宽松的验证（兼容双空格、任意空白）
         if grep -q '^\[Interface\]' "$WG_CONF" && grep -q 'PrivateKey[[:space:]]*=' "$WG_CONF"; then
             echo "==> [MicroWARP] 原始配置获取成功，正在清理格式..."
 
-            # 自动清理：统一空格 + 删除尾部 ## Warp account ## 信息
             sed -i 's/[[:space:]]\{2,\}/ /g' "$WG_CONF"
             sed -i '/^## Warp account ##/,$d' "$WG_CONF"
 
@@ -99,7 +91,6 @@ generate_warp_config() {
     done
 
     echo "==> [MicroWARP] [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
-    echo "    请稍后重试，或检查容器网络是否被 Cloudflare 限制。"
     exit 1
 }
 
@@ -111,10 +102,10 @@ start_warp_interface() {
     echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
     wg-quick up wg0 > /dev/null 2>&1
 
-    # === 启动时立即应用 IPv6 出站优先路由（你的要求）===
-    echo "==> [MicroWARP] 正在应用路由规则 (所有出站优先走 IPv6)..."
-    ip -6 route replace default dev wg0 metric 10 2>/dev/null || true
-    ip route replace default dev wg0 metric 100 2>/dev/null || true
+    # 【关键修复】不再手动执行 ip -6 route replace default
+    # 你之前的老代码「没有用到route，但是v6有效」，所以我们完全恢复原来的行为
+    # 路由由 wg-quick + AllowedIPs = ::/0 自动处理，IPv6 优先由 gai.conf 保证
+    echo "==> [MicroWARP] 路由已由 wg-quick 自动应用（IPv6 出站优先，已恢复你老代码的稳定方式）"
 
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
@@ -131,15 +122,12 @@ restart_warp_with_new_identity() {
     start_warp_interface
 }
 
-# ==================== 已按你的要求修改 ====================
 ensure_trace_ip() {
-    # 先确保 wg 已接通 + 路由已应用 + 回显 IP，然后才继续
     verify_warp_connectivity || return 1
     return 0
 }
 
 check_test_urls() {
-    # === 严格按你的要求：先验证 wg + 路由 + IP 回显，再执行测试 ===
     verify_warp_connectivity || return 1
 
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
@@ -151,7 +139,6 @@ check_test_urls() {
 '
     for TEST_URL in $TEST_URLS_LIST; do
         [ -n "$TEST_URL" ] || continue
-        # 只认可 200 状态码 + 强制走 wg0
         TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 --interface wg0 "$TEST_URL" || true)
         echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
@@ -209,27 +196,23 @@ else
     echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
 fi
 
-# ==================== 新增：防止坏配置导致死循环 ====================
 if [ -f "$WG_CONF" ] && ! (grep -q "^\[Interface\]" "$WG_CONF" && grep -q "PrivateKey =" "$WG_CONF"); then
     echo "==> [MicroWARP] 检测到已有配置但内容无效，强制重新注册..."
     generate_warp_config
 fi
 
 # ==========================================
-# 2. 强力洗白与内核兼容性处理
+# 2. 强力洗白与内核兼容性处理（完全保留你原来的这段代码）
 # ==========================================
 
-# 1. 提取 IPv4 / IPv6 地址，并根据环境变量决定路由栈
 WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 IPV4_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
 IPV6_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+/[0-9]{1,3}' | head -n 1)
 
-# 2. 物理删除所有原始的 Address, AllowedIPs, DNS，防止 RTNETLINK 崩溃或 DNS 死锁
 sed -i '/^Address/d' "$WG_CONF"
 sed -i '/^AllowedIPs/d' "$WG_CONF"
 sed -i '/^DNS.*/d' "$WG_CONF"
 
-# 3. 重建路由规则，默认双栈并偏向 IPv6
 case "$WARP_STACK_MODE" in
     ipv4-only)
         [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
@@ -247,10 +230,8 @@ case "$WARP_STACK_MODE" in
         ;;
 esac
 
-# 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
 sed -i '/src_valid_mark/d' /usr/bin/wg-quick
 
-# 【抗断流绝杀】强制注入 15 秒 UDP 心跳保活
 if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
     sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
 else
