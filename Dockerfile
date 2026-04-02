@@ -14,7 +14,7 @@ RUN git clone https://github.com/rofl0r/microsocks.git /src && \
 FROM dockerhub.timeweb.cloud/library/alpine:latest
 
 # 仅安装必要的内核级 WireGuard 和网络控制工具
-RUN apk add --no-cache wireguard-tools iptables iproute2 wget curl
+RUN apk add --no-cache wireguard-tools iptables iproute2 curl
 
 # 打包microsocks
 COPY --from=builder /src/microsocks /usr/local/bin/microsocks
