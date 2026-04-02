@@ -38,18 +38,16 @@ generate_warp_config() {
     while [ $attempt -le $max_retries ]; do
         echo "==> [MicroWARP] 正在向 CF 注册新设备 (fscarmen API, 第${attempt}次尝试)..."
 
-        curl -s \
-             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; MicroWARP/1.0) AppleWebKit/537.36" \
-             "https://warp.cloudflare.now.cc/?run=register&format=wireguard" > "$WG_CONF"
+        # 完全模仿原脚本 curl 特征：使用 .nyc.mn + retry 参数
+        curl --retry 3 --retry-delay 2 --max-time 10 --silent --location --fail \
+             "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$WG_CONF"
 
         # 更宽松的验证（兼容双空格、任意空白）
         if grep -q '^\[Interface\]' "$WG_CONF" && grep -q 'PrivateKey[[:space:]]*=' "$WG_CONF"; then
             echo "==> [MicroWARP] 原始配置获取成功，正在清理格式..."
 
-            # === 关键清理步骤 ===
-            # 1. 把所有连续空格/制表符统一成单个空格
+            # 自动清理：统一空格 + 删除尾部 ## Warp account ## 信息
             sed -i 's/[[:space:]]\{2,\}/ /g' "$WG_CONF"
-            # 2. 删除尾部的 ## Warp account ## 账号信息（wg-quick 不需要）
             sed -i '/^## Warp account ##/,$d' "$WG_CONF"
 
             echo "==> [MicroWARP] 节点配置生成成功！(已标准化)"
@@ -64,7 +62,7 @@ generate_warp_config() {
     done
 
     echo "==> [MicroWARP] [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
-    echo "    请检查容器网络 / VPS IP 是否被 Cloudflare 临时限制，或稍后重试。"
+    echo "    请稍后重试，或检查容器网络是否被 Cloudflare 限制。"
     exit 1
 }
 
