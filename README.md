@@ -88,7 +88,6 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - SOCKS_USER=admin      # Enable authentication (leave empty for no auth)
       - SOCKS_PASS=123456     # Auth password
       - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP, or a comma/semicolon-separated candidate list
-      - GH_PROXY=https://github.ednovas.xyz # Prefix only the wgcf binary download URL
       - ROTATE_IP_ON_START=1 # Re-register a fresh WARP device on every container start to refresh the egress IP (default: 0)
       - WARP_STACK=ipv6-preferred # ipv6-preferred (default), dual, ipv4-only, or ipv6-only
       - TEST_URLS=https://grok.com,https://example.com # Comma/semicolon-separated URLs; all must avoid 4xx/5xx before startup succeeds
@@ -176,7 +175,6 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - BIND_PORT=1080        # 监听端口 (默认 1080)
       - SOCKS_USER=admin      # SOCKS5 认证用户名 (留空则为无密码模式)
       - SOCKS_PASS=123456     # SOCKS5 认证密码
-      - GH_PROXY=https://github.ednovas.xyz # 仅代理 wgcf 二进制下载地址，不代理 GitHub API 版本查询
       - ROTATE_IP_ON_START=1 # 每次容器启动时重新注册 WARP 设备并刷新出口 IP (默认: 0)
       - WARP_STACK=ipv6-preferred # ipv6-preferred（默认）、dual、ipv4-only 或 ipv6-only
       - TEST_URLS=https://grok.com,https://example.com # 逗号/分号分隔的测试 URL；必须全部不返回 4xx/5xx 才算通过

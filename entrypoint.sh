@@ -7,6 +7,7 @@ fi
 
 WG_CONF="/etc/wireguard/wg0.conf"
 ROTATE_IP_ON_START="${ROTATE_IP_ON_START:-0}"
+WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 mkdir -p /etc/wireguard
 
 # SOCKS5 代理配置
@@ -26,10 +27,10 @@ print_warp_identity_summary() {
     IPV4_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
     IPV6_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n 1)
     ENDPOINT=$(awk -F ' = ' '/^Endpoint = / {print $2; exit}' "$WG_CONF")
-    PUBKEY_FINGERPRINT=$(printf '%s' "$PRIVATE_KEY" | sha256sum | awk '{print substr($1,1,16)}')
+    PRIVATE_KEY_FINGERPRINT=$(printf '%s' "$PRIVATE_KEY" | sha256sum | awk '{print substr($1,1,16)}')
 
     echo "==> [MicroWARP] WARP 设备身份摘要:"
-    echo "==> [MicroWARP]   PrivateKey SHA256/16: ${PUBKEY_FINGERPRINT}"
+    echo "==> [MicroWARP]   PrivateKey SHA256/16: ${PRIVATE_KEY_FINGERPRINT}"
     [ -n "$IPV4_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv4: ${IPV4_ADDRESS}"
     [ -n "$IPV6_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv6: ${IPV6_ADDRESS}"
     [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
@@ -52,8 +53,6 @@ generate_warp_config() {
     local max_retries=3
     local attempt=1
     local raw_conf="/tmp/wg0.api.$$"
-
-    WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 
     while [ "$attempt" -le "$max_retries" ]; do
         echo "==> [MicroWARP] 正在向 CF 注册新设备 (API, 第${attempt}次尝试)..."
@@ -239,7 +238,7 @@ ensure_trace_ip() {
         echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP..."
         # 准备尝试重连前，因为网卡要重置，明确发现故障先切断代理
         stop_socks
-        
+
         echo "==> [MicroWARP] 正在重新注册并重试..."
         ATTEMPT=$((ATTEMPT + 1))
         restart_warp_with_new_identity
@@ -286,9 +285,9 @@ ensure_network_ready() {
 
         # 走到这里说明：虽然拿到IP但测试URL不通，或者根本拿不到IP
         echo "==> [MicroWARP] 连通性测试未通过！"
-        
+
         # 确定网络有问题，立刻切断SOCKS（防透传泄漏）
-        stop_socks 
+        stop_socks
 
         echo "==> [MicroWARP] 正在重新注册并重置节点..."
         restart_warp_with_new_identity
@@ -299,8 +298,8 @@ periodic_test_url_monitor() {
     echo "==> [MicroWARP] 已启动守护模式，每 15 分钟进行一次健康巡检..."
     while true; do
         # 睡眠等待期间能随时响应容器的停止信号
-        sleep 900 & wait $! 
-        
+        sleep 900 & wait $!
+
         echo "==> [MicroWARP] 正在执行 15 分钟 TEST_URLS 巡检..."
 
         # 巡检时直接发起检测，不干扰正常运行的 SOCKS
@@ -312,7 +311,7 @@ periodic_test_url_monitor() {
         # 只有在确诊不通返回了非零状态，才触发保护机制并切断网络
         echo "==> [MicroWARP] ❌ 巡检未通过！触发节点重选保护机制..."
         stop_socks
-        
+
         # 进入修复死循环，修复成功后内部会重新调用 start_socks
         ensure_network_ready
     done
