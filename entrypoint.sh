@@ -30,6 +30,41 @@ print_warp_identity_summary() {
     [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
 }
 
+# ==================== 新增：严格按你的要求实现 ====================
+# 先确保 wg0 已接通 + 路由规则已应用（IPv6 出站优先）+ 回显 IPv4/IPv6
+# 然后才执行健康检查
+verify_warp_connectivity() {
+    echo "==> [MicroWARP] 正在验证 wg0 隧道状态..."
+
+    # 1. 先确保本地 wg 已接通
+    if ! ip link show wg0 &>/dev/null; then
+        echo "==> [MicroWARP] [ERROR] wg0 接口未启动！"
+        return 1
+    fi
+    echo "==> [MicroWARP] wg0 接口已接通 ✅"
+
+    # 2. 应用/强化路由规则（所有出站优先走 IPv6）
+    echo "==> [MicroWARP] 正在应用路由规则 (所有出站优先走 IPv6)..."
+    ip -6 route replace default dev wg0 metric 10 2>/dev/null || true
+    ip route replace default dev wg0 metric 100 2>/dev/null || true
+
+    # 3. 恢复 WARP 启动前的回程路由（保持原脚本逻辑）
+    TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
+    if [ -n "${PRE_WARP_GW:-}" ] && [ -n "${PRE_WARP_DEV:-}" ]; then
+        if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
+            echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+        fi
+    fi
+
+    # 4. 回显当前出口 IPv4 和 IPv6（强制走 wg0 接口）
+    local ipv4=$(curl -4 -s --interface wg0 --max-time 10 https://api.ipify.org 2>/dev/null || echo "检测失败")
+    local ipv6=$(curl -6 -s --interface wg0 --max-time 10 https://api6.ipify.org 2>/dev/null || echo "检测失败")
+    echo "==> [MicroWARP] 当前出口 IPv4: $ipv4"
+    echo "==> [MicroWARP] 当前出口 IPv6: $ipv6"
+
+    return 0
+}
+
 # ==================== 核心修复：带重试 + 智能验证 + 自动清理 ====================
 generate_warp_config() {
     local max_retries=3
@@ -74,6 +109,11 @@ start_warp_interface() {
     echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
     wg-quick up wg0 > /dev/null 2>&1
 
+    # === 启动时立即应用 IPv6 出站优先路由（你的要求）===
+    echo "==> [MicroWARP] 正在应用路由规则 (所有出站优先走 IPv6)..."
+    ip -6 route replace default dev wg0 metric 10 2>/dev/null || true
+    ip route replace default dev wg0 metric 100 2>/dev/null || true
+
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
         if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
@@ -89,36 +129,17 @@ restart_warp_with_new_identity() {
     start_warp_interface
 }
 
+# ==================== 已按你的要求修改 ====================
 ensure_trace_ip() {
-    TRACE_ATTEMPTS=${TRACE_ATTEMPTS:-3}
-    ATTEMPT=1
-
-    while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
-        echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-        TRACE_OUTPUT_V4=$(curl -4 -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
-        TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
-        TRACE_OUTPUT_V6=$(curl -6 -s -m 5 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
-        TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
-
-        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
-        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
-
-        if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
-            return 0
-        fi
-
-        if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
-            echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
-            return 1
-        fi
-
-        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP，正在重新注册并重试..."
-        ATTEMPT=$((ATTEMPT + 1))
-        restart_warp_with_new_identity
-    done
+    # 先确保 wg 已接通 + 路由已应用 + 回显 IP，然后才继续
+    verify_warp_connectivity || return 1
+    return 0
 }
 
 check_test_urls() {
+    # === 严格按你的要求：先验证 wg + 路由 + IP 回显，再执行测试 ===
+    verify_warp_connectivity || return 1
+
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
     [ -n "$TEST_URLS_LIST" ] || return 0
@@ -128,15 +149,14 @@ check_test_urls() {
 '
     for TEST_URL in $TEST_URLS_LIST; do
         [ -n "$TEST_URL" ] || continue
-        TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
+        # 只认可 200 状态码 + 强制走 wg0
+        TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 --interface wg0 "$TEST_URL" || true)
         echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
-        case "$TEST_HTTP_CODE" in
-            4*|5*|000|"")
-                IFS=$OLD_IFS
-                return 1
-                ;;
-        esac
+        if [ "$TEST_HTTP_CODE" != "200" ]; then
+            IFS=$OLD_IFS
+            return 1
+        fi
     done
 
     IFS=$OLD_IFS
@@ -242,7 +262,7 @@ if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
 fi
 
 # ==========================================
-# 3. 拉起内核网卡
+# 3. 拉起内核网卡 + 健康检查
 # ==========================================
 start_warp_interface
 ensure_test_urls_ready
@@ -261,5 +281,5 @@ if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
 else
     echo "==> [MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
     echo "==>[MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
+    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT}"
 fi
