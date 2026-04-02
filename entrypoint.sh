@@ -155,6 +155,16 @@ generate_warp_config() {
 }
 
 
+prepare_wg_quick_compat() {
+    if [ -w /proc/sys/net/ipv4/conf/all/src_valid_mark ]; then
+        echo "==> [MicroWARP] src_valid_mark 可写，保留 wg-quick 默认设置"
+    else
+        echo "==> [MicroWARP] [WARN] 当前环境 /proc/sys 为只读，已兼容性移除 wg-quick 的 src_valid_mark 写入"
+        sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
+    fi
+}
+
+
 start_warp_interface() {
     PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
     PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
@@ -285,6 +295,10 @@ if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
     echo "==> [MicroWARP] 已启用 IPv6 优先地址选择策略"
 fi
+
+
+prepare_wg_quick_compat
+
 
 # ==========================================
 # 3. 拉起内核网卡 + 监控
