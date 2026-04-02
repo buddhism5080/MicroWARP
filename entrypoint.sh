@@ -156,12 +156,7 @@ generate_warp_config() {
 
 
 prepare_wg_quick_compat() {
-    if [ -w /proc/sys/net/ipv4/conf/all/src_valid_mark ]; then
-        echo "==> [MicroWARP] src_valid_mark 可写，保留 wg-quick 默认设置"
-    else
-        echo "==> [MicroWARP] [WARN] 当前环境 /proc/sys 为只读，已兼容性移除 wg-quick 的 src_valid_mark 写入"
-        sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
-    fi
+    sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
 }
 
 
