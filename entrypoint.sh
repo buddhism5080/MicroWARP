@@ -30,7 +30,7 @@ print_warp_identity_summary() {
     [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
 }
 
-# ==================== 新增：严格按你的要求实现 ====================
+# ==================== 严格按你的要求实现（已修复 IPv6 检测） ====================
 # 先确保 wg0 已接通 + 路由规则已应用（IPv6 出站优先）+ 回显 IPv4/IPv6
 # 然后才执行健康检查
 verify_warp_connectivity() {
@@ -57,8 +57,10 @@ verify_warp_connectivity() {
     fi
 
     # 4. 回显当前出口 IPv4 和 IPv6（强制走 wg0 接口）
+    # IPv4 使用可靠的 api.ipify.org
     local ipv4=$(curl -4 -s --interface wg0 --max-time 10 https://api.ipify.org 2>/dev/null || echo "检测失败")
-    local ipv6=$(curl -6 -s --interface wg0 --max-time 10 https://api6.ipify.org 2>/dev/null || echo "检测失败")
+    # IPv6 使用 Cloudflare 官方 IPv6 literal 地址（无 DNS 依赖，更稳定）
+    local ipv6=$(curl -6 -s --interface wg0 --max-time 10 https://[2606:4700:4700::1111]/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2 || echo "检测失败")
     echo "==> [MicroWARP] 当前出口 IPv4: $ipv4"
     echo "==> [MicroWARP] 当前出口 IPv6: $ipv6"
 
