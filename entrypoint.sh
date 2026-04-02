@@ -18,7 +18,7 @@ is_enabled() {
 
 print_warp_identity_summary() {
     PRIVATE_KEY=$(awk -F ' = ' '/^PrivateKey = / {print $2; exit}' "$WG_CONF")
-    # 新 API 返回的 Address 是裸 IP（无 /32 /128），使用正则精准提取（不受行序影响）
+    # 适配新 API 返回的裸 IP（无 /32 /128）
     IPV4_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
     IPV6_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n 1)
     ENDPOINT=$(awk -F ' = ' '/^Endpoint = / {print $2; exit}' "$WG_CONF")
@@ -76,10 +76,10 @@ generate_warp_config() {
 }
 
 # ==========================================
-# 强力洗白函数（兼容新 API 裸 IP 格式 + 每次重新注册都必须执行）
+# 强力洗白函数（完全兼容您提供的 API 返回格式）
 # ==========================================
 wash_warp_config() {
-    # 1. 提取 IPv4 / IPv6 地址（适配新 API 返回的裸 IP，无 /32 /128）
+    # 1. 提取 IPv4 / IPv6 地址（适配新 API 的裸 IP 格式）
     WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
     IPV4_ADDR=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
     IPV6_ADDR=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n 1)
@@ -143,12 +143,16 @@ start_warp_interface() {
             echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
         fi
     fi
+
+    # 新增：给隧道握手一点稳定时间，避免 trace_ip 首次抓不到出口 IP
+    sleep 3
+    echo "==> [MicroWARP] 隧道已稳定（等待 3 秒）"
 }
 
 restart_warp_with_new_identity() {
     wg-quick down wg0 > /dev/null 2>&1 || true
     generate_warp_config
-    wash_warp_config          # 每次重新注册都执行完整洗白（兼容新 API 格式）
+    wash_warp_config          # 每次重新注册都执行完整洗白
     print_warp_identity_summary
     start_warp_interface
 }
@@ -159,9 +163,9 @@ ensure_trace_ip() {
 
     while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
         echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-        TRACE_OUTPUT_V4=$(curl -4 -s -m 5 https://1.1.1.1/cdn-cgi/trace || true)
+        TRACE_OUTPUT_V4=$(curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
         TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
-        TRACE_OUTPUT_V6=$(curl -6 -s -m 5 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
+        TRACE_OUTPUT_V6=$(curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
         TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
 
         [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
@@ -252,14 +256,9 @@ else
 fi
 
 # ==========================================
-# 2. 强力洗白（仅首次启动执行一次，后续重注册由 restart_warp_with_new_identity 负责）
+# 2. 强力洗白（每次启动都执行，确保格式一致）
 # ==========================================
-if [ ! -f "$WG_CONF" ] || is_enabled "$ROTATE_IP_ON_START"; then
-    wash_warp_config
-else
-    # 已有持久化配置时，仍然执行一次洗白（确保格式一致 + 注入最新参数）
-    wash_warp_config
-fi
+wash_warp_config
 
 print_warp_identity_summary
 if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
