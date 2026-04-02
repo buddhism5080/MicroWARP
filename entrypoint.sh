@@ -47,87 +47,122 @@ pick_endpoint_ip() {
 generate_warp_config() {
     local max_retries=3
     local attempt=1
+    local raw_conf="/tmp/wg0.api.$$"
 
-    while [ $attempt -le $max_retries ]; do
-        echo "==> [MicroWARP] 正在向 CF 注册新设备 (fscarmen API, 第${attempt}次尝试)..."
+    WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 
-        curl --retry 3 --retry-delay 2 --max-time 10 --silent --location --fail \
-             "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$WG_CONF"
+    while [ "$attempt" -le "$max_retries" ]; do
+        echo "==> [MicroWARP] 正在向 CF 注册新设备 (API, 第${attempt}次尝试)..."
 
-        if grep -q '^\[Interface\]' "$WG_CONF" && grep -q 'PrivateKey[[:space:]]*=' "$WG_CONF"; then
-            echo "==> [MicroWARP] 原始配置获取成功，正在清理格式..."
+        if curl --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
+            "https://warp.cloudflare.nyc.mn/?run=register&format=wireguard" > "$raw_conf"; then
 
-            sed -i 's/[[:space:]]\{2,\}/ /g' "$WG_CONF"
-            sed -i '/^## Warp account ##/,$d' "$WG_CONF"
+            # 去掉 CRLF，防止隐藏字符
+            sed -i 's/\r$//' "$raw_conf"
 
-            echo "==> [MicroWARP] 节点配置生成成功！(已标准化)"
-            return 0
+            # 基础校验
+            if grep -q '^\[Interface\]' "$raw_conf" &&
+               grep -q '^\[Peer\]' "$raw_conf" &&
+               grep -q '^PrivateKey[[:space:]]*=' "$raw_conf" &&
+               grep -q '^PublicKey[[:space:]]*=' "$raw_conf" &&
+               grep -q '^Endpoint[[:space:]]*=' "$raw_conf"; then
+
+                PRIVATE_KEY=$(awk -F '[[:space:]]*=[[:space:]]*' '/^PrivateKey[[:space:]]*=/{print $2; exit}' "$raw_conf")
+                PUBLIC_KEY=$(awk -F '[[:space:]]*=[[:space:]]*' '/^PublicKey[[:space:]]*=/{print $2; exit}' "$raw_conf")
+                ENDPOINT=$(awk -F '[[:space:]]*=[[:space:]]*' '/^Endpoint[[:space:]]*=/{print $2; exit}' "$raw_conf")
+                MTU=$(awk -F '[[:space:]]*=[[:space:]]*' '/^MTU[[:space:]]*=/{print $2; exit}' "$raw_conf")
+
+                IPV4_ADDR=$(awk -F '[[:space:]]*=[[:space:]]*' '
+                    /^Address[[:space:]]*=/ {
+                        if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                            print $2; exit
+                        }
+                    }' "$raw_conf")
+
+                IPV6_ADDR=$(awk -F '[[:space:]]*=[[:space:]]*' '
+                    /^Address[[:space:]]*=/ {
+                        if ($2 ~ /:/) {
+                            print $2; exit
+                        }
+                    }' "$raw_conf")
+
+                [ -n "$PRIVATE_KEY" ] || { echo "==> [ERROR] PrivateKey 提取失败"; rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
+                [ -n "$PUBLIC_KEY" ]  || { echo "==> [ERROR] PublicKey 提取失败";  rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
+                [ -n "$ENDPOINT" ]    || { echo "==> [ERROR] Endpoint 提取失败";   rm -f "$raw_conf"; attempt=$((attempt+1)); sleep 3; continue; }
+
+                # 自定义 Endpoint 覆盖
+                if [ -n "$ENDPOINT_IP" ]; then
+                    if pick_endpoint_ip; then
+                        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
+                        ENDPOINT="$ENDPOINT_IP_SELECTED"
+                    else
+                        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
+                        ENDPOINT="$ENDPOINT_IP"
+                    fi
+                fi
+
+                [ -n "$MTU" ] || MTU=1280
+
+                {
+                    echo "[Interface]"
+                    echo "PrivateKey = $PRIVATE_KEY"
+
+                    case "$WARP_STACK_MODE" in
+                        ipv4-only)
+                            [ -n "$IPV4_ADDR" ] && echo "Address = ${IPV4_ADDR}/32"
+                            ;;
+                        ipv6-only)
+                            [ -n "$IPV6_ADDR" ] && echo "Address = ${IPV6_ADDR}/128"
+                            ;;
+                        ipv6-preferred|dual|*)
+                            if [ -n "$IPV4_ADDR" ] && [ -n "$IPV6_ADDR" ]; then
+                                echo "Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128"
+                            elif [ -n "$IPV4_ADDR" ]; then
+                                echo "Address = ${IPV4_ADDR}/32"
+                            elif [ -n "$IPV6_ADDR" ]; then
+                                echo "Address = ${IPV6_ADDR}/128"
+                            fi
+                            ;;
+                    esac
+
+                    echo "MTU = $MTU"
+                    echo
+                    echo "[Peer]"
+                    echo "PublicKey = $PUBLIC_KEY"
+
+                    case "$WARP_STACK_MODE" in
+                        ipv4-only)
+                            echo "AllowedIPs = 0.0.0.0/0"
+                            ;;
+                        ipv6-only)
+                            echo "AllowedIPs = ::/0"
+                            ;;
+                        ipv6-preferred|dual|*)
+                            echo "AllowedIPs = 0.0.0.0/0, ::/0"
+                            ;;
+                    esac
+
+                    echo "Endpoint = $ENDPOINT"
+                    echo "PersistentKeepalive = 15"
+                } > "$WG_CONF"
+
+                rm -f "$raw_conf"
+                echo "==> [MicroWARP] 节点配置生成成功！(已按 wgcf 风格标准化)"
+                return 0
+            fi
         fi
 
         echo "==> [MicroWARP] [WARN] 第${attempt}次返回无效配置，原始内容预览："
-        cat "$WG_CONF" | head -30
-        rm -f "$WG_CONF"
+        head -30 "$raw_conf" 2>/dev/null || true
+        rm -f "$raw_conf"
         attempt=$((attempt + 1))
-        [ $attempt -le $max_retries ] && sleep 8
+        [ "$attempt" -le "$max_retries" ] && sleep 5
     done
 
     echo "==> [MicroWARP] [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
     exit 1
 }
 
-# ==========================================
-# 强力洗白函数（完全兼容您提供的 API 返回格式）
-# ==========================================
-wash_warp_config() {
-    # 1. 提取 IPv4 / IPv6 地址（适配新 API 的裸 IP 格式）
-    WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
-    IPV4_ADDR=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
-    IPV6_ADDR=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n 1)
-
-    # 2. 物理删除所有原始的 Address、AllowedIPs、DNS
-    sed -i '/^Address/d' "$WG_CONF"
-    sed -i '/^AllowedIPs/d' "$WG_CONF"
-    sed -i '/^DNS.*/d' "$WG_CONF"
-
-    # 3. 重建路由规则（强制加上标准 CIDR 掩码，确保 wg-quick 完全兼容）
-    case "$WARP_STACK_MODE" in
-        ipv4-only)
-            [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR/32" "$WG_CONF"
-            sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
-            ;;
-        ipv6-only)
-            [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR/128" "$WG_CONF"
-            sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
-            ;;
-        ipv6-preferred|dual|*)
-            [ -n "$IPV6_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV6_ADDR/128" "$WG_CONF"
-            [ -n "$IPV4_ADDR" ] && sed -i "/\[Interface\]/a Address = $IPV4_ADDR/32" "$WG_CONF"
-            sed -i "/\[Peer\]/a AllowedIPs = ::\/0" "$WG_CONF"
-            sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
-            ;;
-    esac
-
-    # 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
-    sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
-
-    # 抗断流绝杀：强制 15 秒 UDP 心跳
-    if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
-        sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
-    else
-        sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$WG_CONF"
-    fi
-
-    # 防阻断绝杀：自定义 Endpoint 随机/覆盖
-    if [ -n "$ENDPOINT_IP" ]; then
-        if pick_endpoint_ip; then
-            echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
-            sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP_SELECTED/g" "$WG_CONF"
-        else
-            echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
-            sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
-        fi
-    fi
-}
 
 start_warp_interface() {
     PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
@@ -152,7 +187,6 @@ start_warp_interface() {
 restart_warp_with_new_identity() {
     wg-quick down wg0 > /dev/null 2>&1 || true
     generate_warp_config
-    wash_warp_config          # 每次重新注册都执行完整洗白
     print_warp_identity_summary
     start_warp_interface
 }
