@@ -9,6 +9,11 @@ WG_CONF="/etc/wireguard/wg0.conf"
 ROTATE_IP_ON_START="${ROTATE_IP_ON_START:-0}"
 mkdir -p /etc/wireguard
 
+# SOCKS5 代理配置
+LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
+LISTEN_PORT=${BIND_PORT:-"1080"}
+SOCKS_PID=""
+
 is_enabled() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on) return 0 ;;
@@ -18,7 +23,6 @@ is_enabled() {
 
 print_warp_identity_summary() {
     PRIVATE_KEY=$(awk -F ' = ' '/^PrivateKey = / {print $2; exit}' "$WG_CONF")
-    # 适配新 API 返回的裸 IP（无 /32 /128）
     IPV4_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
     IPV6_ADDRESS=$(grep '^Address =' "$WG_CONF" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n 1)
     ENDPOINT=$(awk -F ' = ' '/^Endpoint = / {print $2; exit}' "$WG_CONF")
@@ -138,7 +142,7 @@ generate_warp_config() {
                 } > "$WG_CONF"
 
                 rm -f "$raw_conf"
-                echo "==> [MicroWARP] 节点配置生成成功！(已按 wgcf 风格标准化)"
+                echo "==> [MicroWARP] 节点配置生成成功！"
                 return 0
             fi
         fi
@@ -154,11 +158,9 @@ generate_warp_config() {
     exit 1
 }
 
-
 prepare_wg_quick_compat() {
     sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
 }
-
 
 start_warp_interface() {
     PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
@@ -171,13 +173,12 @@ start_warp_interface() {
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
         if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
-            echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+            echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由"
         fi
     fi
 
-    # 新增：给隧道握手一点稳定时间，避免 trace_ip 首次抓不到出口 IP
     sleep 3
-    echo "==> [MicroWARP] 隧道已稳定（等待 3 秒）"
+    echo "==> [MicroWARP] 隧道已启动"
 }
 
 restart_warp_with_new_identity() {
@@ -187,30 +188,59 @@ restart_warp_with_new_identity() {
     start_warp_interface
 }
 
+# ==========================================
+# SOCKS5 代理生命周期管理
+# ==========================================
+start_socks() {
+    if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+        echo "==> [MicroWARP] 🟢 节点状态健康，正在启动 SOCKS 服务..."
+        if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
+            microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
+        else
+            microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" > /dev/null 2>&1 &
+        fi
+        SOCKS_PID=$!
+        echo "==> [MicroWARP] 🚀 MicroSOCKS 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
+    fi
+}
+
+stop_socks() {
+    if [ -n "$SOCKS_PID" ] && kill -0 "$SOCKS_PID" 2>/dev/null; then
+        echo "==> [MicroWARP] 🛑 切断 SOCKS 服务，避免请求黑洞..."
+        kill "$SOCKS_PID" 2>/dev/null || true
+        wait "$SOCKS_PID" 2>/dev/null || true
+        SOCKS_PID=""
+        echo "==> [MicroWARP] 🔻 SOCKS 服务已下线"
+    fi
+}
+
 ensure_trace_ip() {
     TRACE_ATTEMPTS=${TRACE_ATTEMPTS:-3}
     ATTEMPT=1
 
     while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
-        echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
         TRACE_OUTPUT_V4=$(curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
         TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
         TRACE_OUTPUT_V6=$(curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
         TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
 
-        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
-        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
-
         if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
+            echo "==> [MicroWARP] 当前出口 IP 已获取："
+            [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
+            [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
             return 0
         fi
 
         if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
-            echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+            echo "==> [MicroWARP] ⚠️ 获取 IP 连续超时，底层连通性异常！"
             return 1
         fi
 
-        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP，正在重新注册并重试..."
+        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP..."
+        # 准备尝试重连前，因为网卡要重置，明确发现故障先切断代理
+        stop_socks
+        
+        echo "==> [MicroWARP] 正在重新注册并重试..."
         ATTEMPT=$((ATTEMPT + 1))
         restart_warp_with_new_identity
     done
@@ -227,7 +257,7 @@ check_test_urls() {
     for TEST_URL in $TEST_URLS_LIST; do
         [ -n "$TEST_URL" ] || continue
         TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
-        echo "==> [MicroWARP] ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        echo "==> [MicroWARP] 测速反馈 ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
         case "$TEST_HTTP_CODE" in
             4*|5*|000|"")
@@ -241,35 +271,58 @@ check_test_urls() {
     return 0
 }
 
-ensure_test_urls_ready() {
+# ==========================================
+# 核心网络就绪保证 (仅限发现异常进入修复或初次启动时)
+# ==========================================
+ensure_network_ready() {
     while true; do
-        ensure_trace_ip || return 1
-
-        if check_test_urls; then
-            return 0
+        if ensure_trace_ip; then
+            if check_test_urls; then
+                # 测试均通过，安全上线
+                start_socks
+                return 0
+            fi
         fi
 
-        echo "==> [MicroWARP] 存在测试 URL 未通过，正在重新注册并重试..."
+        # 走到这里说明：虽然拿到IP但测试URL不通，或者根本拿不到IP
+        echo "==> [MicroWARP] 连通性测试未通过！"
+        
+        # 确定网络有问题，立刻切断SOCKS（防透传泄漏）
+        stop_socks 
+
+        echo "==> [MicroWARP] 正在重新注册并重置节点..."
         restart_warp_with_new_identity
     done
 }
 
 periodic_test_url_monitor() {
+    echo "==> [MicroWARP] 已启动守护模式，每 15 分钟进行一次健康巡检..."
     while true; do
-        sleep 900
+        # 睡眠等待期间能随时响应容器的停止信号
+        sleep 900 & wait $! 
+        
         echo "==> [MicroWARP] 正在执行 15 分钟 TEST_URLS 巡检..."
 
+        # 巡检时直接发起检测，不干扰正常运行的 SOCKS
         if check_test_urls; then
-            echo "==> [MicroWARP] 15 分钟 TEST_URLS 巡检通过"
+            echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线"
             continue
         fi
 
-        echo "==> [MicroWARP] TEST_URLS 巡检未通过，正在重新注册并恢复..."
-        while ! ensure_test_urls_ready; do
-            echo "==> [MicroWARP] 恢复流程未完成，60 秒后继续重试..."
-            sleep 60
-        done
+        # 只有在确诊不通返回了非零状态，才触发保护机制并切断网络
+        echo "==> [MicroWARP] ❌ 巡检未通过！触发节点重选保护机制..."
+        stop_socks
+        
+        # 进入修复死循环，修复成功后内部会重新调用 start_socks
+        ensure_network_ready
     done
+}
+
+cleanup_on_exit() {
+    echo "==> [MicroWARP] 收到退出信号，正在清理进程和网卡..."
+    stop_socks
+    wg-quick down wg0 >/dev/null 2>&1 || true
+    exit 0
 }
 
 # ==========================================
@@ -291,29 +344,20 @@ if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "==> [MicroWARP] 已启用 IPv6 优先地址选择策略"
 fi
 
-
 prepare_wg_quick_compat
 
+# ==========================================
+# 2. 捕获系统退出信号，实现优雅退出
+# ==========================================
+trap cleanup_on_exit INT TERM
 
 # ==========================================
-# 3. 拉起内核网卡 + 监控
+# 3. 核心运行流
 # ==========================================
 start_warp_interface
-ensure_test_urls_ready
-periodic_test_url_monitor &
 
-# ==========================================
-# 4. 启动 C 语言 SOCKS5 代理服务
-# ==========================================
-LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
-LISTEN_PORT=${BIND_PORT:-"1080"}
+# 首次启动：挂起直到网络 100% 连通才上线 SOCKS
+ensure_network_ready
 
-if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
-    echo "==> [MicroWARP] 🔒 身份认证已开启 (User: $SOCKS_USER)"
-    echo "==> [MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS"
-else
-    echo "==> [MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
-    echo "==>[MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
-fi
+# 接管主进程生命周期，死循环守护代理和网卡的健康
+periodic_test_url_monitor
