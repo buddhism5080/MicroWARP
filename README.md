@@ -92,7 +92,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WARP_STACK=ipv6-preferred # ipv6-preferred (default), dual, ipv4-only, or ipv6-only
       - WARP_API_URL=https://api1.example.com/register?format=wireguard,https://api2.example.com/register?format=wireguard # One or more compatible API endpoints; each request tries them in order
       - WARP_API_PROXY=http://127.0.0.1:8080 # Optional proxy used only for the API registration request
-      - WG_RECONNECT_RETRIES=5 # Reconnect wg0 this many times before requesting a brand new config; minimum 0 disables this stage
+      - WG_RECONNECT_RETRIES=5 # Reconnect wg0 this many times before requesting a brand new config; minimum 0 disables this stage, large values are capped at 20
       - TEST_URLS=https://grok.com,https://example.com # Comma/semicolon-separated URLs; all must avoid 4xx/5xx before startup succeeds
 ```
 
@@ -186,7 +186,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WARP_STACK=ipv6-preferred # ipv6-preferred（默认）、dual、ipv4-only 或 ipv6-only
       - WARP_API_URL=https://api1.example.com/register?format=wireguard,https://api2.example.com/register?format=wireguard # 可配置一个或多个兼容注册 API，逗号/分号分隔后会按顺序尝试
       - WARP_API_PROXY=http://127.0.0.1:8080 # 仅用于注册 API 请求的可选代理
-      - WG_RECONNECT_RETRIES=5 # 健康检查失败后，先断开重连 wg0 的重试次数；最低为 0，设为 0 则直接跳过此阶段
+      - WG_RECONNECT_RETRIES=5 # 健康检查失败后，先断开重连 wg0 的重试次数；最低为 0，设为 0 则直接跳过此阶段，过大值会被限制到 20
       - TEST_URLS=https://grok.com,https://example.com # 逗号/分号分隔的测试 URL；必须全部不返回 4xx/5xx 才算通过
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
@@ -198,7 +198,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 如果你要切换到别的兼容注册 API，可以设置 `WARP_API_URL`；如果配置了多个地址（逗号或分号分隔），每次注册请求都会按顺序逐个尝试；如果只有这一步注册请求需要走代理，可以设置 `WARP_API_PROXY`。两者都不会改变请求方式和返回的 WireGuard 配置格式。
 >
-> 当健康检查失败时，如果是取不到出口 IP，MicroWARP 会先立即切断 SOCKS 服务；随后无论是取不到出口 IP，还是 `TEST_URLS` 返回异常，都会按 `WG_RECONNECT_RETRIES` 的配置先执行 `wg0` 断开重连并重新跑健康检查。只有在这些重试全部失败后，才会重新向 API 申请新的配置。默认值是 `5`，最小值是 `0`，设为 `0` 会直接跳过重连阶段。
+> 当健康检查失败时，如果是取不到出口 IP，MicroWARP 会先立即切断 SOCKS 服务；随后无论是取不到出口 IP，还是 `TEST_URLS` 返回异常，都会按 `WG_RECONNECT_RETRIES` 的配置先执行 `wg0` 断开重连并重新跑健康检查。只有在这些重试全部失败后，才会重新向 API 申请新的配置。默认值是 `5`，最小值是 `0`，设为 `0` 会直接跳过重连阶段；为了兼容 Alpine 的 `/bin/sh` 数值比较，过大值会被限制到 `20`。
 >
 > 现在启动日志还会打印一份简短的身份摘要，包括私钥指纹、接口地址和最终采用的 Peer Endpoint，方便你确认“设备身份是否真的变了”。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
 

@@ -307,18 +307,29 @@ check_test_urls() {
 }
 
 get_wg_reconnect_retries() {
-    case "${WG_RECONNECT_RETRIES:-5}" in
+    RAW_RETRIES=${WG_RECONNECT_RETRIES:-5}
+
+    case "$RAW_RETRIES" in
         '')
             printf '5\n'
+            return 0
             ;;
         -*)
             printf '0\n'
+            return 0
             ;;
         *[!0-9]*)
             printf '5\n'
+            return 0
+            ;;
+    esac
+
+    case "$RAW_RETRIES" in
+        0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20)
+            printf '%s\n' "$RAW_RETRIES"
             ;;
         *)
-            printf '%s\n' "${WG_RECONNECT_RETRIES}"
+            printf '20\n'
             ;;
     esac
 }
