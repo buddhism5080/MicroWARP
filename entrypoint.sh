@@ -10,6 +10,7 @@ ROTATE_IP_ON_START="${ROTATE_IP_ON_START:-0}"
 WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '[:lower:]')
 WARP_API_URL="${WARP_API_URL:-https://warp.cloudflare.nyc.mn/?run=register&format=wireguard}"
 WARP_API_PROXY="${WARP_API_PROXY:-}"
+TEST_URLS_CHECK_INTERVAL="${TEST_URLS_CHECK_INTERVAL:-900}"
 mkdir -p /etc/wireguard
 
 # SOCKS5 代理配置
@@ -398,12 +399,12 @@ ensure_network_ready() {
 }
 
 periodic_test_url_monitor() {
-    echo "==> [MicroWARP] 已启动守护模式，每 15 分钟进行一次健康巡检..."
+    echo "==> [MicroWARP] 已启动守护模式，每 ${TEST_URLS_CHECK_INTERVAL} 秒进行一次健康巡检..."
     while true; do
         # 睡眠等待期间能随时响应容器的停止信号
-        sleep 900 & wait $!
+        sleep "$TEST_URLS_CHECK_INTERVAL" & wait $!
 
-        echo "==> [MicroWARP] 正在执行 15 分钟 TEST_URLS 巡检..."
+        echo "==> [MicroWARP] 正在执行 TEST_URLS 巡检（间隔 ${TEST_URLS_CHECK_INTERVAL} 秒）..."
 
         # 巡检时直接发起检测，不干扰正常运行的 SOCKS
         if check_test_urls; then

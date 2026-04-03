@@ -94,6 +94,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WARP_API_PROXY=http://127.0.0.1:8080 # Optional proxy used only for the API registration request
       - WG_RECONNECT_RETRIES=5 # Reconnect wg0 this many times before requesting a brand new config; minimum 0 disables this stage, large values are capped at 20
       - TEST_URLS=https://grok.com,https://example.com # Comma/semicolon-separated URLs; all must avoid 4xx/5xx before startup succeeds
+      - TEST_URLS_CHECK_INTERVAL=900 # Background TEST_URLS inspection interval in seconds; default 900
 ```
 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
@@ -188,6 +189,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WARP_API_PROXY=http://127.0.0.1:8080 # 仅用于注册 API 请求的可选代理
       - WG_RECONNECT_RETRIES=5 # 健康检查失败后，先断开重连 wg0 的重试次数；最低为 0，设为 0 则直接跳过此阶段，过大值会被限制到 20
       - TEST_URLS=https://grok.com,https://example.com # 逗号/分号分隔的测试 URL；必须全部不返回 4xx/5xx 才算通过
+      - TEST_URLS_CHECK_INTERVAL=900 # 后台 TEST_URLS 巡检间隔，单位秒；默认 900
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
