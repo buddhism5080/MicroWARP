@@ -201,7 +201,10 @@ start_warp_interface() {
     PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
 
     echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-    wg-quick up wg0 > /dev/null 2>&1
+    if ! wg-quick up wg0 > /dev/null 2>&1; then
+        echo "==> [MicroWARP] [WARN] wg0 启动失败"
+        return 1
+    fi
 
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
@@ -212,6 +215,7 @@ start_warp_interface() {
 
     sleep 3
     echo "==> [MicroWARP] 隧道已启动"
+    return 0
 }
 
 restart_warp_with_new_identity() {
@@ -266,16 +270,14 @@ ensure_trace_ip() {
 
         if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
             echo "==> [MicroWARP] ⚠️ 获取 IP 连续超时，底层连通性异常！"
+            echo "==> [MicroWARP] 获取不到出口 IP，先切断 SOCKS 服务"
+            stop_socks
             return 1
         fi
 
         echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP..."
-        # 准备尝试重连前，因为网卡要重置，明确发现故障先切断代理
-        stop_socks
-
-        echo "==> [MicroWARP] 正在重新注册并重试..."
         ATTEMPT=$((ATTEMPT + 1))
-        restart_warp_with_new_identity
+        sleep 2
     done
 }
 
@@ -304,26 +306,82 @@ check_test_urls() {
     return 0
 }
 
+get_wg_reconnect_retries() {
+    case "${WG_RECONNECT_RETRIES:-5}" in
+        '')
+            printf '5\n'
+            ;;
+        -*)
+            printf '0\n'
+            ;;
+        *[!0-9]*)
+            printf '5\n'
+            ;;
+        *)
+            printf '%s\n' "${WG_RECONNECT_RETRIES}"
+            ;;
+    esac
+}
+
+run_health_checks() {
+    ensure_trace_ip || return 1
+    check_test_urls
+}
+
+restart_wg_interface() {
+    echo "==> [MicroWARP] 正在断开并重连 wg0..."
+    wg-quick down wg0 > /dev/null 2>&1 || true
+    if start_warp_interface; then
+        return 0
+    fi
+
+    echo "==> [MicroWARP] [WARN] WG 接口重连失败"
+    return 1
+}
+
+try_wg_reconnect_recovery() {
+    RECONNECT_RETRIES=$(get_wg_reconnect_retries)
+
+    if [ "$RECONNECT_RETRIES" -le 0 ]; then
+        echo "==> [MicroWARP] 已禁用 WG 重连重试，跳过接口重连阶段"
+        return 1
+    fi
+
+    ATTEMPT=1
+    while [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ]; do
+        echo "==> [MicroWARP] 正在执行 WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
+        if restart_wg_interface && run_health_checks; then
+            echo "==> [MicroWARP] WG 重连后健康检查已恢复"
+            return 0
+        fi
+
+        ATTEMPT=$((ATTEMPT + 1))
+        [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ] && sleep 3
+    done
+
+    echo "==> [MicroWARP] [WARN] WG 重连重试全部失败"
+    return 1
+}
+
 # ==========================================
 # 核心网络就绪保证 (仅限发现异常进入修复或初次启动时)
 # ==========================================
 ensure_network_ready() {
     while true; do
-        if ensure_trace_ip; then
-            if check_test_urls; then
-                # 测试均通过，安全上线
-                start_socks
-                return 0
-            fi
+        if run_health_checks; then
+            start_socks
+            return 0
         fi
 
-        # 走到这里说明：虽然拿到IP但测试URL不通，或者根本拿不到IP
         echo "==> [MicroWARP] 连通性测试未通过！"
-
-        # 确定网络有问题，立刻切断SOCKS（防透传泄漏）
         stop_socks
 
-        echo "==> [MicroWARP] 正在重新注册并重置节点..."
+        if try_wg_reconnect_recovery; then
+            start_socks
+            return 0
+        fi
+
+        echo "==> [MicroWARP] WG 重连重试后仍未恢复，正在重新注册并重置节点..."
         restart_warp_with_new_identity
     done
 }
