@@ -253,33 +253,22 @@ stop_socks() {
 }
 
 ensure_trace_ip() {
-    TRACE_ATTEMPTS=${TRACE_ATTEMPTS:-3}
-    ATTEMPT=1
+    TRACE_OUTPUT_V4=$(curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
+    TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
+    TRACE_OUTPUT_V6=$(curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
+    TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
 
-    while [ "$ATTEMPT" -le "$TRACE_ATTEMPTS" ]; do
-        TRACE_OUTPUT_V4=$(curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
-        TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
-        TRACE_OUTPUT_V6=$(curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
-        TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
+    if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
+        echo "==> [MicroWARP] 当前出口 IP 已获取："
+        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
+        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
+        return 0
+    fi
 
-        if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
-            echo "==> [MicroWARP] 当前出口 IP 已获取："
-            [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
-            [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
-            return 0
-        fi
-
-        if [ "$ATTEMPT" -ge "$TRACE_ATTEMPTS" ]; then
-            echo "==> [MicroWARP] ⚠️ 获取 IP 连续超时，底层连通性异常！"
-            echo "==> [MicroWARP] 获取不到出口 IP，先切断 SOCKS 服务"
-            stop_socks
-            return 1
-        fi
-
-        echo "==> [MicroWARP] 第 ${ATTEMPT}/${TRACE_ATTEMPTS} 次未获取到出口 IP..."
-        ATTEMPT=$((ATTEMPT + 1))
-        sleep 2
-    done
+    echo "==> [MicroWARP] ⚠️ 当前出口 IP 检测失败，直接判定底层连通性异常！"
+    echo "==> [MicroWARP] 获取不到出口 IP，先切断 SOCKS 服务"
+    stop_socks
+    return 1
 }
 
 check_test_urls() {
