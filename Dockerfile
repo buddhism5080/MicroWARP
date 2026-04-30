@@ -12,9 +12,12 @@ RUN git clone https://github.com/rofl0r/microsocks.git /src && \
 # 阶段 2：极净运行环境
 # ==========================================
 FROM dockerhub.timeweb.cloud/library/alpine:latest
+ENV TZ=Asia/Shanghai
 
 # 仅安装必要的内核级 WireGuard 和网络控制工具
-RUN apk add --no-cache wireguard-tools iptables iproute2 curl
+RUN apk add --no-cache wireguard-tools iptables iproute2 curl tzdata && \
+    ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime && \
+    echo "${TZ}" > /etc/timezone
 
 # 打包microsocks
 COPY --from=builder /src/microsocks /usr/local/bin/microsocks

@@ -11,12 +11,16 @@ WARP_STACK_MODE=$(printf '%s' "${WARP_STACK:-ipv6-preferred}" | tr '[:upper:]' '
 WARP_API_URL="${WARP_API_URL:-https://warp.cloudflare.nyc.mn/?run=register&format=wireguard}"
 WARP_API_PROXY="${WARP_API_PROXY:-}"
 TEST_URLS_CHECK_INTERVAL="${TEST_URLS_CHECK_INTERVAL:-900}"
+TZ="${TZ:-Asia/Shanghai}"
+export TZ
 mkdir -p /etc/wireguard
 
 # SOCKS5 代理配置
 LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
 LISTEN_PORT=${BIND_PORT:-"1080"}
 SOCKS_PID=""
+SOCKS_ONLINE_AT_EPOCH=""
+SOCKS_ONLINE_AT_TEXT=""
 
 is_enabled() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -229,6 +233,49 @@ restart_warp_with_new_identity() {
 # ==========================================
 # SOCKS5 代理生命周期管理
 # ==========================================
+format_uptime_duration() {
+    TOTAL_SECONDS=${1:-0}
+
+    case "$TOTAL_SECONDS" in
+        ''|*[!0-9-]*)
+            TOTAL_SECONDS=0
+            ;;
+    esac
+
+    [ "$TOTAL_SECONDS" -lt 0 ] && TOTAL_SECONDS=0
+
+    DAYS=$((TOTAL_SECONDS / 86400))
+    HOURS=$(( (TOTAL_SECONDS % 86400) / 3600 ))
+    MINUTES=$(( (TOTAL_SECONDS % 3600) / 60 ))
+    SECONDS=$((TOTAL_SECONDS % 60))
+
+    if [ "$DAYS" -gt 0 ]; then
+        printf '%dd %02dh %02dm %02ds\n' "$DAYS" "$HOURS" "$MINUTES" "$SECONDS"
+        return 0
+    fi
+
+    printf '%02dh %02dm %02ds\n' "$HOURS" "$MINUTES" "$SECONDS"
+}
+
+record_socks_online_started_at() {
+    SOCKS_ONLINE_AT_EPOCH=$(date +%s)
+    SOCKS_ONLINE_AT_TEXT=$(date '+%Y-%m-%d %H:%M:%S %z')
+}
+
+print_socks_health_check_success() {
+    if [ -z "$SOCKS_ONLINE_AT_EPOCH" ] || [ -z "$SOCKS_ONLINE_AT_TEXT" ]; then
+        echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线"
+        return 0
+    fi
+
+    NOW_EPOCH=$(date +%s)
+    UPTIME_SECONDS=$((NOW_EPOCH - SOCKS_ONLINE_AT_EPOCH))
+    [ "$UPTIME_SECONDS" -lt 0 ] && UPTIME_SECONDS=0
+    UPTIME_TEXT=$(format_uptime_duration "$UPTIME_SECONDS")
+
+    echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
+}
+
 start_socks() {
     if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
         echo "==> [MicroWARP] 🟢 节点状态健康，正在启动 SOCKS 服务..."
@@ -238,6 +285,7 @@ start_socks() {
             microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" > /dev/null 2>&1 &
         fi
         SOCKS_PID=$!
+        record_socks_online_started_at
         echo "==> [MicroWARP] 🚀 MicroSOCKS 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
     fi
 }
@@ -247,9 +295,12 @@ stop_socks() {
         echo "==> [MicroWARP] 🛑 切断 SOCKS 服务，避免请求黑洞..."
         kill "$SOCKS_PID" 2>/dev/null || true
         wait "$SOCKS_PID" 2>/dev/null || true
-        SOCKS_PID=""
         echo "==> [MicroWARP] 🔻 SOCKS 服务已下线"
     fi
+
+    SOCKS_PID=""
+    SOCKS_ONLINE_AT_EPOCH=""
+    SOCKS_ONLINE_AT_TEXT=""
 }
 
 ensure_trace_ip() {
@@ -397,7 +448,7 @@ periodic_test_url_monitor() {
 
         # 巡检时直接发起检测，不干扰正常运行的 SOCKS
         if check_test_urls; then
-            echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线"
+            print_socks_health_check_success
             continue
         fi
 
