@@ -322,6 +322,67 @@ ensure_trace_ip() {
     return 1
 }
 
+is_retryable_test_url_curl_exit() {
+    case "${1:-}" in
+        5|6|7|28|52|55|56)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_test_url_retry_reason() {
+    case "${1:-}" in
+        28)
+            printf '请求超时\n'
+            ;;
+        5|6)
+            printf 'DNS 波动\n'
+            ;;
+        7|52|55|56)
+            printf '本地网络波动\n'
+            ;;
+        *)
+            printf '可重试错误\n'
+            ;;
+    esac
+}
+
+check_single_test_url() {
+    TARGET_URL=$1
+    RETRYABLE_FAILURE_RETRIES=2
+    ATTEMPT=1
+
+    while true; do
+        if TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TARGET_URL"); then
+            CURL_EXIT=0
+        else
+            CURL_EXIT=$?
+        fi
+
+        [ -n "$TEST_HTTP_CODE" ] || TEST_HTTP_CODE="000"
+        echo "==> [MicroWARP] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+
+        if is_retryable_test_url_curl_exit "$CURL_EXIT" && [ "$ATTEMPT" -le "$RETRYABLE_FAILURE_RETRIES" ]; then
+            RETRY_REASON=$(get_test_url_retry_reason "$CURL_EXIT")
+            echo "==> [MicroWARP] ${TARGET_URL} ${RETRY_REASON}，5 秒后重试 (${ATTEMPT}/${RETRYABLE_FAILURE_RETRIES})..."
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+            continue
+        fi
+
+        case "$TEST_HTTP_CODE" in
+            4*|5*|000|"")
+                return 1
+                ;;
+        esac
+
+        return 0
+    done
+}
+
 check_test_urls() {
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
@@ -332,15 +393,10 @@ check_test_urls() {
 '
     for TEST_URL in $TEST_URLS_LIST; do
         [ -n "$TEST_URL" ] || continue
-        TEST_HTTP_CODE=$(curl -A 'Mozilla/5.0' -sL -o /dev/null -w '%{http_code}' -m 10 "$TEST_URL" || true)
-        echo "==> [MicroWARP] 测速反馈 ${TEST_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
-
-        case "$TEST_HTTP_CODE" in
-            4*|5*|000|"")
-                IFS=$OLD_IFS
-                return 1
-                ;;
-        esac
+        if ! check_single_test_url "$TEST_URL"; then
+            IFS=$OLD_IFS
+            return 1
+        fi
     done
 
     IFS=$OLD_IFS
