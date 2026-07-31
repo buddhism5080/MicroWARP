@@ -53,7 +53,7 @@ version: '3.8'
 
 services:
   microwarp:
-    image: ghcr.io/ccbkkb/microwarp:latest
+    image: ghcr.io/buddhism5080/microwarp-fork-1193760856:feat-multi-instance-lb
     container_name: microwarp
     restart: always
     ports:
@@ -74,6 +74,11 @@ services:
 volumes:
   warp-data:
 ```
+
+> **Fork image note:** this branch’s CI publishes to  
+> `ghcr.io/buddhism5080/microwarp-fork-1193760856:<branch-tag>`  
+> (branch slashes become hyphens, e.g. `feat/multi-instance-lb` → `feat-multi-instance-lb`).  
+> Upstream mainline images remain under `ghcr.io/ccbkkb/microwarp`.
 
 Run the container:
 ```bash
@@ -158,7 +163,7 @@ version: '3.8'
 
 services:
   microwarp:
-    image: ghcr.io/ccbkkb/microwarp:latest
+    image: ghcr.io/buddhism5080/microwarp-fork-1193760856:feat-multi-instance-lb
     container_name: microwarp
     restart: always
     ports:
@@ -179,6 +184,11 @@ services:
 volumes:
   warp-data:
 ```
+
+> **Fork 镜像说明：** 当前分支的 CI 会推到  
+> `ghcr.io/buddhism5080/microwarp-fork-1193760856:<分支标签>`  
+> （分支名里的 `/` 会变成 `-`，例如 `feat/multi-instance-lb` → `feat-multi-instance-lb`）。  
+> 上游正式镜像仍是 `ghcr.io/ccbkkb/microwarp`。
 
 启动容器：
 ```bash
