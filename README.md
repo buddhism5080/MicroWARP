@@ -61,12 +61,15 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+      # multi-instance (WARP_INSTANCES>1) also needs:
+      # - SYS_ADMIN
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
       - warp-data:/etc/wireguard # Keep account data to avoid rate limits
     environment:
       - ROTATE_IP_ON_START=0 # Set to 1 to refresh the WARP exit IP on each container start
+      # - WARP_INSTANCES=3 # >1 = multiple in-container WARP tunnels + single SOCKS LB
 
 volumes:
   warp-data:
@@ -95,6 +98,8 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WG_RECONNECT_RETRIES=5 # Reconnect wg0 this many times before requesting a brand new config; minimum 0 disables this stage, large values are capped at 20
       - TEST_URLS=https://grok.com,https://example.com # Comma/semicolon-separated URLs; all must avoid 4xx/5xx before startup succeeds
       - TEST_URLS_CHECK_INTERVAL=900 # Background TEST_URLS inspection interval in seconds; default 900
+      - WARP_INSTANCES=1 # Number of in-container WARP tunnels (default 1, max 100). >1 enables single-port HAProxy LB over healthy instances only
+      - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
 ```
 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
@@ -106,6 +111,12 @@ MicroWARP supports powerful environment variables to customize your setup while 
 *(When health checks fail, MicroWARP now first disconnects and reconnects `wg0`, then reruns the checks. Only after `WG_RECONNECT_RETRIES` attempts still fail will it request a brand new config. The default is `5`, and `0` disables the reconnect phase.)*
 
 *(Startup logs now print a short WARP identity summary, including a private-key fingerprint, interface addresses, and the selected peer endpoint. If you pass multiple endpoints in `ENDPOINT_IP`, separated by commas or semicolons, MicroWARP will randomly pick one on each start.)*
+
+*(Set `WARP_INSTANCES=N` (N>1) to run **multiple WARP tunnels inside one container**. Only one SOCKS port is exposed (`BIND_ADDR`/`BIND_PORT`); HAProxy round-robins to healthy in-container backends and immediately removes unhealthy ones from the pool. Per-instance configs live under `/etc/wireguard/instances/<id>/wg0.conf`. Multi-instance needs extra privileges for network namespaces — add `SYS_ADMIN` (in addition to the usual `NET_ADMIN` / `SYS_MODULE`). Default remains `1` and keeps the original single-tunnel path.)*
+
+*(Multi-instance runtime notes: instances start **serially with a 1s stagger**; health probes are also staggered by `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES`. A failed instance is removed from HAProxy immediately and revived by its own **background worker** (reconnect → re-register with backoff) so one bad tunnel cannot block the whole container. Registration API calls are serialized across workers.)*
+
+*(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -155,12 +166,15 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+      # 多实例 (WARP_INSTANCES>1) 还需要:
+      # - SYS_ADMIN
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
       - warp-data:/etc/wireguard # 持久化保存账号凭证，防止重启触发风控
     environment:
       - ROTATE_IP_ON_START=0 # 改成 1 则每次容器启动时都刷新一次 WARP 出口 IP
+      # - WARP_INSTANCES=3 # >1 = 单容器多 WARP 隧道 + 单 SOCKS 健康负载均衡
 
 volumes:
   warp-data:
@@ -190,6 +204,8 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WG_RECONNECT_RETRIES=5 # 健康检查失败后，先断开重连 wg0 的重试次数；最低为 0，设为 0 则直接跳过此阶段，过大值会被限制到 20
       - TEST_URLS=https://grok.com,https://example.com # 逗号/分号分隔的测试 URL；必须全部不返回 4xx/5xx 才算通过
       - TEST_URLS_CHECK_INTERVAL=900 # 后台 TEST_URLS 巡检间隔，单位秒；默认 900
+      - WARP_INSTANCES=1 # 单容器内并行 WARP 隧道数量（默认 1，最大 100）。>1 时只暴露一个 SOCKS 端口，经 HAProxy 只负载到健康实例
+      - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
@@ -203,6 +219,12 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 > 当健康检查失败时，如果是取不到出口 IP，MicroWARP 会先立即切断 SOCKS 服务；随后无论是取不到出口 IP，还是 `TEST_URLS` 返回异常，都会按 `WG_RECONNECT_RETRIES` 的配置先执行 `wg0` 断开重连并重新跑健康检查。只有在这些重试全部失败后，才会重新向 API 申请新的配置。默认值是 `5`，最小值是 `0`，设为 `0` 会直接跳过重连阶段；为了兼容 Alpine 的 `/bin/sh` 数值比较，过大值会被限制到 `20`。
 >
 > 现在启动日志还会打印一份简短的身份摘要，包括私钥指纹、接口地址和最终采用的 Peer Endpoint，方便你确认“设备身份是否真的变了”。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
+>
+> 设置 `WARP_INSTANCES=N`（N>1）可在**同一个容器内**并行多条 WARP 隧道：对外仍只暴露一个 SOCKS 端口（`BIND_ADDR`/`BIND_PORT`），由 HAProxy 轮询健康后端，不健康实例会立刻从池中剔除。各实例配置保存在 `/etc/wireguard/instances/<id>/wg0.conf`。多实例依赖 network namespace，除常规 `NET_ADMIN` / `SYS_MODULE` 外建议再加 `SYS_ADMIN`。默认仍是 `1`，完全走原来的单隧道路径。
+>
+> 多实例运行细节：实例**串行启动并间隔 1 秒错峰**；健康巡检按 `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES` 错峰。失败实例会立刻踢出 HAProxy，并由各自的**后台 worker**独立复活（重连 → 重注册，带退避），避免单个坏隧道卡死整容器。各 worker 的注册 API 请求会串行化，降低打爆注册接口的风险。
+>
+> 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 

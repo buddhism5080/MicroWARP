@@ -11,10 +11,16 @@ mkdir() {
 source <(python3 - <<'PY'
 from pathlib import Path
 text = Path('entrypoint.sh').read_text()
-marker = "# ==========================================\n# 1. 账号全自动申请与配置生成\n# ==========================================\n"
-if marker not in text:
+# Prefer the multi-instance entrypoint marker; fall back to the legacy single-instance marker.
+for marker in (
+    "# ==========================================\n# 1. 初始化\n# ==========================================\n",
+    "# ==========================================\n# 1. 账号全自动申请与配置生成\n# ==========================================\n",
+):
+    if marker in text:
+        print(text.split(marker)[0], end='')
+        break
+else:
     raise SystemExit('entrypoint marker not found')
-print(text.split(marker)[0], end='')
 PY
 )
 
