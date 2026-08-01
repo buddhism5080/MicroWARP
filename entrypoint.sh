@@ -602,22 +602,167 @@ stop_socks() {
     SOCKS_ONLINE_AT_TEXT=""
 }
 
-ensure_trace_ip() {
-    TRACE_OUTPUT_V4=$(curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
-    TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
-    TRACE_OUTPUT_V6=$(curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
-    TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
+# Extract a usable public IP from common probe response shapes:
+# - Cloudflare trace: ip=x.x.x.x
+# - plain text: x.x.x.x / 2a09:...
+# - tiny JSON: {"ip":"..."} / "ip": "..."
+extract_ip_from_probe_body() {
+    BODY=$1
+    FAMILY=${2:-any}   # v4 | v6 | any
+    CANDIDATE=$(printf '%s\n' "$BODY" | tr -d '\r' | awk '
+        BEGIN { found="" }
+        {
+            line=$0
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line ~ /^ip=/) {
+                sub(/^ip=/, "", line)
+                found=line
+                exit
+            }
+            if (match(line, /"ip"[[:space:]]*:[[:space:]]*"/)) {
+                line=substr(line, RSTART)
+                sub(/^"ip"[[:space:]]*:[[:space:]]*"/, "", line)
+                sub(/".*/, "", line)
+                found=line
+                exit
+            }
+            # plain single-token body
+            if (NF==1 && line !~ /[^0-9A-Fa-f:.]/) {
+                found=line
+                exit
+            }
+        }
+        END { if (found != "") print found }
+    ')
+
+    [ -n "$CANDIDATE" ] || return 1
+    CANDIDATE=$(printf '%s' "$CANDIDATE" | tr -d '[:space:]')
+
+    case "$FAMILY" in
+        v4)
+            printf '%s\n' "$CANDIDATE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+            ;;
+        v6)
+            # must look like IPv6 (contains colon, not dotted-quad only)
+            case "$CANDIDATE" in
+                *:*) ;;
+                *) return 1 ;;
+            esac
+            printf '%s\n' "$CANDIDATE" | grep -Eq '^[0-9A-Fa-f:]+$' || return 1
+            ;;
+        *)
+            ;;
+    esac
+
+    printf '%s\n' "$CANDIDATE"
+    return 0
+}
+
+# Default multi-source lists (comma-separated). Prefer:
+# - IP-literal HTTPS endpoints (no DNS dependency)
+# - globally anycast / highly available providers
+# Override via EGRESS_IP_V4_URLS / EGRESS_IP_V6_URLS if needed.
+get_egress_ip_v4_urls() {
+    RAW=${EGRESS_IP_V4_URLS:-https://1.1.1.1/cdn-cgi/trace,https://1.0.0.1/cdn-cgi/trace,https://cloudflare.com/cdn-cgi/trace,https://api.ipify.org,https://checkip.amazonaws.com,https://ipv4.icanhazip.com,https://ifconfig.me/ip}
+    printf '%s\n' "$RAW"
+}
+
+get_egress_ip_v6_urls() {
+    RAW=${EGRESS_IP_V6_URLS:-https://[2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]/cdn-cgi/trace,https://api64.ipify.org,https://ipv6.icanhazip.com}
+    printf '%s\n' "$RAW"
+}
+
+get_egress_ip_curl_max_time() {
+    RAW=${EGRESS_IP_CURL_MAX_TIME:-4}
+    case "$RAW" in
+        ''|*[!0-9]*) printf '4\n' ;;
+        0) printf '1\n' ;;
+        *) printf '%s\n' "$RAW" ;;
+    esac
+}
+
+# Probe one family through optional netns. Sets PROBED_IP on success.
+# Usage: probe_egress_ip_family <v4|v6> [netns_name]
+probe_egress_ip_family() {
+    FAMILY=$1
+    NS_NAME=${2:-}
+    PROBED_IP=''
+    MAX_TIME=$(get_egress_ip_curl_max_time)
+
+    if [ "$FAMILY" = "v4" ]; then
+        URLS_RAW=$(get_egress_ip_v4_urls)
+        CURL_FAMILY_FLAG='-4'
+    else
+        URLS_RAW=$(get_egress_ip_v6_urls)
+        CURL_FAMILY_FLAG='-6'
+    fi
+
+    URLS=$(printf '%s' "$URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+    [ -n "$URLS" ] || return 1
+
+    OLD_IFS=$IFS
+    IFS='
+'
+    for URL in $URLS; do
+        [ -n "$URL" ] || continue
+        if [ -n "$NS_NAME" ]; then
+            BODY=$(ip netns exec "$NS_NAME" curl $CURL_FAMILY_FLAG -sS -L --connect-timeout 2 -m "$MAX_TIME" \
+                -A 'MicroWARP-health/1.0' --fail "$URL" 2>/dev/null || true)
+        else
+            BODY=$(curl $CURL_FAMILY_FLAG -sS -L --connect-timeout 2 -m "$MAX_TIME" \
+                -A 'MicroWARP-health/1.0' --fail "$URL" 2>/dev/null || true)
+        fi
+        [ -n "$BODY" ] || continue
+        if IP_VAL=$(extract_ip_from_probe_body "$BODY" "$FAMILY"); then
+            PROBED_IP=$IP_VAL
+            PROBED_IP_SOURCE=$URL
+            IFS=$OLD_IFS
+            return 0
+        fi
+    done
+    IFS=$OLD_IFS
+    return 1
+}
+
+# Best-effort dual-stack egress discovery. Never cuts traffic by itself.
+# Returns 0 if at least one family succeeded; 1 if all sources failed.
+# Sets TRACE_IP_V4 / TRACE_IP_V6 to "ip=..." lines (or empty).
+probe_egress_ips() {
+    NS_NAME=${1:-}
+    LABEL=${2:-}
+    TRACE_IP_V4=''
+    TRACE_IP_V6=''
+    PREFIX='==> [MicroWARP]'
+    [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
+
+    PROBED_IP=''
+    PROBED_IP_SOURCE=''
+    if probe_egress_ip_family v4 "$NS_NAME"; then
+        TRACE_IP_V4="ip=${PROBED_IP}"
+        echo "${PREFIX} 出口 IPv4: ${PROBED_IP}  (via ${PROBED_IP_SOURCE})"
+    fi
+
+    PROBED_IP=''
+    PROBED_IP_SOURCE=''
+    if probe_egress_ip_family v6 "$NS_NAME"; then
+        TRACE_IP_V6="ip=${PROBED_IP}"
+        echo "${PREFIX} 出口 IPv6: ${PROBED_IP}  (via ${PROBED_IP_SOURCE})"
+    fi
 
     if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
-        echo "==> [MicroWARP] 当前出口 IP 已获取："
-        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
-        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
         return 0
     fi
 
-    echo "==> [MicroWARP] ⚠️ 当前出口 IP 检测失败，直接判定底层连通性异常！"
-    echo "==> [MicroWARP] 获取不到出口 IP，先切断 SOCKS 服务"
-    stop_socks
+    echo "${PREFIX} ⚠️ 出口 IP 多源探测均失败（不单独据此切断服务，继续以 TEST_URLS 为准）"
+    return 1
+}
+
+ensure_trace_ip() {
+    # Soft signal only: multi-source probe. Do NOT stop SOCKS here.
+    # Hard fail / cut traffic is decided by run_health_checks + TEST_URLS.
+    if probe_egress_ips '' ''; then
+        return 0
+    fi
     return 1
 }
 
@@ -731,8 +876,21 @@ get_wg_reconnect_retries() {
 }
 
 run_health_checks() {
-    ensure_trace_ip || return 1
-    check_test_urls
+    # Egress IP is diagnostic + best-effort. TEST_URLS is the real pass/fail gate
+    # when configured. IP-only hard-fail only if no TEST_URLS are set.
+    IP_OK=0
+    ensure_trace_ip && IP_OK=1 || true
+
+    TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
+    TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+
+    if [ -n "$TEST_URLS_LIST" ]; then
+        check_test_urls
+        return $?
+    fi
+
+    # No TEST_URLS configured: fall back to IP probe as connectivity signal.
+    [ "$IP_OK" -eq 1 ]
 }
 
 restart_wg_interface() {
@@ -1196,21 +1354,8 @@ start_instance_socks() {
 ns_ensure_trace_ip() {
     INST_ID=$1
     NS_NAME=$(get_instance_netns_name "$INST_ID")
-
-    TRACE_OUTPUT_V4=$(ip netns exec "$NS_NAME" curl -4 -s -m 8 https://1.1.1.1/cdn-cgi/trace || true)
-    TRACE_IP_V4=$(printf '%s\n' "$TRACE_OUTPUT_V4" | grep '^ip=' || true)
-    TRACE_OUTPUT_V6=$(ip netns exec "$NS_NAME" curl -6 -s -m 8 https://[2606:4700:4700::1111]/cdn-cgi/trace || true)
-    TRACE_IP_V6=$(printf '%s\n' "$TRACE_OUTPUT_V6" | grep '^ip=' || true)
-
-    if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 当前出口 IP 已获取："
-        [ -n "$TRACE_IP_V4" ] && printf 'IPv4 %s\n' "$TRACE_IP_V4"
-        [ -n "$TRACE_IP_V6" ] && printf 'IPv6 %s\n' "$TRACE_IP_V6"
-        return 0
-    fi
-
-    echo "==> [MicroWARP] [inst${INST_ID}] ⚠️ 出口 IP 检测失败"
-    return 1
+    # Soft: multi-source. Failure alone must not condemn the instance.
+    probe_egress_ips "$NS_NAME" "inst${INST_ID}"
 }
 
 ns_check_single_test_url() {
@@ -1271,8 +1416,18 @@ ns_check_test_urls() {
 
 run_instance_health_checks() {
     INST_ID=$1
-    ns_ensure_trace_ip "$INST_ID" || return 1
-    ns_check_test_urls "$INST_ID"
+    IP_OK=0
+    ns_ensure_trace_ip "$INST_ID" && IP_OK=1 || true
+
+    TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
+    TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+
+    if [ -n "$TEST_URLS_LIST" ]; then
+        ns_check_test_urls "$INST_ID"
+        return $?
+    fi
+
+    [ "$IP_OK" -eq 1 ]
 }
 
 restart_instance_wg() {

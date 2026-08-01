@@ -193,6 +193,45 @@ test_config_stale_offline_threshold() {
     fi
 }
 
+
+test_extract_ip_from_probe_body() {
+    assert_eq "$(extract_ip_from_probe_body $'fl=x\nip=1.2.3.4\nugo=1' v4)" '1.2.3.4' 'cloudflare trace v4'
+    assert_eq "$(extract_ip_from_probe_body $'ip=2a09:bac1::1' v6)" '2a09:bac1::1' 'cloudflare trace v6'
+    assert_eq "$(extract_ip_from_probe_body '8.8.8.8' v4)" '8.8.8.8' 'plain v4'
+    assert_eq "$(extract_ip_from_probe_body '{"ip":"9.9.9.9"}' v4)" '9.9.9.9' 'json ip field'
+    if extract_ip_from_probe_body '1.2.3.4' v6 >/dev/null 2>&1; then
+        echo 'v4 body must not parse as v6' >&2
+        exit 1
+    fi
+}
+
+test_run_health_checks_prefers_test_urls_over_ip_failure() {
+    # IP probe fails, but TEST_URLS pass => overall healthy
+    probe_egress_ips() { return 1; }
+    ensure_trace_ip() { probe_egress_ips '' ''; }
+    check_test_urls() { return 0; }
+    TEST_URLS='https://example.com'
+    if ! run_health_checks; then
+        echo 'expected TEST_URLS success to override IP probe failure' >&2
+        exit 1
+    fi
+}
+
+test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok() {
+    probe_egress_ips() {
+        TRACE_IP_V4='ip=1.2.3.4'
+        TRACE_IP_V6=''
+        return 0
+    }
+    ensure_trace_ip() { probe_egress_ips '' ''; }
+    check_test_urls() { return 1; }
+    TEST_URLS='https://example.com'
+    if run_health_checks; then
+        echo 'expected TEST_URLS failure to fail health even when IP ok' >&2
+        exit 1
+    fi
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -200,6 +239,9 @@ test_instance_count_is_capped
 test_instance_ids_list
 test_instance_paths_and_addresses
 test_parse_endpoint_host_port
+test_extract_ip_from_probe_body
+test_run_health_checks_prefers_test_urls_over_ip_failure
+test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
 test_stagger_skips_after_last_instance
