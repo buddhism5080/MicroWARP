@@ -227,6 +227,199 @@ test_egress_ip_defaults_interleave_vendors() {
     esac
 }
 
+test_run_health_checks_prefers_test_urls_when_ip_soft_disabled() {
+    # threshold 0 => ensure_trace_ip returns 1 soft; TEST_URLS pass => healthy
+    ensure_trace_ip() { return 1; }
+    check_test_urls() { return 0; }
+    TEST_URLS='https://example.com'
+    if ! run_health_checks; then
+        echo 'expected TEST_URLS success when IP hard-fail disabled (soft rc)' >&2
+        exit 1
+    fi
+}
+
+test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok() {
+    ensure_trace_ip() { return 0; }
+    check_test_urls() { return 1; }
+    TEST_URLS='https://example.com'
+    if run_health_checks; then
+        echo 'expected TEST_URLS failure to fail health even when IP ok' >&2
+        exit 1
+    fi
+}
+
+test_run_health_checks_hard_fails_when_round_gets_no_ip() {
+    # rc 2 = this round's link budget exhausted with no IP => WARP down
+    ensure_trace_ip() { return 2; }
+    stop_socks() { :; }
+    check_test_urls() { return 0; }
+    TEST_URLS='https://example.com'
+    if run_health_checks; then
+        echo 'expected no-IP-in-round hard fail to fail health' >&2
+        exit 1
+    fi
+}
+
+test_probe_family_stops_after_threshold_links() {
+    EGRESS_IP_FAIL_THRESHOLD=4
+    EGRESS_IP_V4_URLS='https://a.example/1,https://a.example/2,https://a.example/3,https://a.example/4,https://a.example/5'
+    EGRESS_IP_CURL_MAX_TIME=1
+    # curl runs in $(...); use a file counter so parent can observe attempts
+    CURL_LOG=/tmp/microwarp-egress-curl-$$.log
+    : > "$CURL_LOG"
+    curl() {
+        printf '%s\n' "${@: -1}" >> "$CURL_LOG"
+        return 22
+    }
+    PROBE_URL_ATTEMPTS=0
+    if probe_egress_ip_family v4; then
+        echo 'expected all links to fail' >&2
+        exit 1
+    fi
+    assert_eq "$PROBE_URL_ATTEMPTS" '4' 'should try exactly 4 links then stop'
+    assert_eq "$(wc -l < "$CURL_LOG" | tr -d " ")" '4' 'curl should be invoked 4 times'
+    rm -f "$CURL_LOG"
+}
+
+test_probe_family_stops_early_on_success() {
+    EGRESS_IP_FAIL_THRESHOLD=4
+    EGRESS_IP_V4_URLS='https://a.example/1,https://a.example/2,https://a.example/3'
+    CURL_LOG=/tmp/microwarp-egress-curl-ok-$$.log
+    : > "$CURL_LOG"
+    curl() {
+        printf '%s\n' "${@: -1}" >> "$CURL_LOG"
+        local n
+        n=$(wc -l < "$CURL_LOG" | tr -d " ")
+        if [ "$n" -eq 2 ]; then
+            printf '9.9.9.9\n'
+            return 0
+        fi
+        return 22
+    }
+    if ! probe_egress_ip_family v4; then
+        echo 'expected success on 2nd link' >&2
+        exit 1
+    fi
+    assert_eq "$PROBED_IP" '9.9.9.9' 'parsed ip'
+    assert_eq "$PROBE_URL_ATTEMPTS" '2' 'stop after first success'
+    assert_eq "$(wc -l < "$CURL_LOG" | tr -d " ")" '2' 'only two curls'
+    rm -f "$CURL_LOG"
+}
+
+test_haproxy_config_only_includes_healthy_servers() {
+    local cfg
+    cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:down 2:up 3:up')
+
+    assert_contains "$cfg" 'bind 0.0.0.0:1080' 'frontend bind'
+    assert_contains "$cfg" 'mode tcp' 'tcp mode'
+    assert_contains "$cfg" 'balance roundrobin' 'round robin'
+    assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
+    assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
+
+    if [[ "$cfg" == *'server inst1 '* ]]; then
+        echo 'unhealthy instance 1 must not appear as an active server' >&2
+        exit 1
+    fi
+}
+
+test_haproxy_config_with_no_healthy_backends_still_binds() {
+    local cfg
+    cfg=$(render_haproxy_config '127.0.0.1' '2080' '1:down 2:down')
+    assert_contains "$cfg" 'bind 127.0.0.1:2080' 'frontend should still bind with zero healthy backends'
+    assert_contains "$cfg" 'backend warp_pool' 'backend section remains'
+}
+
+test_stagger_skips_after_last_instance() {
+    local calls=0
+    sleep() {
+        calls=$((calls + 1))
+    }
+
+    INSTANCE_START_STAGGER_SECONDS=1
+    stagger_next_instance_start 3 3
+    assert_eq "$calls" '0' 'last instance should not sleep'
+
+    stagger_next_instance_start 2 3
+    assert_eq "$calls" '1' 'non-last instance should sleep once'
+}
+
+test_health_check_stagger_is_interval_div_count() {
+    TEST_URLS_CHECK_INTERVAL=900
+    assert_eq "$(get_health_check_stagger_seconds 3)" '300' '900/3 should be 300'
+    assert_eq "$(get_health_check_stagger_seconds 1)" '900' 'single instance keeps full interval'
+    assert_eq "$(get_health_check_stagger_seconds 10)" '90' '900/10 should be 90'
+
+    TEST_URLS_CHECK_INTERVAL=5
+    assert_eq "$(get_health_check_stagger_seconds 10)" '1' 'stagger should floor to at least 1 second'
+
+    TEST_URLS_CHECK_INTERVAL=0
+    assert_eq "$(get_health_check_stagger_seconds 4)" '1' 'non-positive interval should still stagger by 1s'
+}
+
+test_config_stale_offline_threshold() {
+    CONFIG_STALE_OFFLINE_SECONDS=7200
+    assert_eq "$(get_config_stale_offline_seconds)" '7200' 'default stale threshold is 2 hours'
+
+    CONFIG_STALE_OFFLINE_SECONDS=0
+    assert_eq "$(get_config_stale_offline_seconds)" '0' '0 disables stale force-reregister'
+
+    CONFIG_STALE_OFFLINE_SECONDS=abc
+    assert_eq "$(get_config_stale_offline_seconds)" '7200' 'invalid value falls back to 7200'
+
+    CONFIG_STALE_OFFLINE_SECONDS=7200
+    NOW=$(date +%s)
+    OLD=$((NOW - 7201))
+    if ! is_offline_long_enough_for_stale_config "$OLD"; then
+        echo 'expected 7201s offline to be stale at 7200 threshold' >&2
+        exit 1
+    fi
+    RECENT=$((NOW - 100))
+    if is_offline_long_enough_for_stale_config "$RECENT"; then
+        echo 'expected 100s offline NOT to be stale at 7200 threshold' >&2
+        exit 1
+    fi
+
+    CONFIG_STALE_OFFLINE_SECONDS=0
+    if is_offline_long_enough_for_stale_config "$OLD"; then
+        echo 'threshold 0 should disable stale detection' >&2
+        exit 1
+    fi
+}
+
+
+test_extract_ip_from_probe_body() {
+    assert_eq "$(extract_ip_from_probe_body $'fl=x\nip=1.2.3.4\nugo=1' v4)" '1.2.3.4' 'cloudflare trace v4'
+    assert_eq "$(extract_ip_from_probe_body $'ip=2a09:bac1::1' v6)" '2a09:bac1::1' 'cloudflare trace v6'
+    assert_eq "$(extract_ip_from_probe_body '8.8.8.8' v4)" '8.8.8.8' 'plain v4'
+    assert_eq "$(extract_ip_from_probe_body '{"ip":"9.9.9.9"}' v4)" '9.9.9.9' 'json ip field'
+    if extract_ip_from_probe_body '1.2.3.4' v6 >/dev/null 2>&1; then
+        echo 'v4 body must not parse as v6' >&2
+        exit 1
+    fi
+}
+
+test_egress_ip_defaults_interleave_vendors() {
+    local v4 v6
+    v4=$(get_egress_ip_v4_urls)
+    v6=$(get_egress_ip_v6_urls)
+    # 1.1.1.1 should appear before 1.0.0.1, and not be adjacent
+    case "$v4" in
+        *'1.1.1.1/cdn-cgi/trace,https://1.0.0.1'* )
+            echo "CF v4 endpoints must not be adjacent: $v4" >&2
+            exit 1
+            ;;
+    esac
+    assert_contains "$v4" '1.1.1.1/cdn-cgi/trace' 'has 1.1.1.1'
+    assert_contains "$v4" '1.0.0.1/cdn-cgi/trace' 'has 1.0.0.1'
+    assert_contains "$v4" 'api4.ipify.org' 'has ipify between CF endpoints ideally'
+    case "$v6" in
+        *'2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]'* )
+            echo "CF v6 endpoints must not be adjacent: $v6" >&2
+            exit 1
+            ;;
+    esac
+}
+
 test_run_health_checks_prefers_test_urls_over_soft_ip_failure() {
     # Soft IP fail (streak below threshold) + TEST_URLS pass => healthy
     EGRESS_IP_FAIL_STREAK=0
@@ -308,10 +501,11 @@ test_instance_paths_and_addresses
 test_parse_endpoint_host_port
 test_extract_ip_from_probe_body
 test_egress_ip_defaults_interleave_vendors
-test_run_health_checks_prefers_test_urls_over_soft_ip_failure
+test_run_health_checks_prefers_test_urls_when_ip_soft_disabled
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
-test_run_health_checks_hard_fails_after_ip_streak_threshold
-test_note_egress_ip_failure_hits_threshold_at_four
+test_run_health_checks_hard_fails_when_round_gets_no_ip
+test_probe_family_stops_after_threshold_links
+test_probe_family_stops_early_on_success
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
 test_stagger_skips_after_last_instance

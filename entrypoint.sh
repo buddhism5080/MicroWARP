@@ -683,8 +683,10 @@ get_egress_ip_curl_max_time() {
     esac
 }
 
-# Consecutive full egress-IP probe failures before declaring WARP dead.
-# Default 4. Set EGRESS_IP_FAIL_THRESHOLD=0 to never hard-fail on IP alone.
+# Max probe URLs to try per address family in one health check.
+# Default 4: if 4 links all fail to yield an IP for a family, that family is done.
+# If BOTH families get no IP after their tries, WARP is declared down.
+# Set EGRESS_IP_FAIL_THRESHOLD=0 to only log and never hard-fail on IP alone.
 get_egress_ip_fail_threshold() {
     RAW=${EGRESS_IP_FAIL_THRESHOLD:-4}
     case "$RAW" in
@@ -693,73 +695,22 @@ get_egress_ip_fail_threshold() {
     esac
 }
 
-# Single-instance streak lives in this shell variable; multi-instance uses files.
-EGRESS_IP_FAIL_STREAK=${EGRESS_IP_FAIL_STREAK:-0}
-
-get_instance_egress_fail_file() {
-    printf '%s/inst%s.egress_fail_streak\n' "$INSTANCE_STATE_DIR" "$1"
-}
-
-read_egress_ip_fail_streak() {
-    # optional inst id; empty => single-instance shell counter
-    INST_ID=${1:-}
-    if [ -z "$INST_ID" ]; then
-        printf '%s\n' "${EGRESS_IP_FAIL_STREAK:-0}"
-        return 0
-    fi
-    F=$(get_instance_egress_fail_file "$INST_ID")
-    if [ -f "$F" ]; then
-        VAL=$(tr -d '\n' < "$F")
-        case "$VAL" in
-            ''|*[!0-9]*) printf '0\n' ;;
-            *) printf '%s\n' "$VAL" ;;
-        esac
-    else
-        printf '0\n'
-    fi
-}
-
-write_egress_ip_fail_streak() {
-    INST_ID=${1:-}
-    VAL=${2:-0}
-    case "$VAL" in
-        ''|*[!0-9]*) VAL=0 ;;
-    esac
-    if [ -z "$INST_ID" ]; then
-        EGRESS_IP_FAIL_STREAK=$VAL
-        return 0
-    fi
-    mkdir -p "$INSTANCE_STATE_DIR"
-    printf '%s\n' "$VAL" > "$(get_instance_egress_fail_file "$INST_ID")"
-}
-
-note_egress_ip_success() {
-    INST_ID=${1:-}
-    write_egress_ip_fail_streak "$INST_ID" 0
-}
-
-# On full dual-stack probe failure: bump streak. Echo new streak on stdout via STREAK var.
-# Returns 0 always; sets EGRESS_IP_STREAK_NOW and EGRESS_IP_STREAK_HARDFAIL=1 if threshold hit.
-note_egress_ip_failure() {
-    INST_ID=${1:-}
-    THRESH=$(get_egress_ip_fail_threshold)
-    CUR=$(read_egress_ip_fail_streak "$INST_ID")
-    CUR=$((CUR + 1))
-    write_egress_ip_fail_streak "$INST_ID" "$CUR"
-    EGRESS_IP_STREAK_NOW=$CUR
-    EGRESS_IP_STREAK_HARDFAIL=0
-    if [ "$THRESH" -gt 0 ] && [ "$CUR" -ge "$THRESH" ]; then
-        EGRESS_IP_STREAK_HARDFAIL=1
-    fi
-}
-
 # Probe one family through optional netns. Sets PROBED_IP on success.
+# Tries at most EGRESS_IP_FAIL_THRESHOLD URLs (default 4), first-success-wins.
 # Usage: probe_egress_ip_family <v4|v6> [netns_name]
+# Sets PROBE_URL_ATTEMPTS to how many links were tried.
 probe_egress_ip_family() {
     FAMILY=$1
     NS_NAME=${2:-}
     PROBED_IP=''
+    PROBED_IP_SOURCE=''
+    PROBE_URL_ATTEMPTS=0
     MAX_TIME=$(get_egress_ip_curl_max_time)
+    MAX_URLS=$(get_egress_ip_fail_threshold)
+    # 0 => try entire list (no hard cap); still used only as soft diagnostic by caller
+    if [ "$MAX_URLS" -eq 0 ]; then
+        MAX_URLS=9999
+    fi
 
     if [ "$FAMILY" = "v4" ]; then
         URLS_RAW=$(get_egress_ip_v4_urls)
@@ -777,6 +728,11 @@ probe_egress_ip_family() {
 '
     for URL in $URLS; do
         [ -n "$URL" ] || continue
+        if [ "$PROBE_URL_ATTEMPTS" -ge "$MAX_URLS" ]; then
+            break
+        fi
+        PROBE_URL_ATTEMPTS=$((PROBE_URL_ATTEMPTS + 1))
+
         if [ -n "$NS_NAME" ]; then
             BODY=$(ip netns exec "$NS_NAME" curl $CURL_FAMILY_FLAG -sS -L --connect-timeout 2 -m "$MAX_TIME" \
                 -A 'MicroWARP-health/1.0' --fail "$URL" 2>/dev/null || true)
@@ -796,42 +752,49 @@ probe_egress_ip_family() {
     return 1
 }
 
-# Best-effort dual-stack egress discovery. Never cuts traffic by itself.
-# Returns 0 if at least one family succeeded; 1 if all sources failed.
-# Sets TRACE_IP_V4 / TRACE_IP_V6 to "ip=..." lines (or empty).
+# Dual-stack egress discovery for one health-check tick.
+# Returns 0 if at least one family got an IP; 1 if all tried links failed.
+# Sets TRACE_IP_V4 / TRACE_IP_V6 and EGRESS_IP_URLS_TRIED.
 probe_egress_ips() {
     NS_NAME=${1:-}
     LABEL=${2:-}
     TRACE_IP_V4=''
     TRACE_IP_V6=''
+    EGRESS_IP_URLS_TRIED=0
     PREFIX='==> [MicroWARP]'
     [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
 
     PROBED_IP=''
     PROBED_IP_SOURCE=''
+    PROBE_URL_ATTEMPTS=0
     if probe_egress_ip_family v4 "$NS_NAME"; then
         TRACE_IP_V4="ip=${PROBED_IP}"
-        echo "${PREFIX} 出口 IPv4: ${PROBED_IP}  (via ${PROBED_IP_SOURCE})"
+        echo "${PREFIX} 出口 IPv4: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
     fi
+    EGRESS_IP_URLS_TRIED=$((EGRESS_IP_URLS_TRIED + PROBE_URL_ATTEMPTS))
 
     PROBED_IP=''
     PROBED_IP_SOURCE=''
+    PROBE_URL_ATTEMPTS=0
     if probe_egress_ip_family v6 "$NS_NAME"; then
         TRACE_IP_V6="ip=${PROBED_IP}"
-        echo "${PREFIX} 出口 IPv6: ${PROBED_IP}  (via ${PROBED_IP_SOURCE})"
+        echo "${PREFIX} 出口 IPv6: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
     fi
+    EGRESS_IP_URLS_TRIED=$((EGRESS_IP_URLS_TRIED + PROBE_URL_ATTEMPTS))
 
     if [ -n "$TRACE_IP_V4" ] || [ -n "$TRACE_IP_V6" ]; then
         return 0
     fi
 
-    echo "${PREFIX} ⚠️ 出口 IP 多源探测均失败"
+    MAX_URLS=$(get_egress_ip_fail_threshold)
+    echo "${PREFIX} ⚠️ 出口 IP 探测失败：本轮已试链接均未取到 IP（每栈最多试 ${MAX_URLS} 条，同厂商已错开）"
     return 1
 }
 
-# Run probe + maintain consecutive-failure streak.
 # optional arg1 = inst id (empty for single-instance)
-# Returns 0 on IP success; 1 on soft fail (streak < threshold); 2 on hard fail (streak >= threshold).
+# Returns 0 on IP success;
+#         1 soft fail only when EGRESS_IP_FAIL_THRESHOLD=0 (never hard-fail on IP);
+#         2 hard fail: this round tried up to N links/family and got no IP → WARP down.
 ensure_trace_ip() {
     INST_ID=${1:-}
     LABEL=''
@@ -842,26 +805,20 @@ ensure_trace_ip() {
     fi
 
     if probe_egress_ips "$NS_NAME" "$LABEL"; then
-        note_egress_ip_success "$INST_ID"
         return 0
     fi
 
-    note_egress_ip_failure "$INST_ID"
     THRESH=$(get_egress_ip_fail_threshold)
     PREFIX='==> [MicroWARP]'
     [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
 
-    if [ "${EGRESS_IP_STREAK_HARDFAIL:-0}" -eq 1 ]; then
-        echo "${PREFIX} 出口 IP 连续失败 ${EGRESS_IP_STREAK_NOW}/${THRESH} 次，判定 WARP 连接失败"
-        return 2
+    if [ "$THRESH" -eq 0 ]; then
+        echo "${PREFIX} 出口 IP 本轮未取到（EGRESS_IP_FAIL_THRESHOLD=0，不据此判死）"
+        return 1
     fi
 
-    if [ "$THRESH" -gt 0 ]; then
-        echo "${PREFIX} 出口 IP 连续失败 ${EGRESS_IP_STREAK_NOW}/${THRESH} 次（未达阈值，暂不单独判死）"
-    else
-        echo "${PREFIX} 出口 IP 探测失败（EGRESS_IP_FAIL_THRESHOLD=0，不据此判死）"
-    fi
-    return 1
+    echo "${PREFIX} 本轮 ${THRESH} 条链接内未取到出口 IP，判定 WARP 连接失败"
+    return 2
 }
 
 is_retryable_test_url_curl_exit() {
@@ -974,16 +931,14 @@ get_wg_reconnect_retries() {
 }
 
 run_health_checks() {
-    # Egress IP multi-source probe with consecutive-fail streak:
-    # - success => reset streak
-    # - fail streak >= EGRESS_IP_FAIL_THRESHOLD (default 4) => WARP hard-fail
-    # - below threshold + TEST_URLS set => TEST_URLS still decides
-    # - no TEST_URLS => IP probe is the connectivity signal
+    # Egress IP: try up to EGRESS_IP_FAIL_THRESHOLD links per family (default 4).
+    # If this round gets no IP from those links => WARP hard-fail (rc 2).
+    # Soft rc 1 only when threshold is 0; then TEST_URLS may still pass.
     ensure_trace_ip
     IP_RC=$?
 
     if [ "$IP_RC" -eq 2 ]; then
-        # Consecutive IP failures hit threshold: treat as WARP down.
+        # This round: N links failed to yield any egress IP → WARP down.
         stop_socks
         return 1
     fi
@@ -1525,7 +1480,7 @@ run_instance_health_checks() {
     IP_RC=$?
 
     if [ "$IP_RC" -eq 2 ]; then
-        # Consecutive IP failures hit threshold: instance is WARP-dead.
+        # This round: N links failed to yield any egress IP → instance WARP-dead.
         return 1
     fi
 

@@ -109,7 +109,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
       # - EGRESS_IP_CURL_MAX_TIME=4 # per-source curl max-time seconds (default 4)
-      # - EGRESS_IP_FAIL_THRESHOLD=4 # consecutive full IP-probe failures before WARP is declared down (0=never)
+      # - EGRESS_IP_FAIL_THRESHOLD=4 # max links to try per family in one check; all miss => WARP down (0=never hard-fail on IP)
 ```
 
 *(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
@@ -120,7 +120,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(When health checks fail, MicroWARP now first disconnects and reconnects `wg0`, then reruns the checks. Only after `WG_RECONNECT_RETRIES` attempts still fail will it request a brand new config. The default is `5`, and `0` disables the reconnect phase.)*
 
-*(Egress IP discovery is multi-source with same-vendor endpoints interleaved (e.g. `1.1.1.1` … later `1.0.0.1`). A single failed probe round only raises a streak counter; after `EGRESS_IP_FAIL_THRESHOLD` consecutive full failures (default **4**), WARP is declared down. Below that threshold, configured `TEST_URLS` still decide health. Set the threshold to `0` to disable IP-based hard-fail.)*
+*(Egress IP discovery is multi-source with same-vendor endpoints interleaved (e.g. `1.1.1.1` … later `1.0.0.1`). In **one** health check it tries up to `EGRESS_IP_FAIL_THRESHOLD` links per address family (default **4**), first success wins; if those links yield no IP, WARP is declared down. Set the threshold to `0` to disable IP-based hard-fail (then `TEST_URLS` alone decide).)*
 
 *(Startup logs now print a short WARP identity summary, including a private-key fingerprint, interface addresses, and the selected peer endpoint. If you pass multiple endpoints in `ENDPOINT_IP`, separated by commas or semicolons, MicroWARP will randomly pick one on each start.)*
 
@@ -227,7 +227,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
       # - EGRESS_IP_CURL_MAX_TIME=4 # 单个探测源超时秒数（默认 4）
-      # - EGRESS_IP_FAIL_THRESHOLD=4 # 连续整轮 IP 探测失败多少次后判定 WARP 挂（默认 4；0=不因 IP 判死）
+      # - EGRESS_IP_FAIL_THRESHOLD=4 # 单次检查每栈最多试几条链接，都失败则判 WARP 挂（默认 4；0=不因 IP 判死）
 
       # ⚠️ 针对香港/美西机房的防阻断绝杀：
       - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
@@ -238,7 +238,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 如果你要切换到别的兼容注册 API，可以设置 `WARP_API_URL`；如果配置了多个地址（逗号或分号分隔），每次注册请求都会按顺序逐个尝试；如果只有这一步注册请求需要走代理，可以设置 `WARP_API_PROXY`。两者都不会改变请求方式和返回的 WireGuard 配置格式。
 >
-> 出口 IP 探测为**多源、短超时、同厂商错开**（例如先 `1.1.1.1`，中间插入其它厂商，再试 `1.0.0.1`）。**单次**整轮失败只累计连续失败次数；连续达到 `EGRESS_IP_FAIL_THRESHOLD`（默认 **4**）才判定 WARP 连接失败。未达阈值时若配置了 `TEST_URLS`，仍以业务 URL 为准。健康检查失败后仍按 `WG_RECONNECT_RETRIES` 先重连再重检，全部失败后才重新向 API 申请配置（默认 `5`，`0` 跳过重连，过大值封顶 `20`）。
+> 出口 IP 探测为**多源、短超时、同厂商错开**（例如先 `1.1.1.1`，中间插其它厂商，再试 `1.0.0.1`）。**同一次**健康检查内，每个地址族最多试 `EGRESS_IP_FAIL_THRESHOLD` 条链接（默认 **4**），成功即停；若这几条都拿不到 IP，判定 WARP 连接失败。`EGRESS_IP_FAIL_THRESHOLD=0` 时不因 IP 判死，改由 `TEST_URLS` 决定。健康检查失败后仍按 `WG_RECONNECT_RETRIES` 先重连再重检，全部失败后才重新向 API 申请配置（默认 `5`，`0` 跳过重连，过大值封顶 `20`）。
 >
 > 现在启动日志还会打印一份简短的身份摘要，包括私钥指纹、接口地址和最终采用的 Peer Endpoint，方便你确认“设备身份是否真的变了”。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
 >
