@@ -166,18 +166,18 @@ is_offline_long_enough_for_stale_config() {
 }
 
 record_instance_offline_since() {
-    INST_ID=$1
-    FILE=$(get_instance_offline_since_file "$INST_ID")
+    _oid=$1
+    FILE=$(get_instance_offline_since_file "$_oid")
     mkdir -p "$(dirname "$FILE")"
     if [ ! -f "$FILE" ]; then
         date +%s > "$FILE"
-        echo "==> [MicroWARP] [inst${INST_ID}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
+        echo "==> [MicroWARP] [inst${_oid}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
     fi
 }
 
 clear_instance_offline_since() {
-    INST_ID=$1
-    rm -f "$(get_instance_offline_since_file "$INST_ID")"
+    _oid=$1
+    rm -f "$(get_instance_offline_since_file "$_oid")"
 }
 
 get_instance_offline_since_epoch() {
@@ -190,8 +190,8 @@ get_instance_offline_since_epoch() {
 }
 
 instance_should_force_new_config() {
-    INST_ID=$1
-    SINCE=$(get_instance_offline_since_epoch "$INST_ID")
+    _oid=$1
+    SINCE=$(get_instance_offline_since_epoch "$_oid")
     [ -n "$SINCE" ] || return 1
     is_offline_long_enough_for_stale_config "$SINCE"
 }
@@ -310,11 +310,11 @@ EOF
     IFS=' '
     for ITEM in $STATUS_LIST; do
         [ -n "$ITEM" ] || continue
-        INST_ID=${ITEM%%:*}
-        INST_STATUS=${ITEM#*:}
-        [ "$INST_STATUS" = "up" ] || continue
-        ENDPOINT=$(get_instance_socks_endpoint "$INST_ID")
-        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$INST_ID" "$ENDPOINT"
+        _sid=${ITEM%%:*}
+        _sstatus=${ITEM#*:}
+        [ "$_sstatus" = "up" ] || continue
+        ENDPOINT=$(get_instance_socks_endpoint "$_sid")
+        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
     done
     IFS=$OLD_IFS
 }
@@ -799,12 +799,13 @@ probe_egress_ips() {
 #         1 soft fail only when EGRESS_IP_FAIL_THRESHOLD=0 (never hard-fail on IP);
 #         2 hard fail: this round tried up to N links/family and got no IP → WARP down.
 ensure_trace_ip() {
-    INST_ID=${1:-}
+    # Use _tid only — never touch global INST_ID (ash/bash global assign leaks to caller loops).
+    _tid=${1:-}
     LABEL=''
     NS_NAME=''
-    if [ -n "$INST_ID" ]; then
-        LABEL="inst${INST_ID}"
-        NS_NAME=$(get_instance_netns_name "$INST_ID")
+    if [ -n "$_tid" ]; then
+        LABEL="inst${_tid}"
+        NS_NAME=$(get_instance_netns_name "$_tid")
     fi
 
     if probe_egress_ips "$NS_NAME" "$LABEL"; then
@@ -1721,43 +1722,23 @@ request_instance_recovery() {
 
 # Foreground bounded attempt (startup path only). Returns quickly-ish.
 ensure_instance_ready() {
-    local INST_ID="$1"
-    local MAX_REREG REREG_COUNT
-    # Optional second arg: max full identity re-registers in THIS call (startup budget).
-    MAX_REREG=${2:-1}
+    # Startup path: ONE quick health probe. Never block the serial boot loop on
+    # multi-attempt WG reconnect (that made inst1→inst2 look "stuck", and any
+    # INST_ID leak during long reconnect showed up as the wrong instance).
+    # Failures hand off to request_instance_recovery (background, correct id).
+    local _eid="$1"
+    # second arg kept for API compat; ignored (background worker does full revive)
 
-    REREG_COUNT=0
-    while true; do
-        if run_instance_health_checks "$INST_ID"; then
-            mark_instance_up "$INST_ID"
-            return 0
-        fi
+    if run_instance_health_checks "$_eid"; then
+        mark_instance_up "$_eid"
+        return 0
+    fi
 
-        echo "==> [MicroWARP] [inst${INST_ID}] 连通性测试未通过"
-        mark_instance_down "$INST_ID"
-        reload_haproxy_from_status
-
-        if try_instance_wg_reconnect_recovery "$INST_ID"; then
-            mark_instance_up "$INST_ID"
-            return 0
-        fi
-
-        case "$MAX_REREG" in
-            ''|*[!0-9]*)
-                MAX_REREG=1
-                ;;
-        esac
-
-        if [ "$REREG_COUNT" -ge "$MAX_REREG" ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 启动期预算用尽，交给后台 worker 继续复活"
-            request_instance_recovery "$INST_ID"
-            return 1
-        fi
-
-        echo "==> [MicroWARP] [inst${INST_ID}] 重连失败，重新注册 WARP 设备..."
-        restart_instance_with_new_identity "$INST_ID"
-        REREG_COUNT=$((REREG_COUNT + 1))
-    done
+    echo "==> [MicroWARP] [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
+    mark_instance_down "$_eid"
+    reload_haproxy_from_status
+    request_instance_recovery "$_eid"
+    return 1
 }
 
 stagger_next_instance_start() {
@@ -1777,43 +1758,43 @@ bootstrap_multi_instances() {
     mkdir -p "$INSTANCE_STATE_DIR" /etc/wireguard/instances
     echo "==> [MicroWARP] 多实例串行启动（实例间错开 ${INSTANCE_START_STAGGER_SECONDS}s，避免并发注册/建隧）"
 
-    for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        CONF_PATH=$(get_instance_conf_path "$INST_ID")
-        set_instance_status "$INST_ID" "down"
+    for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        CONF_PATH=$(get_instance_conf_path "$_bid")
+        set_instance_status "$_bid" "down"
         # Start offline clock only if not already tracking (e.g. after container restart while still down).
-        record_instance_offline_since "$INST_ID"
+        record_instance_offline_since "$_bid"
 
         if [ ! -f "$CONF_PATH" ]; then
             # migrate legacy single-instance conf to inst1 if present
-            if [ "$INST_ID" = "1" ] && [ -f "$WG_CONF" ] && ! is_enabled "$ROTATE_IP_ON_START"; then
+            if [ "$_bid" = "1" ] && [ -f "$WG_CONF" ] && ! is_enabled "$ROTATE_IP_ON_START"; then
                 mkdir -p "$(dirname "$CONF_PATH")"
                 cp "$WG_CONF" "$CONF_PATH"
                 echo "==> [MicroWARP] [inst1] 复用已有 ${WG_CONF}"
             else
-                echo "==> [MicroWARP] [inst${INST_ID}] 未检测到配置，自动注册..."
+                echo "==> [MicroWARP] [inst${_bid}] 未检测到配置，自动注册..."
                 generate_warp_config "$CONF_PATH"
             fi
         elif is_enabled "$ROTATE_IP_ON_START"; then
-            echo "==> [MicroWARP] [inst${INST_ID}] ROTATE_IP_ON_START 生效，重新注册..."
+            echo "==> [MicroWARP] [inst${_bid}] ROTATE_IP_ON_START 生效，重新注册..."
             generate_warp_config "$CONF_PATH"
         else
-            echo "==> [MicroWARP] [inst${INST_ID}] 检测到已有配置，跳过注册"
+            echo "==> [MicroWARP] [inst${_bid}] 检测到已有配置，跳过注册"
         fi
 
-        print_warp_identity_summary "$CONF_PATH" "inst${INST_ID}"
-        setup_instance_netns "$INST_ID"
-        start_instance_warp "$INST_ID" || true
-        stagger_next_instance_start "$INST_ID" "$WARP_INSTANCE_COUNT"
+        print_warp_identity_summary "$CONF_PATH" "inst${_bid}"
+        setup_instance_netns "$_bid"
+        start_instance_warp "$_bid" || true
+        stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
     done
 
     # Bring frontend up early (may temporarily have zero backends), then fill healthy ones.
     reload_haproxy_from_status
 
-    # Startup: quick bounded check per instance; failures hand off to background workers.
-    for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        ensure_instance_ready "$INST_ID" 1 || true
+    # Startup health: sequential quick probes, NO inter-instance sleep here.
+    # (Tunnel bring-up above already staggered; blocking reconnect was removed.)
+    for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        ensure_instance_ready "$_bid" 1 || true
         reload_haproxy_from_status
-        stagger_next_instance_start "$INST_ID" "$WARP_INSTANCE_COUNT"
     done
 
     HEALTHY=$(count_healthy_instances)
