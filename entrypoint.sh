@@ -658,17 +658,20 @@ extract_ip_from_probe_body() {
     return 0
 }
 
-# Default multi-source lists (comma-separated). Prefer:
-# - IP-literal HTTPS endpoints (no DNS dependency)
-# - globally anycast / highly available providers
+# Default multi-source lists (comma-separated), ordered first-success-wins.
+# Prefer: CF IP-literal /cdn-cgi/trace (no DNS), then dual-stack-safe
+# family-specific hostnames that return the requested address family.
+# Verified under curl -4/-6; avoid dual-stack hosts that ignore -4 and
+# still return AAAA (e.g. ifconfig.me, bare cloudflare.com) and flaky TLS
+# endpoints (e.g. checkip.amazonaws.com from some paths).
 # Override via EGRESS_IP_V4_URLS / EGRESS_IP_V6_URLS if needed.
 get_egress_ip_v4_urls() {
-    RAW=${EGRESS_IP_V4_URLS:-https://1.1.1.1/cdn-cgi/trace,https://1.0.0.1/cdn-cgi/trace,https://cloudflare.com/cdn-cgi/trace,https://api.ipify.org,https://checkip.amazonaws.com,https://ipv4.icanhazip.com,https://ifconfig.me/ip}
+    RAW=${EGRESS_IP_V4_URLS:-https://1.1.1.1/cdn-cgi/trace,https://1.0.0.1/cdn-cgi/trace,https://api4.ipify.org,https://api.ipify.org,https://ipv4.icanhazip.com,https://v4.ident.me,https://ipinfo.io/ip}
     printf '%s\n' "$RAW"
 }
 
 get_egress_ip_v6_urls() {
-    RAW=${EGRESS_IP_V6_URLS:-https://[2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]/cdn-cgi/trace,https://api64.ipify.org,https://ipv6.icanhazip.com}
+    RAW=${EGRESS_IP_V6_URLS:-https://[2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]/cdn-cgi/trace,https://api6.ipify.org,https://ipv6.icanhazip.com,https://v6.ident.me}
     printf '%s\n' "$RAW"
 }
 
