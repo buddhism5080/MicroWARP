@@ -239,7 +239,8 @@ with_dir_lock() {
 }
 
 is_instance_recovering() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local PID_FILE PID
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     if [ ! -f "$PID_FILE" ]; then
         return 1
@@ -253,7 +254,8 @@ is_instance_recovering() {
 }
 
 stop_instance_recovery() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local PID_FILE PID i
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     if [ -f "$PID_FILE" ]; then
         PID=$(tr -d '\n' < "$PID_FILE")
@@ -272,8 +274,9 @@ stop_instance_recovery() {
 }
 
 stop_all_instance_recoveries() {
-    for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        stop_instance_recovery "$INST_ID"
+    local _iid
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        stop_instance_recovery "$_iid"
     done
 }
 
@@ -1063,13 +1066,14 @@ cleanup_on_exit() {
 # 多实例（单容器内）: netns + haproxy 健康 LB
 # ==========================================
 set_instance_status() {
-    INST_ID=$1
-    STATUS=$2
+    local INST_ID="$1"
+    local STATUS="$2"
     mkdir -p "$INSTANCE_STATE_DIR"
     printf '%s\n' "$STATUS" > "$(get_instance_status_file "$INST_ID")"
 }
 
 get_instance_status() {
+    local STATUS_FILE
     STATUS_FILE=$(get_instance_status_file "$1")
     if [ -f "$STATUS_FILE" ]; then
         tr -d '\n' < "$STATUS_FILE"
@@ -1079,22 +1083,22 @@ get_instance_status() {
 }
 
 collect_instance_status_list() {
-    LIST=""
-    for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        STATUS=$(get_instance_status "$INST_ID")
+    local LIST="" _iid STATUS
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        STATUS=$(get_instance_status "$_iid")
         if [ -n "$LIST" ]; then
-            LIST="$LIST ${INST_ID}:${STATUS}"
+            LIST="$LIST ${_iid}:${STATUS}"
         else
-            LIST="${INST_ID}:${STATUS}"
+            LIST="${_iid}:${STATUS}"
         fi
     done
     printf '%s\n' "$LIST"
 }
 
 count_healthy_instances() {
-    COUNT=0
-    for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        if [ "$(get_instance_status "$INST_ID")" = "up" ]; then
+    local COUNT=0 _iid
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        if [ "$(get_instance_status "$_iid")" = "up" ]; then
             COUNT=$((COUNT + 1))
         fi
     done
@@ -1112,7 +1116,8 @@ enable_host_forwarding() {
 }
 
 destroy_instance_netns() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME HOST_VETH WG_NAME
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     HOST_VETH=$(get_instance_host_veth "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
@@ -1125,7 +1130,8 @@ destroy_instance_netns() {
 }
 
 setup_instance_netns() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME HOST_VETH NS_VETH HOST_IP NS_IP
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     HOST_VETH=$(get_instance_host_veth "$INST_ID")
     NS_VETH=$(get_instance_ns_veth "$INST_ID")
@@ -1284,7 +1290,8 @@ format_endpoint_ip_port() {
 # - Endpoint hostname resolved in the default netns to a concrete IP
 #   so netns startup does not depend on Docker's 127.0.0.11 stub resolver
 prepare_instance_wg_conf() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local CONF_PATH WG_NAME WG_LINK_CONF RUNTIME_CONF RAW_ENDPOINT RESOLVED_IP NEW_ENDPOINT
     CONF_PATH=$(get_instance_conf_path "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
     WG_LINK_CONF="/etc/wireguard/${WG_NAME}.conf"
@@ -1320,7 +1327,8 @@ prepare_instance_wg_conf() {
 }
 
 start_instance_warp() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME WG_NAME HOST_IP NS_VETH WG_LOG UP_OK RAW_ENDPOINT
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
     HOST_IP=$(get_instance_host_ip "$INST_ID")
@@ -1376,7 +1384,8 @@ start_instance_warp() {
 }
 
 stop_instance_socks() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local PID_FILE PID
     PID_FILE=$(get_instance_pid_file "$INST_ID")
 
     if [ -f "$PID_FILE" ]; then
@@ -1391,7 +1400,8 @@ stop_instance_socks() {
 }
 
 start_instance_socks() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME NS_IP PID_FILE PID
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     NS_IP=$(get_instance_ns_ip "$INST_ID")
     PID_FILE=$(get_instance_pid_file "$INST_ID")
@@ -1413,14 +1423,15 @@ start_instance_socks() {
 }
 
 ns_ensure_trace_ip() {
-    INST_ID=$1
+    local INST_ID="$1"
     # Delegates to ensure_trace_ip with inst id (streak + multi-source).
     ensure_trace_ip "$INST_ID"
 }
 
 ns_check_single_test_url() {
-    INST_ID=$1
-    TARGET_URL=$2
+    local INST_ID="$1"
+    local TARGET_URL="$2"
+    local NS_NAME TEST_HTTP_CODE CURL_EXIT RETRYABLE_FAILURE_RETRIES ATTEMPT RETRY_REASON
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     RETRYABLE_FAILURE_RETRIES=2
     ATTEMPT=1
@@ -1454,7 +1465,8 @@ ns_check_single_test_url() {
 }
 
 ns_check_test_urls() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local TEST_URLS_RAW TEST_URLS_LIST OLD_IFS TEST_URL
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
     [ -n "$TEST_URLS_LIST" ] || return 0
@@ -1475,7 +1487,8 @@ ns_check_test_urls() {
 }
 
 run_instance_health_checks() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local IP_RC TEST_URLS_RAW TEST_URLS_LIST
     ns_ensure_trace_ip "$INST_ID"
     IP_RC=$?
 
@@ -1496,7 +1509,8 @@ run_instance_health_checks() {
 }
 
 restart_instance_wg() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME WG_NAME
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
 
@@ -1506,7 +1520,8 @@ restart_instance_wg() {
 }
 
 try_instance_wg_reconnect_recovery() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local RECONNECT_RETRIES ATTEMPT
     RECONNECT_RETRIES=$(get_wg_reconnect_retries)
 
     if [ "$RECONNECT_RETRIES" -le 0 ]; then
@@ -1530,7 +1545,8 @@ try_instance_wg_reconnect_recovery() {
 }
 
 restart_instance_with_new_identity() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local NS_NAME WG_NAME CONF_PATH
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
     CONF_PATH=$(get_instance_conf_path "$INST_ID")
@@ -1543,7 +1559,7 @@ restart_instance_with_new_identity() {
 }
 
 mark_instance_up() {
-    INST_ID=$1
+    local INST_ID="$1"
     start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
@@ -1551,7 +1567,7 @@ mark_instance_up() {
 }
 
 mark_instance_down() {
-    INST_ID=$1
+    local INST_ID="$1"
     stop_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
@@ -1611,15 +1627,20 @@ reload_haproxy_from_status() {
 # If offline continuously for CONFIG_STALE_OFFLINE_SECONDS (default 2h), skip reconnect and
 # force a new WARP registration — existing conf is treated as stale/invalid.
 instance_recovery_worker() {
-    INST_ID=$1
+    # IMPORTANT: use local INST_ID. Nested helpers (reload_haproxy, status loops)
+    # also assign INST_ID; without local, a recovery for inst12 becomes inst20.
+    local INST_ID="$1"
+    local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
-    echo $$ > "$PID_FILE"
+    # Parent (request_instance_recovery) records the real job PID via $!.
+    # Do NOT write $$ here: in BusyBox ash a backgrounded function often keeps
+    # the main shell's $$ (container PID 1), which corrupts recovery tracking.
     # shellcheck disable=SC2064
     trap 'rm -f "$PID_FILE"' EXIT INT TERM
 
     BACKOFF=5
     MAX_BACKOFF=60
-    echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (PID $$)"
+    echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile)"
 
     while true; do
         if run_instance_health_checks "$INST_ID"; then
@@ -1675,7 +1696,8 @@ instance_recovery_worker() {
 
 # Kick off background revival if not already running. Non-blocking.
 request_instance_recovery() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local _rec_pid _pid_file
     mkdir -p "$INSTANCE_STATE_DIR"
 
     if is_instance_recovering "$INST_ID"; then
@@ -1684,17 +1706,23 @@ request_instance_recovery() {
     fi
 
     # Ensure status is down and socks is off before spawning recovery.
+    # NOTE: mark/reload helpers must not clobber our INST_ID (they use local or other names).
     mark_instance_down "$INST_ID"
     reload_haproxy_from_status
 
+    _pid_file=$(get_instance_recover_pid_file "$INST_ID")
     echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker..."
+    # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
     instance_recovery_worker "$INST_ID" &
-    echo $! > "$(get_instance_recover_pid_file "$INST_ID")"
+    _rec_pid=$!
+    echo "$_rec_pid" > "$_pid_file"
+    echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
 }
 
 # Foreground bounded attempt (startup path only). Returns quickly-ish.
 ensure_instance_ready() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local MAX_REREG REREG_COUNT
     # Optional second arg: max full identity re-registers in THIS call (startup budget).
     MAX_REREG=${2:-1}
 
@@ -1853,7 +1881,8 @@ get_health_check_stagger_seconds() {
 
 # Lightweight monitor visit: if healthy keep/restore up; if not, kick off background revival and move on.
 probe_instance_and_schedule_recovery() {
-    INST_ID=$1
+    local INST_ID="$1"
+    local OLD_STATUS
 
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then

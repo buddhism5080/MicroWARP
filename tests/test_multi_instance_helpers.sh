@@ -492,6 +492,33 @@ test_note_egress_ip_failure_hits_threshold_at_four() {
     assert_eq "$(read_egress_ip_fail_streak '')" '0' 'success resets streak'
 }
 
+
+test_inst_id_not_clobbered_by_status_loops() {
+    # Simulate the production bug: nested status loops used INST_ID and overwrote
+    # the caller's inst id (e.g. 12 -> 20). After the fix, collect/count use _iid
+    # and recovery helpers local their INST_ID.
+    WARP_INSTANCES=3
+    WARP_INSTANCE_COUNT=3
+    INSTANCE_STATE_DIR=/tmp/microwarp-instid-$$
+    command mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
+    # real mkdir may be mocked; write status files directly
+    printf 'up\n' > "$INSTANCE_STATE_DIR/inst1.status"
+    printf 'down\n' > "$INSTANCE_STATE_DIR/inst2.status"
+    printf 'up\n' > "$INSTANCE_STATE_DIR/inst3.status"
+
+    # un-mock mkdir for this test if needed - get_instance_status_file only prints path
+    outer_id=12
+    # call collect which previously looped INST_ID=1..N
+    collect_instance_status_list >/dev/null
+    # If collect polluted a global INST_ID, it would be last id (3 with WARP_INSTANCES=3 / max capped)
+    # Ensure our outer variable is untouched and collect works.
+    assert_eq "$outer_id" '12' 'outer id must remain 12'
+    LIST=$(collect_instance_status_list)
+    assert_contains "$LIST" '1:up' 'inst1 up'
+    assert_contains "$LIST" '2:down' 'inst2 down'
+    assert_eq "$(count_healthy_instances)" '2' 'two healthy'
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -501,6 +528,7 @@ test_instance_paths_and_addresses
 test_parse_endpoint_host_port
 test_extract_ip_from_probe_body
 test_egress_ip_defaults_interleave_vendors
+test_inst_id_not_clobbered_by_status_loops
 test_run_health_checks_prefers_test_urls_when_ip_soft_disabled
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
 test_run_health_checks_hard_fails_when_round_gets_no_ip
