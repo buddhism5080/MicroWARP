@@ -205,31 +205,98 @@ test_extract_ip_from_probe_body() {
     fi
 }
 
-test_run_health_checks_prefers_test_urls_over_ip_failure() {
-    # IP probe fails, but TEST_URLS pass => overall healthy
-    probe_egress_ips() { return 1; }
-    ensure_trace_ip() { probe_egress_ips '' ''; }
+test_egress_ip_defaults_interleave_vendors() {
+    local v4 v6
+    v4=$(get_egress_ip_v4_urls)
+    v6=$(get_egress_ip_v6_urls)
+    # 1.1.1.1 should appear before 1.0.0.1, and not be adjacent
+    case "$v4" in
+        *'1.1.1.1/cdn-cgi/trace,https://1.0.0.1'* )
+            echo "CF v4 endpoints must not be adjacent: $v4" >&2
+            exit 1
+            ;;
+    esac
+    assert_contains "$v4" '1.1.1.1/cdn-cgi/trace' 'has 1.1.1.1'
+    assert_contains "$v4" '1.0.0.1/cdn-cgi/trace' 'has 1.0.0.1'
+    assert_contains "$v4" 'api4.ipify.org' 'has ipify between CF endpoints ideally'
+    case "$v6" in
+        *'2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]'* )
+            echo "CF v6 endpoints must not be adjacent: $v6" >&2
+            exit 1
+            ;;
+    esac
+}
+
+test_run_health_checks_prefers_test_urls_over_soft_ip_failure() {
+    # Soft IP fail (streak below threshold) + TEST_URLS pass => healthy
+    EGRESS_IP_FAIL_STREAK=0
+    EGRESS_IP_FAIL_THRESHOLD=4
+    ensure_trace_ip() {
+        # simulate soft fail once without bumping past threshold via real note_* 
+        # directly return 1 like ensure_trace_ip soft path
+        return 1
+    }
     check_test_urls() { return 0; }
     TEST_URLS='https://example.com'
     if ! run_health_checks; then
-        echo 'expected TEST_URLS success to override IP probe failure' >&2
+        echo 'expected TEST_URLS success to override soft IP failure' >&2
         exit 1
     fi
 }
 
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok() {
-    probe_egress_ips() {
-        TRACE_IP_V4='ip=1.2.3.4'
-        TRACE_IP_V6=''
-        return 0
-    }
-    ensure_trace_ip() { probe_egress_ips '' ''; }
+    ensure_trace_ip() { return 0; }
     check_test_urls() { return 1; }
     TEST_URLS='https://example.com'
     if run_health_checks; then
         echo 'expected TEST_URLS failure to fail health even when IP ok' >&2
         exit 1
     fi
+}
+
+test_run_health_checks_hard_fails_after_ip_streak_threshold() {
+    # return code 2 from ensure_trace_ip => hard fail regardless of TEST_URLS
+    ensure_trace_ip() { return 2; }
+    stop_socks() { :; }
+    check_test_urls() { return 0; }
+    TEST_URLS='https://example.com'
+    if run_health_checks; then
+        echo 'expected hard IP streak failure to fail health' >&2
+        exit 1
+    fi
+}
+
+test_note_egress_ip_failure_hits_threshold_at_four() {
+    EGRESS_IP_FAIL_STREAK=0
+    EGRESS_IP_FAIL_THRESHOLD=4
+    INSTANCE_STATE_DIR=/tmp/microwarp-test-state-$$
+    mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
+    # override mkdir no-op from test harness for this path using write directly
+    write_egress_ip_fail_streak() {
+        INST_ID=${1:-}
+        VAL=${2:-0}
+        if [ -z "$INST_ID" ]; then
+            EGRESS_IP_FAIL_STREAK=$VAL
+        fi
+    }
+    read_egress_ip_fail_streak() {
+        INST_ID=${1:-}
+        if [ -z "$INST_ID" ]; then
+            printf '%s\n' "${EGRESS_IP_FAIL_STREAK:-0}"
+        else
+            printf '0\n'
+        fi
+    }
+    note_egress_ip_failure ''
+    assert_eq "$EGRESS_IP_STREAK_NOW" '1' 'streak 1'
+    assert_eq "$EGRESS_IP_STREAK_HARDFAIL" '0' 'not hard yet'
+    note_egress_ip_failure ''
+    note_egress_ip_failure ''
+    note_egress_ip_failure ''
+    assert_eq "$EGRESS_IP_STREAK_NOW" '4' 'streak 4'
+    assert_eq "$EGRESS_IP_STREAK_HARDFAIL" '1' 'hard at 4'
+    note_egress_ip_success ''
+    assert_eq "$(read_egress_ip_fail_streak '')" '0' 'success resets streak'
 }
 
 test_default_instance_count_is_one
@@ -240,8 +307,11 @@ test_instance_ids_list
 test_instance_paths_and_addresses
 test_parse_endpoint_host_port
 test_extract_ip_from_probe_body
-test_run_health_checks_prefers_test_urls_over_ip_failure
+test_egress_ip_defaults_interleave_vendors
+test_run_health_checks_prefers_test_urls_over_soft_ip_failure
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
+test_run_health_checks_hard_fails_after_ip_streak_threshold
+test_note_egress_ip_failure_hits_threshold_at_four
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
 test_stagger_skips_after_last_instance

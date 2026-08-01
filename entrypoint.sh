@@ -659,19 +659,18 @@ extract_ip_from_probe_body() {
 }
 
 # Default multi-source lists (comma-separated), ordered first-success-wins.
-# Prefer: CF IP-literal /cdn-cgi/trace (no DNS), then dual-stack-safe
-# family-specific hostnames that return the requested address family.
-# Verified under curl -4/-6; avoid dual-stack hosts that ignore -4 and
-# still return AAAA (e.g. ifconfig.me, bare cloudflare.com) and flaky TLS
-# endpoints (e.g. checkip.amazonaws.com from some paths).
+# Same-vendor endpoints are interleaved (e.g. 1.1.1.1 ... later 1.0.0.1)
+# so a single provider outage does not burn adjacent slots.
+# Prefer CF IP-literal /cdn-cgi/trace early (no DNS), then family-specific
+# hostnames verified under curl -4/-6.
 # Override via EGRESS_IP_V4_URLS / EGRESS_IP_V6_URLS if needed.
 get_egress_ip_v4_urls() {
-    RAW=${EGRESS_IP_V4_URLS:-https://1.1.1.1/cdn-cgi/trace,https://1.0.0.1/cdn-cgi/trace,https://api4.ipify.org,https://api.ipify.org,https://ipv4.icanhazip.com,https://v4.ident.me,https://ipinfo.io/ip}
+    RAW=${EGRESS_IP_V4_URLS:-https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,https://ipv4.icanhazip.com,https://v4.ident.me,https://1.0.0.1/cdn-cgi/trace,https://ipinfo.io/ip,https://api.ipify.org}
     printf '%s\n' "$RAW"
 }
 
 get_egress_ip_v6_urls() {
-    RAW=${EGRESS_IP_V6_URLS:-https://[2606:4700:4700::1111]/cdn-cgi/trace,https://[2606:4700:4700::1001]/cdn-cgi/trace,https://api6.ipify.org,https://ipv6.icanhazip.com,https://v6.ident.me}
+    RAW=${EGRESS_IP_V6_URLS:-https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,https://ipv6.icanhazip.com,https://[2606:4700:4700::1001]/cdn-cgi/trace,https://v6.ident.me}
     printf '%s\n' "$RAW"
 }
 
@@ -682,6 +681,76 @@ get_egress_ip_curl_max_time() {
         0) printf '1\n' ;;
         *) printf '%s\n' "$RAW" ;;
     esac
+}
+
+# Consecutive full egress-IP probe failures before declaring WARP dead.
+# Default 4. Set EGRESS_IP_FAIL_THRESHOLD=0 to never hard-fail on IP alone.
+get_egress_ip_fail_threshold() {
+    RAW=${EGRESS_IP_FAIL_THRESHOLD:-4}
+    case "$RAW" in
+        ''|*[!0-9]*) printf '4\n' ;;
+        *) printf '%s\n' "$RAW" ;;
+    esac
+}
+
+# Single-instance streak lives in this shell variable; multi-instance uses files.
+EGRESS_IP_FAIL_STREAK=${EGRESS_IP_FAIL_STREAK:-0}
+
+get_instance_egress_fail_file() {
+    printf '%s/inst%s.egress_fail_streak\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+read_egress_ip_fail_streak() {
+    # optional inst id; empty => single-instance shell counter
+    INST_ID=${1:-}
+    if [ -z "$INST_ID" ]; then
+        printf '%s\n' "${EGRESS_IP_FAIL_STREAK:-0}"
+        return 0
+    fi
+    F=$(get_instance_egress_fail_file "$INST_ID")
+    if [ -f "$F" ]; then
+        VAL=$(tr -d '\n' < "$F")
+        case "$VAL" in
+            ''|*[!0-9]*) printf '0\n' ;;
+            *) printf '%s\n' "$VAL" ;;
+        esac
+    else
+        printf '0\n'
+    fi
+}
+
+write_egress_ip_fail_streak() {
+    INST_ID=${1:-}
+    VAL=${2:-0}
+    case "$VAL" in
+        ''|*[!0-9]*) VAL=0 ;;
+    esac
+    if [ -z "$INST_ID" ]; then
+        EGRESS_IP_FAIL_STREAK=$VAL
+        return 0
+    fi
+    mkdir -p "$INSTANCE_STATE_DIR"
+    printf '%s\n' "$VAL" > "$(get_instance_egress_fail_file "$INST_ID")"
+}
+
+note_egress_ip_success() {
+    INST_ID=${1:-}
+    write_egress_ip_fail_streak "$INST_ID" 0
+}
+
+# On full dual-stack probe failure: bump streak. Echo new streak on stdout via STREAK var.
+# Returns 0 always; sets EGRESS_IP_STREAK_NOW and EGRESS_IP_STREAK_HARDFAIL=1 if threshold hit.
+note_egress_ip_failure() {
+    INST_ID=${1:-}
+    THRESH=$(get_egress_ip_fail_threshold)
+    CUR=$(read_egress_ip_fail_streak "$INST_ID")
+    CUR=$((CUR + 1))
+    write_egress_ip_fail_streak "$INST_ID" "$CUR"
+    EGRESS_IP_STREAK_NOW=$CUR
+    EGRESS_IP_STREAK_HARDFAIL=0
+    if [ "$THRESH" -gt 0 ] && [ "$CUR" -ge "$THRESH" ]; then
+        EGRESS_IP_STREAK_HARDFAIL=1
+    fi
 }
 
 # Probe one family through optional netns. Sets PROBED_IP on success.
@@ -756,15 +825,41 @@ probe_egress_ips() {
         return 0
     fi
 
-    echo "${PREFIX} ⚠️ 出口 IP 多源探测均失败（不单独据此切断服务，继续以 TEST_URLS 为准）"
+    echo "${PREFIX} ⚠️ 出口 IP 多源探测均失败"
     return 1
 }
 
+# Run probe + maintain consecutive-failure streak.
+# optional arg1 = inst id (empty for single-instance)
+# Returns 0 on IP success; 1 on soft fail (streak < threshold); 2 on hard fail (streak >= threshold).
 ensure_trace_ip() {
-    # Soft signal only: multi-source probe. Do NOT stop SOCKS here.
-    # Hard fail / cut traffic is decided by run_health_checks + TEST_URLS.
-    if probe_egress_ips '' ''; then
+    INST_ID=${1:-}
+    LABEL=''
+    NS_NAME=''
+    if [ -n "$INST_ID" ]; then
+        LABEL="inst${INST_ID}"
+        NS_NAME=$(get_instance_netns_name "$INST_ID")
+    fi
+
+    if probe_egress_ips "$NS_NAME" "$LABEL"; then
+        note_egress_ip_success "$INST_ID"
         return 0
+    fi
+
+    note_egress_ip_failure "$INST_ID"
+    THRESH=$(get_egress_ip_fail_threshold)
+    PREFIX='==> [MicroWARP]'
+    [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
+
+    if [ "${EGRESS_IP_STREAK_HARDFAIL:-0}" -eq 1 ]; then
+        echo "${PREFIX} 出口 IP 连续失败 ${EGRESS_IP_STREAK_NOW}/${THRESH} 次，判定 WARP 连接失败"
+        return 2
+    fi
+
+    if [ "$THRESH" -gt 0 ]; then
+        echo "${PREFIX} 出口 IP 连续失败 ${EGRESS_IP_STREAK_NOW}/${THRESH} 次（未达阈值，暂不单独判死）"
+    else
+        echo "${PREFIX} 出口 IP 探测失败（EGRESS_IP_FAIL_THRESHOLD=0，不据此判死）"
     fi
     return 1
 }
@@ -879,10 +974,19 @@ get_wg_reconnect_retries() {
 }
 
 run_health_checks() {
-    # Egress IP is diagnostic + best-effort. TEST_URLS is the real pass/fail gate
-    # when configured. IP-only hard-fail only if no TEST_URLS are set.
-    IP_OK=0
-    ensure_trace_ip && IP_OK=1 || true
+    # Egress IP multi-source probe with consecutive-fail streak:
+    # - success => reset streak
+    # - fail streak >= EGRESS_IP_FAIL_THRESHOLD (default 4) => WARP hard-fail
+    # - below threshold + TEST_URLS set => TEST_URLS still decides
+    # - no TEST_URLS => IP probe is the connectivity signal
+    ensure_trace_ip
+    IP_RC=$?
+
+    if [ "$IP_RC" -eq 2 ]; then
+        # Consecutive IP failures hit threshold: treat as WARP down.
+        stop_socks
+        return 1
+    fi
 
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
@@ -892,8 +996,7 @@ run_health_checks() {
         return $?
     fi
 
-    # No TEST_URLS configured: fall back to IP probe as connectivity signal.
-    [ "$IP_OK" -eq 1 ]
+    [ "$IP_RC" -eq 0 ]
 }
 
 restart_wg_interface() {
@@ -1356,9 +1459,8 @@ start_instance_socks() {
 
 ns_ensure_trace_ip() {
     INST_ID=$1
-    NS_NAME=$(get_instance_netns_name "$INST_ID")
-    # Soft: multi-source. Failure alone must not condemn the instance.
-    probe_egress_ips "$NS_NAME" "inst${INST_ID}"
+    # Delegates to ensure_trace_ip with inst id (streak + multi-source).
+    ensure_trace_ip "$INST_ID"
 }
 
 ns_check_single_test_url() {
@@ -1419,8 +1521,13 @@ ns_check_test_urls() {
 
 run_instance_health_checks() {
     INST_ID=$1
-    IP_OK=0
-    ns_ensure_trace_ip "$INST_ID" && IP_OK=1 || true
+    ns_ensure_trace_ip "$INST_ID"
+    IP_RC=$?
+
+    if [ "$IP_RC" -eq 2 ]; then
+        # Consecutive IP failures hit threshold: instance is WARP-dead.
+        return 1
+    fi
 
     TEST_URLS_RAW=${TEST_URLS:-https://grok.com}
     TEST_URLS_LIST=$(printf '%s' "$TEST_URLS_RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
@@ -1430,7 +1537,7 @@ run_instance_health_checks() {
         return $?
     fi
 
-    [ "$IP_OK" -eq 1 ]
+    [ "$IP_RC" -eq 0 ]
 }
 
 restart_instance_wg() {
