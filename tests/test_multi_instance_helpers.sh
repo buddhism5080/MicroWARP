@@ -93,6 +93,26 @@ test_instance_paths_and_addresses() {
     assert_eq "$(get_instance_socks_endpoint 2)" '10.66.2.2:1080' 'socks endpoint'
 }
 
+test_parse_endpoint_host_port() {
+    parse_endpoint_host_port 'engage.cloudflareclient.com:2408'
+    assert_eq "$ENDPOINT_HOST" 'engage.cloudflareclient.com' 'hostname host'
+    assert_eq "$ENDPOINT_PORT" '2408' 'hostname port'
+
+    parse_endpoint_host_port '162.159.193.10:2408'
+    assert_eq "$ENDPOINT_HOST" '162.159.193.10' 'ipv4 host'
+    assert_eq "$ENDPOINT_PORT" '2408' 'ipv4 port'
+
+    parse_endpoint_host_port '[2606:4700:4700::1111]:2408'
+    assert_eq "$ENDPOINT_HOST" '2606:4700:4700::1111' 'ipv6 bracket host'
+    assert_eq "$ENDPOINT_PORT" '2408' 'ipv6 bracket port'
+
+    assert_eq "$(format_endpoint_ip_port '1.2.3.4' '2408')" '1.2.3.4:2408' 'format ipv4'
+    assert_eq "$(format_endpoint_ip_port '2606:4700::1' '2408')" '[2606:4700::1]:2408' 'format ipv6'
+
+    # IP literals should pass through resolve_host_to_ip unchanged.
+    assert_eq "$(resolve_host_to_ip '162.159.193.10')" '162.159.193.10' 'ipv4 literal resolve passthrough'
+}
+
 test_haproxy_config_only_includes_healthy_servers() {
     local cfg
     cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:down 2:up 3:up')
@@ -179,6 +199,7 @@ test_invalid_instance_count_falls_back
 test_instance_count_is_capped
 test_instance_ids_list
 test_instance_paths_and_addresses
+test_parse_endpoint_host_port
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
 test_stagger_skips_after_last_instance

@@ -928,25 +928,176 @@ setup_instance_netns() {
     ip netns exec "$NS_NAME" ip link set lo up
     ip netns exec "$NS_NAME" ip route replace default via "$HOST_IP" dev "$NS_VETH"
 
-    # DNS inside netns (WARP may override later; keep underlay resolvers for bootstrap)
+    # DNS inside netns for any residual hostname lookups.
+    # NEVER copy the container resolv.conf: Docker often points at 127.0.0.11,
+    # which only exists in the default netns and is unreachable here.
+    write_netns_resolv_conf "$NS_NAME"
+}
+
+write_netns_resolv_conf() {
+    NS_NAME=$1
     mkdir -p "/etc/netns/${NS_NAME}"
-    if [ -f /etc/resolv.conf ]; then
-        cp /etc/resolv.conf "/etc/netns/${NS_NAME}/resolv.conf" 2>/dev/null || \
-            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "/etc/netns/${NS_NAME}/resolv.conf"
+    printf '%s\n' \
+        'nameserver 1.1.1.1' \
+        'nameserver 8.8.8.8' \
+        'nameserver 2606:4700:4700::1111' \
+        > "/etc/netns/${NS_NAME}/resolv.conf"
+}
+
+# Split "host:port", "[v6]:port", bare host, or bare IP into HOST + PORT (default 2408).
+parse_endpoint_host_port() {
+    EP=$1
+    ENDPOINT_HOST=''
+    ENDPOINT_PORT='2408'
+
+    [ -n "$EP" ] || return 1
+
+    case "$EP" in
+        \[*\]:*)
+            ENDPOINT_HOST=$(printf '%s\n' "$EP" | sed -n 's/^\[\(.*\)\]:\([0-9]\+\)$/\1/p')
+            ENDPOINT_PORT=$(printf '%s\n' "$EP" | sed -n 's/^\[.*\]:\([0-9]\+\)$/\1/p')
+            ;;
+        *:*)
+            # Only treat as host:port when there is a single colon (IPv4/hostname).
+            # IPv6 literals without brackets contain multiple colons.
+            COLON_COUNT=$(printf '%s' "$EP" | awk -F: '{print NF-1}')
+            if [ "$COLON_COUNT" -eq 1 ]; then
+                ENDPOINT_HOST=${EP%:*}
+                ENDPOINT_PORT=${EP##*:}
+            else
+                ENDPOINT_HOST=$EP
+                ENDPOINT_PORT=2408
+            fi
+            ;;
+        *)
+            ENDPOINT_HOST=$EP
+            ENDPOINT_PORT=2408
+            ;;
+    esac
+
+    [ -n "$ENDPOINT_HOST" ] || return 1
+    case "$ENDPOINT_PORT" in
+        ''|*[!0-9]*) ENDPOINT_PORT=2408 ;;
+    esac
+    return 0
+}
+
+is_ipv4_literal() {
+    case "$1" in
+        *[!0-9.]*|'') return 1 ;;
+    esac
+    # rough dotted-quad check
+    printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+is_ipv6_literal() {
+    case "$1" in
+        *:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolve on the *default* netns (container host ns). Never call this inside ip netns exec.
+resolve_host_to_ip() {
+    HOST=$1
+    RES=''
+
+    [ -n "$HOST" ] || return 1
+
+    if is_ipv4_literal "$HOST" || is_ipv6_literal "$HOST"; then
+        printf '%s\n' "$HOST"
+        return 0
+    fi
+
+    # Prefer IPv4 — underlay veth path is IPv4.
+    if command -v getent >/dev/null 2>&1; then
+        RES=$(getent ahostsv4 "$HOST" 2>/dev/null | awk 'NR==1 {print $1; exit}')
+        if [ -z "$RES" ]; then
+            RES=$(getent ahosts "$HOST" 2>/dev/null | awk 'NR==1 {print $1; exit}')
+        fi
+        if [ -z "$RES" ]; then
+            RES=$(getent hosts "$HOST" 2>/dev/null | awk 'NR==1 {print $1; exit}')
+        fi
+    fi
+
+    # Alpine image usually has busybox nslookup even without getent.
+    if [ -z "$RES" ] && command -v nslookup >/dev/null 2>&1; then
+        RES=$(nslookup "$HOST" 1.1.1.1 2>/dev/null | awk '
+            /^Name:/ { found=1; next }
+            found && /^Address/ {
+                addr=$NF
+                sub(/\r$/, "", addr)
+                if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print addr; exit }
+            }
+        ')
+    fi
+
+    if [ -z "$RES" ] && command -v busybox >/dev/null 2>&1; then
+        RES=$(busybox nslookup "$HOST" 1.1.1.1 2>/dev/null | awk '
+            /^Name:/ { found=1; next }
+            found && /^Address/ {
+                addr=$NF
+                sub(/\r$/, "", addr)
+                if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print addr; exit }
+            }
+        ')
+    fi
+
+    if [ -z "$RES" ]; then
+        return 1
+    fi
+    printf '%s\n' "$RES"
+    return 0
+}
+
+format_endpoint_ip_port() {
+    IP=$1
+    PORT=$2
+    if is_ipv6_literal "$IP" && ! is_ipv4_literal "$IP"; then
+        printf '[%s]:%s\n' "$IP" "$PORT"
     else
-        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "/etc/netns/${NS_NAME}/resolv.conf"
+        printf '%s:%s\n' "$IP" "$PORT"
     fi
 }
 
+# Materialize a runtime conf for wg-quick:
+# - interface name = mwN (not wg0)
+# - Endpoint hostname resolved in the default netns to a concrete IP
+#   so netns startup does not depend on Docker's 127.0.0.11 stub resolver
 prepare_instance_wg_conf() {
     INST_ID=$1
     CONF_PATH=$(get_instance_conf_path "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
     WG_LINK_CONF="/etc/wireguard/${WG_NAME}.conf"
+    RUNTIME_CONF="/etc/wireguard/${WG_NAME}.runtime.conf"
 
-    # wg-quick uses basename as interface name; keep a stable link path.
     mkdir -p /etc/wireguard
-    ln -sfn "$CONF_PATH" "$WG_LINK_CONF"
+
+    if [ ! -f "$CONF_PATH" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] [ERROR] 缺少配置文件: ${CONF_PATH}"
+        return 1
+    fi
+
+    # Start from the persisted conf (keeps keys/addresses intact).
+    cp "$CONF_PATH" "$RUNTIME_CONF"
+
+    RAW_ENDPOINT=$(awk -F ' = ' '/^[[:space:]]*Endpoint[[:space:]]*=/ {print $2; exit}' "$RUNTIME_CONF" | tr -d '\r')
+    if [ -n "$RAW_ENDPOINT" ] && parse_endpoint_host_port "$RAW_ENDPOINT"; then
+        if RESOLVED_IP=$(resolve_host_to_ip "$ENDPOINT_HOST"); then
+            NEW_ENDPOINT=$(format_endpoint_ip_port "$RESOLVED_IP" "$ENDPOINT_PORT")
+            if [ "$NEW_ENDPOINT" != "$RAW_ENDPOINT" ]; then
+                echo "==> [MicroWARP] [inst${INST_ID}] Endpoint 预解析: ${RAW_ENDPOINT} -> ${NEW_ENDPOINT}"
+            fi
+            # Replace only the Endpoint line; keep the on-disk identity conf unchanged.
+            sed -i "s|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = ${NEW_ENDPOINT}|" "$RUNTIME_CONF"
+        else
+            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无法在默认 netns 解析 Endpoint 主机名: ${ENDPOINT_HOST}（仍尝试原值）"
+        fi
+    fi
+
+    # wg-quick uses the conf basename as the interface name.
+    ln -sfn "$RUNTIME_CONF" "$WG_LINK_CONF"
+    return 0
 }
 
 start_instance_warp() {
@@ -955,18 +1106,50 @@ start_instance_warp() {
     WG_NAME=$(get_instance_wg_name "$INST_ID")
     HOST_IP=$(get_instance_host_ip "$INST_ID")
     NS_VETH=$(get_instance_ns_veth "$INST_ID")
+    WG_LOG="/tmp/wg-up-inst${INST_ID}.log"
 
-    prepare_instance_wg_conf "$INST_ID"
+    if ! prepare_instance_wg_conf "$INST_ID"; then
+        return 1
+    fi
+
+    # Clean any half-up interface from a previous attempt.
+    ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
+    ip netns exec "$NS_NAME" ip link delete "$WG_NAME" >/dev/null 2>&1 || true
 
     echo "==> [MicroWARP] [inst${INST_ID}] 正在 netns 内启动 WireGuard (${WG_NAME})..."
-    if ! ip netns exec "$NS_NAME" wg-quick up "$WG_NAME" >/dev/null 2>&1; then
+    # Bound the up attempt: DNS/UDP stalls must not freeze serial multi-instance boot.
+    # Do NOT use eval with nested quotes — call timeout/wg-quick directly.
+    if command -v timeout >/dev/null 2>&1; then
+        UP_OK=0
+        timeout 20 ip netns exec "$NS_NAME" wg-quick up "$WG_NAME" >"$WG_LOG" 2>&1 && UP_OK=1
+    else
+        UP_OK=0
+        ip netns exec "$NS_NAME" wg-quick up "$WG_NAME" >"$WG_LOG" 2>&1 && UP_OK=1
+    fi
+
+    if [ "$UP_OK" -ne 1 ]; then
         echo "==> [MicroWARP] [inst${INST_ID}] [WARN] WireGuard 启动失败"
+        if [ -s "$WG_LOG" ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] wg-quick 输出:"
+            tail -n 20 "$WG_LOG" | sed 's/^/    /'
+        fi
         return 1
     fi
 
     # Ensure underlay connected route to host still wins for LB health/traffic ingress
     ip netns exec "$NS_NAME" ip route replace "${INSTANCE_SUBNET_PREFIX}.${INST_ID}.0/24" dev "$NS_VETH" 2>/dev/null || true
     ip netns exec "$NS_NAME" ip route replace "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
+
+    # Pin a host route for the resolved endpoint via underlay so AllowedIPs=0.0.0.0/0
+    # cannot blackhole WireGuard handshake packets back into the tunnel.
+    RAW_ENDPOINT=$(awk -F ' = ' '/^[[:space:]]*Endpoint[[:space:]]*=/ {print $2; exit}' "/etc/wireguard/${WG_NAME}.runtime.conf" 2>/dev/null | tr -d '\r')
+    if [ -n "$RAW_ENDPOINT" ] && parse_endpoint_host_port "$RAW_ENDPOINT"; then
+        if is_ipv4_literal "$ENDPOINT_HOST"; then
+            ip netns exec "$NS_NAME" ip route replace "$ENDPOINT_HOST" via "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
+        elif is_ipv6_literal "$ENDPOINT_HOST"; then
+            ip netns exec "$NS_NAME" ip -6 route replace "$ENDPOINT_HOST" via fe80::1 dev "$NS_VETH" 2>/dev/null || true
+        fi
+    fi
 
     sleep 2
     echo "==> [MicroWARP] [inst${INST_ID}] 隧道已启动"
