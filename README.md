@@ -116,7 +116,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(If `ROTATE_IP_ON_START=1`, MicroWARP will overwrite the persisted `wg0.conf` on each container start by registering a fresh WARP device. Leave it off if you prefer a stable device identity and fewer rate-limit risks.)*
 
-*(You can override `WARP_API_URL` when you want to query one or more compatible registration APIs. Separate multiple addresses with commas or semicolons, and each registration attempt will try them in order. Set `WARP_API_PROXY` if that API request must go through an HTTP/SOCKS proxy. The request and returned WireGuard config format stay unchanged.)*
+*(You can override `WARP_API_URL` when you want to query one or more compatible registration APIs. Separate multiple addresses with commas or semicolons, and each registration attempt will try them in order. Set `WARP_API_PROXY` if that API request must go through an HTTP/SOCKS proxy. When `WARP_API_PROXY` is **unset** and multi-instance has **more than one healthy** backend, registration automatically uses the local HAProxy SOCKS (`socks5h://127.0.0.1:$BIND_PORT`) so API traffic exits via a live WARP tunnel; with 0–1 healthy instances it still registers direct to avoid bootstrap deadlock. The request and returned WireGuard config format stay unchanged.)*
 
 *(When health checks fail, MicroWARP now first disconnects and reconnects `wg0`, then reruns the checks. Only after `WG_RECONNECT_RETRIES` attempts still fail will it request a brand new config. The default is `5`, and `0` disables the reconnect phase.)*
 
@@ -236,7 +236,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 
 > 如果启用 `ROTATE_IP_ON_START=1`，MicroWARP 会在每次容器启动时重新注册一个新的 WARP 设备，并覆盖持久化卷里的 `wg0.conf`。如果你更在意设备身份稳定和降低限频/风控概率，就保持默认关闭。
 >
-> 如果你要切换到别的兼容注册 API，可以设置 `WARP_API_URL`；如果配置了多个地址（逗号或分号分隔），每次注册请求都会按顺序逐个尝试；如果只有这一步注册请求需要走代理，可以设置 `WARP_API_PROXY`。两者都不会改变请求方式和返回的 WireGuard 配置格式。
+> 如果你要切换到别的兼容注册 API，可以设置 `WARP_API_URL`；如果配置了多个地址（逗号或分号分隔），每次注册请求都会按顺序逐个尝试；如果只有这一步注册请求需要走代理，可以设置 `WARP_API_PROXY`。**未设置** `WARP_API_PROXY` 且多实例**健康后端 > 1** 时，注册会自动走本机 HAProxy SOCKS（`socks5h://127.0.0.1:$BIND_PORT`），让 API 经已存活的 WARP 出口出去；健康数 ≤1 时仍直连注册，避免首启死锁。两者都不会改变请求方式和返回的 WireGuard 配置格式。
 >
 > 出口 IP 探测为**多源、短超时、同厂商错开**（例如先 `1.1.1.1`，中间插其它厂商，再试 `1.0.0.1`）。**同一次**健康检查内，每个地址族最多试 `EGRESS_IP_FAIL_THRESHOLD` 条链接（默认 **4**），成功即停；若这几条都拿不到 IP，判定 WARP 连接失败。`EGRESS_IP_FAIL_THRESHOLD=0` 时不因 IP 判死，改由 `TEST_URLS` 决定。健康检查失败后仍按 `WG_RECONNECT_RETRIES` 先重连再重检，全部失败后才重新向 API 申请配置（默认 `5`，`0` 跳过重连，过大值封顶 `20`）。
 >

@@ -670,6 +670,44 @@ test_config_retry_paths() {
     assert_eq "$(get_config_retry_worker_pid_file)" '/var/run/microwarp/config_retry.worker.pid' 'worker pid file'
 }
 
+test_effective_warp_api_proxy_rules() {
+    LISTEN_PORT=1080
+
+    # Explicit proxy always wins.
+    WARP_API_PROXY='socks5://10.0.0.1:9050'
+    WARP_INSTANCE_COUNT=10
+    count_healthy_instances() { printf '5\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" 'socks5://10.0.0.1:9050' 'explicit WARP_API_PROXY wins'
+
+    # No explicit proxy + single instance → direct.
+    WARP_API_PROXY=''
+    WARP_INSTANCE_COUNT=1
+    count_healthy_instances() { printf '99\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" '' 'single instance stays direct'
+
+    # Multi + 0 healthy → direct (bootstrap).
+    WARP_INSTANCE_COUNT=5
+    count_healthy_instances() { printf '0\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" '' '0 healthy → direct'
+
+    # Multi + 1 healthy → still direct (need >1).
+    count_healthy_instances() { printf '1\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" '' '1 healthy → direct'
+
+    # Multi + >1 healthy → local HAProxy socks5h on loopback:BIND_PORT.
+    count_healthy_instances() { printf '2\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" 'socks5h://127.0.0.1:1080' '2 healthy → haproxy socks'
+
+    LISTEN_PORT=2080
+    count_healthy_instances() { printf '3\n'; }
+    assert_eq "$(get_effective_warp_api_proxy)" 'socks5h://127.0.0.1:2080' 'uses LISTEN_PORT'
+
+    unset -f count_healthy_instances 2>/dev/null || true
+    WARP_API_PROXY=''
+    WARP_INSTANCE_COUNT=1
+    LISTEN_PORT=1080
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -683,6 +721,7 @@ test_inst_id_not_clobbered_by_status_loops
 test_generate_warp_config_returns_not_exits_on_failure
 test_config_retry_paths
 test_config_retry_queue_fifo_and_dedupe
+test_effective_warp_api_proxy_rules
 test_run_health_checks_prefers_test_urls_when_ip_soft_disabled
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
 test_run_health_checks_hard_fails_when_round_gets_no_ip

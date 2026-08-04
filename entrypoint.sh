@@ -639,9 +639,55 @@ pick_endpoint_ip() {
     return 0
 }
 
+# Effective proxy for WARP register API only.
+# Priority:
+#   1) explicit WARP_API_PROXY (always wins)
+#   2) multi-instance + healthy backends > 1 → local HAProxy SOCKS (socks5h)
+#   3) otherwise direct (no proxy)
+# Healthy>1 avoids chicken-and-egg on first boot (0/1 up still register direct).
+get_effective_warp_api_proxy() {
+    local HEALTHY
+    if [ -n "$WARP_API_PROXY" ]; then
+        printf '%s\n' "$WARP_API_PROXY"
+        return 0
+    fi
+
+    case "${WARP_INSTANCE_COUNT:-1}" in
+        ''|*[!0-9]*)
+            printf '\n'
+            return 0
+            ;;
+    esac
+
+    if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
+        printf '\n'
+        return 0
+    fi
+
+    HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
+    case "$HEALTHY" in
+        ''|*[!0-9]*)
+            HEALTHY=0
+            ;;
+    esac
+
+    if [ "$HEALTHY" -gt 1 ]; then
+        # Loopback only: BIND_ADDR may be 0.0.0.0 which is not a valid curl proxy host.
+        # socks5h = resolve API hostname via the proxy (through a healthy WARP inst).
+        printf 'socks5h://127.0.0.1:%s\n' "${LISTEN_PORT:-1080}"
+        return 0
+    fi
+
+    printf '\n'
+    return 0
+}
+
 fetch_warp_config() {
+    local EFFECTIVE_PROXY
     API_URLS=$(printf '%s' "$WARP_API_URL" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
     [ -n "$API_URLS" ] || return 1
+
+    EFFECTIVE_PROXY=$(get_effective_warp_api_proxy)
 
     OLD_IFS=$IFS
     IFS='
@@ -650,9 +696,13 @@ fetch_warp_config() {
         [ -n "$API_URL" ] || continue
         echo "==> [MicroWARP] API 地址: ${API_URL}"
 
-        if [ -n "$WARP_API_PROXY" ]; then
-            echo "==> [MicroWARP] API 请求将通过已配置代理发起"
-            curl --proxy "$WARP_API_PROXY" --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
+        if [ -n "$EFFECTIVE_PROXY" ]; then
+            if [ -n "$WARP_API_PROXY" ]; then
+                echo "==> [MicroWARP] API 请求将通过已配置代理发起 (${EFFECTIVE_PROXY})"
+            else
+                echo "==> [MicroWARP] API 请求经本机 HAProxy SOCKS 发起（健康实例>1，${EFFECTIVE_PROXY}）"
+            fi
+            curl --proxy "$EFFECTIVE_PROXY" --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
                 "$API_URL" > "$raw_conf" && {
                 IFS=$OLD_IFS
                 return 0
