@@ -474,7 +474,12 @@ render_haproxy_config() {
     cat <<EOF
 global
     daemon
+    master-worker
     maxconn 4096
+    # Explicit root + chroot /: we intentionally run privileged in this container
+    # (netns / bind). Silences HAProxy 3.x startup warnings that look like crashes.
+    user root
+    chroot /
 
 defaults
     mode tcp
@@ -503,6 +508,101 @@ EOF
         printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
     done
     IFS=$OLD_IFS
+}
+
+get_haproxy_pid_file() {
+    printf '%s/haproxy.pid\n' "$INSTANCE_STATE_DIR"
+}
+
+# True if $1 looks like a live process id we can signal.
+is_live_pid() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$1" 2>/dev/null
+}
+
+# Always re-read the pidfile. Background recovery workers inherit a stale copy of
+# HAPROXY_PID; treating that dead-but-nonempty value as authoritative caused cold
+# starts (and a new "已上线" log line + new PID) on almost every backend change.
+# Prefer: live pidfile → live shell HAPROXY_PID → empty.
+refresh_haproxy_pid() {
+    local PID_FILE CAND
+    PID_FILE=$(get_haproxy_pid_file)
+
+    if [ -f "$PID_FILE" ]; then
+        CAND=$(tr -d ' \n\r\t' < "$PID_FILE" 2>/dev/null || true)
+        if is_live_pid "$CAND"; then
+            HAPROXY_PID=$CAND
+            return 0
+        fi
+    fi
+
+    if is_live_pid "$HAPROXY_PID"; then
+        # Shell has a live pid the file lost — rewrite file for other workers.
+        printf '%s\n' "$HAPROXY_PID" > "$PID_FILE" 2>/dev/null || true
+        return 0
+    fi
+
+    HAPROXY_PID=""
+    return 1
+}
+
+# Master-worker soft reload keeps the same master PID (USR2). Fallback: -sf.
+# Returns 0 only if a live master remains afterwards.
+haproxy_try_soft_reload() {
+    local CFG="$1"
+    local PID_FILE OLD_PID
+    PID_FILE=$(get_haproxy_pid_file)
+
+    refresh_haproxy_pid || return 1
+    OLD_PID=$HAPROXY_PID
+
+    # Preferred: signal existing master (master-worker). PID stays stable.
+    if kill -USR2 "$OLD_PID" 2>/dev/null; then
+        # Give master a moment to re-exec workers / rewrite pidfile if needed.
+        sleep 0.2 2>/dev/null || true
+        if refresh_haproxy_pid && [ "$HAPROXY_PID" = "$OLD_PID" ]; then
+            return 0
+        fi
+        # Master may have rewritten pidfile with same or new pid; still live is OK.
+        if is_live_pid "$HAPROXY_PID"; then
+            return 0
+        fi
+        # USR2 accepted but process gone — fall through.
+    fi
+
+    # Fallback: classic soft-finish (new process, old finishes). PID will change.
+    if haproxy -W -D -f "$CFG" -p "$PID_FILE" -sf "$OLD_PID" 2>/dev/null; then
+        sleep 0.1 2>/dev/null || true
+        if refresh_haproxy_pid; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+haproxy_cold_start() {
+    local CFG="$1"
+    local PID_FILE
+    PID_FILE=$(get_haproxy_pid_file)
+
+    # Best-effort stop any leftover master we still know about.
+    if refresh_haproxy_pid; then
+        kill "$HAPROXY_PID" 2>/dev/null || true
+        sleep 0.2 2>/dev/null || true
+        kill -9 "$HAPROXY_PID" 2>/dev/null || true
+    fi
+    HAPROXY_PID=""
+
+    haproxy -W -D -f "$CFG" -p "$PID_FILE"
+    sleep 0.1 2>/dev/null || true
+    if refresh_haproxy_pid; then
+        record_socks_online_started_at
+        return 0
+    fi
+    return 1
 }
 
 print_warp_identity_summary() {
@@ -1775,47 +1875,43 @@ mark_instance_down() {
 }
 
 _reload_haproxy_from_status_unlocked() {
+    local STATUS_LIST HEALTHY PID_FILE
     mkdir -p "$INSTANCE_STATE_DIR"
+    PID_FILE=$(get_haproxy_pid_file)
     STATUS_LIST=$(collect_instance_status_list)
     HEALTHY=$(count_healthy_instances)
 
     render_haproxy_config "$LISTEN_ADDR" "$LISTEN_PORT" "$STATUS_LIST" > "$HAPROXY_CFG"
     echo "==> [MicroWARP] 刷新 HAProxy 后端（健康实例: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
 
-    if [ -n "$HAPROXY_PID" ] && kill -0 "$HAPROXY_PID" 2>/dev/null; then
-        # soft reload keeps the frontend port open
-        if haproxy -D -f "$HAPROXY_CFG" -p "${INSTANCE_STATE_DIR}/haproxy.pid" -sf "$HAPROXY_PID" 2>/dev/null; then
-            if [ -f "${INSTANCE_STATE_DIR}/haproxy.pid" ]; then
-                HAPROXY_PID=$(tr -d '\n' < "${INSTANCE_STATE_DIR}/haproxy.pid")
-            fi
+    # CRITICAL: re-sync from pidfile every time. Do NOT trust the shell copy of
+    # HAPROXY_PID alone — recovery workers fork with a stale value; a dead-but
+    # non-empty HAPROXY_PID used to skip the pidfile path and cold-start every
+    # revive, printing "已上线" with a new PID on each backend change.
+    if refresh_haproxy_pid; then
+        if haproxy_try_soft_reload "$HAPROXY_CFG"; then
+            echo "==> [MicroWARP] HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}，健康: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
             return 0
         fi
-        echo "==> [MicroWARP] [WARN] HAProxy soft-reload 失败，尝试重启"
-        kill "$HAPROXY_PID" 2>/dev/null || true
-        wait "$HAPROXY_PID" 2>/dev/null || true
-        HAPROXY_PID=""
-    fi
-
-    # Also accept PID from a previous process written to the pid file (multi-worker safe-ish)
-    if [ -z "$HAPROXY_PID" ] && [ -f "${INSTANCE_STATE_DIR}/haproxy.pid" ]; then
-        OLD_PID=$(tr -d '\n' < "${INSTANCE_STATE_DIR}/haproxy.pid")
-        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-            if haproxy -D -f "$HAPROXY_CFG" -p "${INSTANCE_STATE_DIR}/haproxy.pid" -sf "$OLD_PID" 2>/dev/null; then
-                if [ -f "${INSTANCE_STATE_DIR}/haproxy.pid" ]; then
-                    HAPROXY_PID=$(tr -d '\n' < "${INSTANCE_STATE_DIR}/haproxy.pid")
-                fi
-                return 0
-            fi
-            kill "$OLD_PID" 2>/dev/null || true
+        echo "==> [MicroWARP] [WARN] HAProxy soft-reload 失败，尝试冷启动"
+        # Drop dead/broken master before cold start.
+        if is_live_pid "$HAPROXY_PID"; then
+            kill "$HAPROXY_PID" 2>/dev/null || true
+            sleep 0.2 2>/dev/null || true
+            kill -9 "$HAPROXY_PID" 2>/dev/null || true
         fi
+        HAPROXY_PID=""
+        rm -f "$PID_FILE"
     fi
 
-    haproxy -D -f "$HAPROXY_CFG" -p "${INSTANCE_STATE_DIR}/haproxy.pid"
-    if [ -f "${INSTANCE_STATE_DIR}/haproxy.pid" ]; then
-        HAPROXY_PID=$(tr -d '\n' < "${INSTANCE_STATE_DIR}/haproxy.pid")
+    if haproxy_cold_start "$HAPROXY_CFG"; then
+        echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+        return 0
     fi
-    record_socks_online_started_at
-    echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${HAPROXY_PID})"
+
+    echo "==> [MicroWARP] [ERROR] HAProxy 启动失败"
+    HAPROXY_PID=""
+    return 1
 }
 
 reload_haproxy_from_status() {
@@ -2205,11 +2301,13 @@ multi_cleanup_on_exit() {
 
     stop_all_instance_recoveries
 
-    if [ -n "$HAPROXY_PID" ] && kill -0 "$HAPROXY_PID" 2>/dev/null; then
+    refresh_haproxy_pid || true
+    if is_live_pid "$HAPROXY_PID"; then
         kill "$HAPROXY_PID" 2>/dev/null || true
         wait "$HAPROXY_PID" 2>/dev/null || true
     fi
     HAPROXY_PID=""
+    rm -f "$(get_haproxy_pid_file)" 2>/dev/null || true
 
     for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
         destroy_instance_netns "$INST_ID"

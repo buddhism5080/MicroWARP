@@ -313,6 +313,9 @@ test_haproxy_config_only_includes_healthy_servers() {
     assert_contains "$cfg" 'bind 0.0.0.0:1080' 'frontend bind'
     assert_contains "$cfg" 'mode tcp' 'tcp mode'
     assert_contains "$cfg" 'balance roundrobin' 'round robin'
+    assert_contains "$cfg" 'master-worker' 'master-worker mode for stable soft-reload'
+    assert_contains "$cfg" 'user root' 'explicit root to silence HAProxy 3 warn'
+    assert_contains "$cfg" 'chroot /' 'explicit chroot to silence HAProxy 3 warn'
     assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
     assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
 
@@ -327,6 +330,91 @@ test_haproxy_config_with_no_healthy_backends_still_binds() {
     cfg=$(render_haproxy_config '127.0.0.1' '2080' '1:down 2:down')
     assert_contains "$cfg" 'bind 127.0.0.1:2080' 'frontend should still bind with zero healthy backends'
     assert_contains "$cfg" 'backend warp_pool' 'backend section remains'
+}
+
+test_refresh_haproxy_pid_prefers_live_pidfile_over_stale_shell() {
+    # Reproduces: background worker inherits HAPROXY_PID=dead, while pidfile has
+    # the real live master. Old code trusted dead shell pid → cold start every revive.
+    INSTANCE_STATE_DIR=/tmp/microwarp-haproxy-pid-$$
+    command mkdir -p "$INSTANCE_STATE_DIR"
+    mkdir() { command mkdir "$@"; }
+
+    sleep 60 &
+    LIVE_PID=$!
+    printf '%s\n' "$LIVE_PID" > "$INSTANCE_STATE_DIR/haproxy.pid"
+
+    HAPROXY_PID=999999
+    refresh_haproxy_pid
+    assert_eq "$HAPROXY_PID" "$LIVE_PID" 'must adopt live pidfile, not stale shell pid'
+
+    kill "$LIVE_PID" 2>/dev/null || true
+    wait "$LIVE_PID" 2>/dev/null || true
+    refresh_haproxy_pid || true
+    assert_eq "$HAPROXY_PID" '' 'dead pidfile/shell must clear HAPROXY_PID'
+
+    unset -f mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+}
+
+test_reload_uses_soft_path_when_pidfile_live() {
+    # When pidfile points at a live process, reload must soft-reload — not cold-start
+    # (must not log 已上线).
+    INSTANCE_STATE_DIR=/tmp/microwarp-haproxy-reload-$$
+    command mkdir -p "$INSTANCE_STATE_DIR"
+    mkdir() { command mkdir "$@"; }
+    HAPROXY_CFG="$INSTANCE_STATE_DIR/haproxy.cfg"
+    LISTEN_ADDR=0.0.0.0
+    LISTEN_PORT=1080
+    WARP_INSTANCE_COUNT=2
+    SOFT_LOG="$INSTANCE_STATE_DIR/soft.count"
+    COLD_LOG="$INSTANCE_STATE_DIR/cold.count"
+    OUT_LOG="$INSTANCE_STATE_DIR/reload.out"
+    : > "$SOFT_LOG"
+    : > "$COLD_LOG"
+
+    sleep 60 &
+    LIVE_PID=$!
+    printf '%s\n' "$LIVE_PID" > "$INSTANCE_STATE_DIR/haproxy.pid"
+    # Stale shell pid (the bug): non-empty but dead → old code cold-started.
+    HAPROXY_PID=999999
+
+    collect_instance_status_list() { printf '1:up 2:down\n'; }
+    count_healthy_instances() { printf '1\n'; }
+    render_haproxy_config() { printf 'ok\n'; }
+    with_dir_lock() { shift; "$@"; }
+
+    # Count via files: command substitution would put counters in a subshell.
+    haproxy_try_soft_reload() {
+        echo 1 >> "$SOFT_LOG"
+        HAPROXY_PID=$LIVE_PID
+        return 0
+    }
+    haproxy_cold_start() {
+        echo 1 >> "$COLD_LOG"
+        return 0
+    }
+    record_socks_online_started_at() { :; }
+
+    _reload_haproxy_from_status_unlocked >"$OUT_LOG" 2>&1
+    soft_calls=$(wc -l < "$SOFT_LOG" | tr -d ' ')
+    cold_calls=$(wc -l < "$COLD_LOG" | tr -d ' ')
+    out=$(cat "$OUT_LOG")
+    assert_eq "$soft_calls" '1' 'should soft-reload once'
+    assert_eq "$cold_calls" '0' 'must not cold-start when soft-reload works'
+    assert_contains "$out" 'soft-reload 完成' 'log soft-reload not cold start'
+    if [[ "$out" == *'已上线'* ]]; then
+        echo "unexpected cold-start log: $out" >&2
+        exit 1
+    fi
+    assert_eq "$HAPROXY_PID" "$LIVE_PID" 'master pid stays the live one'
+
+    kill "$LIVE_PID" 2>/dev/null || true
+    wait "$LIVE_PID" 2>/dev/null || true
+    unset -f collect_instance_status_list count_healthy_instances render_haproxy_config \
+        with_dir_lock haproxy_try_soft_reload haproxy_cold_start record_socks_online_started_at mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
 }
 
 test_stagger_skips_after_last_instance() {
@@ -602,6 +690,8 @@ test_probe_family_stops_after_threshold_links
 test_probe_family_stops_early_on_success
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
+test_refresh_haproxy_pid_prefers_live_pidfile_over_stale_shell
+test_reload_uses_soft_path_when_pidfile_live
 test_stagger_skips_after_last_instance
 test_health_check_stagger_is_interval_div_count
 test_config_stale_offline_threshold
