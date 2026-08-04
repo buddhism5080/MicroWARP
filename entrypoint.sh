@@ -224,6 +224,14 @@ get_register_lock_dir() {
     printf '%s/register.lock.d\n' "$INSTANCE_STATE_DIR"
 }
 
+get_config_retry_queue_dir() {
+    printf '%s/config_retry.queue\n' "$INSTANCE_STATE_DIR"
+}
+
+get_config_retry_worker_pid_file() {
+    printf '%s/config_retry.worker.pid\n' "$INSTANCE_STATE_DIR"
+}
+
 # mkdir-based lock (no flock dependency on Alpine busybox)
 with_dir_lock() {
     LOCK_DIR=$1
@@ -278,6 +286,184 @@ stop_all_instance_recoveries() {
     for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
         stop_instance_recovery "$_iid"
     done
+    stop_config_retry_worker
+}
+
+# --- Serial background queue for instances that failed WARP config fetch ---
+# One worker processes the queue FIFO so register API is not stampeded, and a
+# single bad inst never exits the whole container.
+is_config_retry_worker_running() {
+    local PID_FILE PID
+    PID_FILE=$(get_config_retry_worker_pid_file)
+    if [ ! -f "$PID_FILE" ]; then
+        return 1
+    fi
+    PID=$(tr -d '\n' < "$PID_FILE")
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$PID_FILE"
+    return 1
+}
+
+stop_config_retry_worker() {
+    local PID_FILE PID i
+    PID_FILE=$(get_config_retry_worker_pid_file)
+    if [ -f "$PID_FILE" ]; then
+        PID=$(tr -d '\n' < "$PID_FILE")
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" 2>/dev/null || true
+            i=0
+            while [ "$i" -lt 20 ] && kill -0 "$PID" 2>/dev/null; do
+                sleep 0.1 2>/dev/null || sleep 1
+                i=$((i + 1))
+            done
+            kill -9 "$PID" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+}
+
+is_instance_queued_for_config_retry() {
+    local INST_ID="$1"
+    local QDIR
+    QDIR=$(get_config_retry_queue_dir)
+    [ -f "${QDIR}/${INST_ID}" ]
+}
+
+# List queued instance ids in FIFO order (by mtime, then name).
+list_config_retry_queue_ids() {
+    local QDIR
+    QDIR=$(get_config_retry_queue_dir)
+    if [ ! -d "$QDIR" ]; then
+        return 0
+    fi
+    # Prefer ls -1tr (oldest first). Fall back to plain names if busybox lacks -t.
+    if ls -1tr "$QDIR" >/dev/null 2>&1; then
+        ls -1tr "$QDIR" 2>/dev/null | sed '/^$/d'
+    else
+        ls -1 "$QDIR" 2>/dev/null | sed '/^$/d' | sort -n
+    fi
+}
+
+enqueue_instance_config_retry() {
+    local INST_ID="$1"
+    local QDIR MARK
+    QDIR=$(get_config_retry_queue_dir)
+    mkdir -p "$QDIR" "$INSTANCE_STATE_DIR"
+    MARK="${QDIR}/${INST_ID}"
+    if [ -f "$MARK" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已在配置重试队列中，跳过重复入队"
+    else
+        # Record enqueue time for FIFO / observability.
+        date +%s > "$MARK" 2>/dev/null || printf '1\n' > "$MARK"
+        echo "==> [MicroWARP] [inst${INST_ID}] 配置获取失败 → 已加入后台串行重试队列"
+    fi
+    set_instance_status "$INST_ID" "down"
+    record_instance_offline_since "$INST_ID"
+    ensure_config_retry_worker
+}
+
+# Full bring-up after a late successful registration (netns may not exist yet).
+bring_up_instance_after_config() {
+    local INST_ID="$1"
+    local CONF_PATH
+    CONF_PATH=$(get_instance_conf_path "$INST_ID")
+
+    if [ ! -f "$CONF_PATH" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] bring_up_instance_after_config: 配置仍不存在"
+        return 1
+    fi
+
+    print_warp_identity_summary "$CONF_PATH" "inst${INST_ID}"
+    setup_instance_netns "$INST_ID" || true
+    start_instance_warp "$INST_ID" || true
+
+    if run_instance_health_checks "$INST_ID"; then
+        mark_instance_up "$INST_ID"
+        reload_haproxy_from_status
+        echo "==> [MicroWARP] [inst${INST_ID}] 🎉 队列重试注册后已上线并加入 LB"
+        return 0
+    fi
+
+    echo "==> [MicroWARP] [inst${INST_ID}] 配置已生成但连通性未过，交给常规后台复活 worker"
+    mark_instance_down "$INST_ID"
+    reload_haproxy_from_status
+    request_instance_recovery "$INST_ID"
+    return 1
+}
+
+# One serial worker: FIFO over failed register attempts. Never exits the container.
+config_retry_worker() {
+    local PID_FILE QDIR INST_ID CONF_PATH BACKOFF MAX_BACKOFF EMPTY_ROUNDS
+    PID_FILE=$(get_config_retry_worker_pid_file)
+    QDIR=$(get_config_retry_queue_dir)
+    # Parent records real job pid via $!. Do not overwrite with $$ (BusyBox ash).
+    # shellcheck disable=SC2064
+    trap 'rm -f "$PID_FILE"' EXIT INT TERM
+
+    BACKOFF=5
+    MAX_BACKOFF=60
+    EMPTY_ROUNDS=0
+    echo "==> [MicroWARP] 配置串行重试 worker 启动"
+
+    while true; do
+        INST_ID=$(list_config_retry_queue_ids | head -n1 || true)
+        if [ -z "$INST_ID" ]; then
+            EMPTY_ROUNDS=$((EMPTY_ROUNDS + 1))
+            # Stay alive briefly in case bootstrap enqueues more; then exit cleanly.
+            if [ "$EMPTY_ROUNDS" -ge 3 ]; then
+                echo "==> [MicroWARP] 配置重试队列已空，worker 退出"
+                rm -f "$PID_FILE"
+                trap - EXIT INT TERM
+                exit 0
+            fi
+            sleep 2
+            continue
+        fi
+        EMPTY_ROUNDS=0
+
+        CONF_PATH=$(get_instance_conf_path "$INST_ID")
+        echo "==> [MicroWARP] [inst${INST_ID}] 队列串行重试：获取/注册 WARP 配置..."
+
+        if [ -f "$CONF_PATH" ] && ! is_enabled "$ROTATE_IP_ON_START"; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 队列中发现配置已存在，直接拉起"
+            rm -f "${QDIR}/${INST_ID}"
+            bring_up_instance_after_config "$INST_ID" || true
+            BACKOFF=5
+            continue
+        fi
+
+        if with_dir_lock "$(get_register_lock_dir)" generate_warp_config "$CONF_PATH"; then
+            rm -f "${QDIR}/${INST_ID}"
+            bring_up_instance_after_config "$INST_ID" || true
+            BACKOFF=5
+            continue
+        fi
+
+        # Keep marker; move to end of FIFO by refreshing mtime after siblings.
+        date +%s > "${QDIR}/${INST_ID}" 2>/dev/null || true
+        echo "==> [MicroWARP] [inst${INST_ID}] 队列本轮注册仍失败，${BACKOFF}s 后继续串行重试（不退出容器）"
+        sleep "$BACKOFF"
+        BACKOFF=$((BACKOFF * 2))
+        if [ "$BACKOFF" -gt "$MAX_BACKOFF" ]; then
+            BACKOFF=$MAX_BACKOFF
+        fi
+    done
+}
+
+ensure_config_retry_worker() {
+    local _pid _pid_file
+    mkdir -p "$INSTANCE_STATE_DIR"
+    if is_config_retry_worker_running; then
+        return 0
+    fi
+    _pid_file=$(get_config_retry_worker_pid_file)
+    echo "==> [MicroWARP] 拉起配置串行重试 worker..."
+    config_retry_worker &
+    _pid=$!
+    echo "$_pid" > "$_pid_file"
+    echo "==> [MicroWARP] 配置串行重试 worker 已记录 PID ${_pid}"
 }
 
 render_haproxy_config() {
@@ -495,7 +681,10 @@ generate_warp_config() {
     done
 
     echo "==> [MicroWARP] [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
-    exit 1
+    # Never exit the container here: multi-instance bootstrap/recovery must
+    # keep running and hand the failed inst to a serial background retry queue.
+    # Callers that need hard-fail (single-instance first boot) check the return code.
+    return 1
 }
 
 prepare_wg_quick_compat() {
@@ -527,7 +716,10 @@ start_warp_interface() {
 
 restart_warp_with_new_identity() {
     wg-quick down wg0 > /dev/null 2>&1 || true
-    generate_warp_config
+    if ! generate_warp_config; then
+        echo "==> [MicroWARP] [WARN] 重新注册失败，保留旧配置并交由上层重试"
+        return 1
+    fi
     print_warp_identity_summary
     start_warp_interface
 }
@@ -1027,7 +1219,10 @@ ensure_network_ready() {
             echo "==> [MicroWARP] WG 重连重试后仍未恢复，正在重新注册并重置节点..."
         fi
 
-        restart_warp_with_new_identity
+        if ! restart_warp_with_new_identity; then
+            echo "==> [MicroWARP] 重新注册本轮失败，5s 后继续重试（不退出容器）"
+            sleep 5
+        fi
     done
 }
 
@@ -1554,7 +1749,11 @@ restart_instance_with_new_identity() {
 
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     # Serialize API registration so many background revivers don't stampede the API.
-    with_dir_lock "$(get_register_lock_dir)" generate_warp_config "$CONF_PATH"
+    if ! with_dir_lock "$(get_register_lock_dir)" generate_warp_config "$CONF_PATH"; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 重注册失败，交由配置串行重试队列继续"
+        enqueue_instance_config_retry "$INST_ID"
+        return 1
+    fi
     print_warp_identity_summary "$CONF_PATH" "inst${INST_ID}"
     start_instance_warp "$INST_ID"
 }
@@ -1627,11 +1826,13 @@ reload_haproxy_from_status() {
 # On success: mark up + reload HAProxy, then exit. On failure: keep retrying with backoff.
 # If offline continuously for CONFIG_STALE_OFFLINE_SECONDS (default 2h), skip reconnect and
 # force a new WARP registration — existing conf is treated as stale/invalid.
+# If conf is missing / register fails, hand off to the serial config-retry queue and exit
+# so we do not double-stampede the API alongside the queue worker.
 instance_recovery_worker() {
     # IMPORTANT: use local INST_ID. Nested helpers (reload_haproxy, status loops)
     # also assign INST_ID; without local, a recovery for inst12 becomes inst20.
     local INST_ID="$1"
-    local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED
+    local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED CONF_PATH
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     # Parent (request_instance_recovery) records the real job PID via $!.
     # Do NOT write $$ here: in BusyBox ash a backgrounded function often keeps
@@ -1644,6 +1845,22 @@ instance_recovery_worker() {
     echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile)"
 
     while true; do
+        CONF_PATH=$(get_instance_conf_path "$INST_ID")
+        if [ ! -f "$CONF_PATH" ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 无配置文件，交给配置串行重试队列（本 worker 退出）"
+            enqueue_instance_config_retry "$INST_ID"
+            rm -f "$PID_FILE"
+            trap - EXIT INT TERM
+            exit 0
+        fi
+
+        if is_instance_queued_for_config_retry "$INST_ID"; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 已在配置重试队列，本 worker 让出"
+            rm -f "$PID_FILE"
+            trap - EXIT INT TERM
+            exit 0
+        fi
+
         if run_instance_health_checks "$INST_ID"; then
             mark_instance_up "$INST_ID"
             reload_haproxy_from_status
@@ -1675,7 +1892,15 @@ instance_recovery_worker() {
             echo "==> [MicroWARP] [inst${INST_ID}] 后台复活：重连无效，重新注册 WARP 身份..."
         fi
 
-        if restart_instance_with_new_identity "$INST_ID" && run_instance_health_checks "$INST_ID"; then
+        if ! restart_instance_with_new_identity "$INST_ID"; then
+            # restart_instance_with_new_identity already enqueued config retry on register fail.
+            echo "==> [MicroWARP] [inst${INST_ID}] 重注册未完成，已交配置队列；本 worker 退出避免双通道重试"
+            rm -f "$PID_FILE"
+            trap - EXIT INT TERM
+            exit 0
+        fi
+
+        if run_instance_health_checks "$INST_ID"; then
             mark_instance_up "$INST_ID"
             reload_haproxy_from_status
             echo "==> [MicroWARP] [inst${INST_ID}] 🎉 重注册后后台复活成功"
@@ -1700,6 +1925,11 @@ request_instance_recovery() {
     local INST_ID="$1"
     local _rec_pid _pid_file
     mkdir -p "$INSTANCE_STATE_DIR"
+
+    if [ ! -f "$(get_instance_conf_path "$INST_ID")" ] || is_instance_queued_for_config_retry "$INST_ID"; then
+        enqueue_instance_config_retry "$INST_ID"
+        return 0
+    fi
 
     if is_instance_recovering "$INST_ID"; then
         echo "==> [MicroWARP] [inst${INST_ID}] 后台复活已在进行中，跳过重复拉起"
@@ -1757,12 +1987,20 @@ bootstrap_multi_instances() {
     enable_host_forwarding
     mkdir -p "$INSTANCE_STATE_DIR" /etc/wireguard/instances
     echo "==> [MicroWARP] 多实例串行启动（实例间错开 ${INSTANCE_START_STAGGER_SECONDS}s，避免并发注册/建隧）"
+    echo "==> [MicroWARP] 首个实例就绪后即开放服务并开始测活；配置失败的实例进入后台串行重试队列"
+
+    # Open frontend immediately (may have zero backends). Clients get refuse/reset
+    # rather than waiting for all N instances to finish register+tunnel.
+    for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        set_instance_status "$_bid" "down"
+        record_instance_offline_since "$_bid"
+    done
+    reload_haproxy_from_status
 
     for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
         CONF_PATH=$(get_instance_conf_path "$_bid")
-        set_instance_status "$_bid" "down"
-        # Start offline clock only if not already tracking (e.g. after container restart while still down).
-        record_instance_offline_since "$_bid"
+        _need_register=0
+        _config_ok=0
 
         if [ ! -f "$CONF_PATH" ]; then
             # migrate legacy single-instance conf to inst1 if present
@@ -1770,48 +2008,74 @@ bootstrap_multi_instances() {
                 mkdir -p "$(dirname "$CONF_PATH")"
                 cp "$WG_CONF" "$CONF_PATH"
                 echo "==> [MicroWARP] [inst1] 复用已有 ${WG_CONF}"
+                _config_ok=1
             else
                 echo "==> [MicroWARP] [inst${_bid}] 未检测到配置，自动注册..."
-                generate_warp_config "$CONF_PATH"
+                _need_register=1
             fi
         elif is_enabled "$ROTATE_IP_ON_START"; then
             echo "==> [MicroWARP] [inst${_bid}] ROTATE_IP_ON_START 生效，重新注册..."
-            generate_warp_config "$CONF_PATH"
+            _need_register=1
         else
             echo "==> [MicroWARP] [inst${_bid}] 检测到已有配置，跳过注册"
+            _config_ok=1
+        fi
+
+        if [ "$_need_register" -eq 1 ]; then
+            if generate_warp_config "$CONF_PATH"; then
+                _config_ok=1
+            else
+                echo "==> [MicroWARP] [inst${_bid}] 启动期配置获取失败（不退出容器），加入后台串行重试队列"
+                enqueue_instance_config_retry "$_bid"
+                reload_haproxy_from_status
+                stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
+                continue
+            fi
+        fi
+
+        if [ "$_config_ok" -ne 1 ]; then
+            enqueue_instance_config_retry "$_bid"
+            reload_haproxy_from_status
+            stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
+            continue
         fi
 
         print_warp_identity_summary "$CONF_PATH" "inst${_bid}"
         setup_instance_netns "$_bid"
         start_instance_warp "$_bid" || true
-        stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
-    done
 
-    # Bring frontend up early (may temporarily have zero backends), then fill healthy ones.
-    reload_haproxy_from_status
-
-    # Startup health: sequential quick probes, NO inter-instance sleep here.
-    # (Tunnel bring-up above already staggered; blocking reconnect was removed.)
-    for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        # Progressive open: health-check + join LB as soon as this inst is up —
+        # do not wait for remaining instances to finish boot.
         ensure_instance_ready "$_bid" 1 || true
         reload_haproxy_from_status
+
+        stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
     done
 
     HEALTHY=$(count_healthy_instances)
     if [ "$HEALTHY" -le 0 ]; then
-        echo "==> [MicroWARP] [WARN] 启动期尚无健康实例；各实例已/将在后台自行复活，主流程继续进入守护"
+        echo "==> [MicroWARP] [WARN] 启动期尚无健康实例；配置队列/复活 worker 继续后台工作，主流程进入守护"
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-            request_instance_recovery "$INST_ID"
+            if [ ! -f "$(get_instance_conf_path "$INST_ID")" ]; then
+                enqueue_instance_config_retry "$INST_ID"
+            else
+                request_instance_recovery "$INST_ID"
+            fi
         done
-        # Wait until at least one is up so clients aren't stuck on empty pool at first boot.
+        # Wait until at least one is up so first-boot clients aren't stuck forever
+        # on an empty pool — but service port is already open above.
         WAIT_ROUNDS=0
         while [ "$(count_healthy_instances)" -le 0 ]; do
             WAIT_ROUNDS=$((WAIT_ROUNDS + 1))
-            echo "==> [MicroWARP] 等待至少一个实例后台复活... (${WAIT_ROUNDS})"
+            echo "==> [MicroWARP] 等待至少一个实例就绪... (${WAIT_ROUNDS})"
             sleep 5
-            # re-kick any worker that died unexpectedly
             for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-                if [ "$(get_instance_status "$INST_ID")" != "up" ]; then
+                if [ "$(get_instance_status "$INST_ID")" = "up" ]; then
+                    continue
+                fi
+                if [ ! -f "$(get_instance_conf_path "$INST_ID")" ]; then
+                    enqueue_instance_config_retry "$INST_ID"
+                else
                     request_instance_recovery "$INST_ID"
                 fi
             done
@@ -1820,7 +2084,7 @@ bootstrap_multi_instances() {
 
     HEALTHY=$(count_healthy_instances)
     echo "==> [MicroWARP] 多实例就绪：${HEALTHY}/${WARP_INSTANCE_COUNT} 健康，统一入口 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    echo "==> [MicroWARP] down 实例由各自后台 worker 独立复活，不阻塞主巡检"
+    echo "==> [MicroWARP] down 实例由配置队列/后台 worker 独立复活，不阻塞主巡检"
     return 0
 }
 
@@ -1864,6 +2128,19 @@ get_health_check_stagger_seconds() {
 probe_instance_and_schedule_recovery() {
     local INST_ID="$1"
     local OLD_STATUS
+
+    # Config retry queue owns registration for conf-less / register-failed insts.
+    if is_instance_queued_for_config_retry "$INST_ID"; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 配置串行重试队列处理中，本轮巡检跳过"
+        ensure_config_retry_worker
+        return 0
+    fi
+
+    if [ ! -f "$(get_instance_conf_path "$INST_ID")" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 无配置 → 入配置串行重试队列"
+        enqueue_instance_config_retry "$INST_ID"
+        return 0
+    fi
 
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then
@@ -1960,10 +2237,16 @@ if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
     # 单实例：保持原有路径与 volume 兼容
     if [ ! -f "$WG_CONF" ]; then
         echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
-        generate_warp_config
+        if ! generate_warp_config; then
+            echo "==> [MicroWARP] [FATAL] 单实例首次注册连续失败，无法启动"
+            exit 1
+        fi
     elif is_enabled "$ROTATE_IP_ON_START"; then
         echo "==> [MicroWARP] 检测到 ROTATE_IP_ON_START=${ROTATE_IP_ON_START}，正在重新注册 WARP 设备以刷新出口 IP..."
-        generate_warp_config
+        if ! generate_warp_config; then
+            echo "==> [MicroWARP] [FATAL] ROTATE_IP_ON_START 注册失败，无法启动"
+            exit 1
+        fi
     else
         echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
     fi

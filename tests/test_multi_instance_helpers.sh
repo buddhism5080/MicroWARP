@@ -519,6 +519,69 @@ test_inst_id_not_clobbered_by_status_loops() {
     assert_eq "$(count_healthy_instances)" '2' 'two healthy'
 }
 
+test_generate_warp_config_returns_not_exits_on_failure() {
+    # Critical: multi-instance must not die when one inst fails register 3x.
+    local status
+    WARP_API_URL='https://127.0.0.1:9/does-not-exist'
+    WARP_API_PROXY=''
+    # Make fetch fail fast without real network dependency.
+    fetch_warp_config() { return 1; }
+    # Avoid long sleeps in the 3-attempt loop.
+    sleep() { :; }
+    set +e
+    generate_warp_config "/tmp/microwarp-gen-fail-$$.conf" >/tmp/microwarp-gen-fail-$$.log 2>&1
+    status=$?
+    set -e
+    unset -f fetch_warp_config sleep 2>/dev/null || true
+    assert_eq "$status" '1' 'generate_warp_config must return 1 on failure'
+    if ! grep -q '连续 3 次失败' /tmp/microwarp-gen-fail-$$.log; then
+        cat /tmp/microwarp-gen-fail-$$.log >&2
+        echo 'expected failure log' >&2
+        exit 1
+    fi
+    rm -f /tmp/microwarp-gen-fail-$$.conf /tmp/microwarp-gen-fail-$$.log
+}
+
+test_config_retry_queue_fifo_and_dedupe() {
+    INSTANCE_STATE_DIR=/tmp/microwarp-cfgq-$$
+    command mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
+    # Use real mkdir for queue dir
+    mkdir() { command mkdir "$@"; }
+    # Stub worker start so enqueue does not background anything in unit test.
+    ensure_config_retry_worker() { :; }
+    set_instance_status() { :; }
+    record_instance_offline_since() { :; }
+
+    enqueue_instance_config_retry 3 >/dev/null
+    enqueue_instance_config_retry 1 >/dev/null
+    enqueue_instance_config_retry 2 >/dev/null
+    # Force deterministic FIFO order via mtime (same-second enqueue is otherwise racy).
+    QDIR=$(get_config_retry_queue_dir)
+    touch -t 202001010001.00 "${QDIR}/3"
+    touch -t 202001010002.00 "${QDIR}/1"
+    touch -t 202001010003.00 "${QDIR}/2"
+    # dedupe
+    out=$(enqueue_instance_config_retry 3 2>&1 || true)
+    assert_contains "$out" '已在配置重试队列' 'dedupe message'
+
+    ids=$(list_config_retry_queue_ids | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    # FIFO by mtime: 3 then 1 then 2
+    assert_eq "$ids" '3 1 2' 'FIFO enqueue order by mtime'
+    assert_eq "$(is_instance_queued_for_config_retry 1 && echo yes || echo no)" 'yes' 'inst1 queued'
+    assert_eq "$(is_instance_queued_for_config_retry 9 && echo yes || echo no)" 'no' 'inst9 not queued'
+
+    # cleanup stubs + dir so later tests see real helpers again
+    unset -f ensure_config_retry_worker set_instance_status record_instance_offline_since 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+}
+
+test_config_retry_paths() {
+    INSTANCE_STATE_DIR=/var/run/microwarp
+    assert_eq "$(get_config_retry_queue_dir)" '/var/run/microwarp/config_retry.queue' 'queue dir'
+    assert_eq "$(get_config_retry_worker_pid_file)" '/var/run/microwarp/config_retry.worker.pid' 'worker pid file'
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -529,6 +592,9 @@ test_parse_endpoint_host_port
 test_extract_ip_from_probe_body
 test_egress_ip_defaults_interleave_vendors
 test_inst_id_not_clobbered_by_status_loops
+test_generate_warp_config_returns_not_exits_on_failure
+test_config_retry_paths
+test_config_retry_queue_fifo_and_dedupe
 test_run_health_checks_prefers_test_urls_when_ip_soft_disabled
 test_run_health_checks_fails_when_test_urls_fail_even_if_ip_ok
 test_run_health_checks_hard_fails_when_round_gets_no_ip
