@@ -186,7 +186,34 @@ get_instance_online_since_epoch() {
     fi
 }
 
-# True (0) if no ESTABLISHED TCP clients to this instance's backend SOCKS endpoint.
+# Busy (non-idle) TCP states for client sessions:
+#   established  — active data path
+#   syn-sent / syn-recv — handshake in progress
+#   fin-wait-1/2, close-wait, last-ack, closing — teardown still holding a session
+# TIME-WAIT is intentionally excluded: pure post-close linger must not block rotation.
+# ss (iproute2) accepts comma-separated state lists.
+SS_BUSY_TCP_STATES='established,syn-sent,syn-recv,fin-wait-1,fin-wait-2,close-wait,last-ack,closing'
+
+# Count non-idle TCP sockets matching an ss filter expression (e.g. "dst 10.66.1.2:1080").
+count_busy_tcp_sockets() {
+    local FILTER="$1"
+    local COUNT
+
+    if ! command -v ss >/dev/null 2>&1; then
+        printf '0\n'
+        return 0
+    fi
+
+    COUNT=$(ss -Htn state "$SS_BUSY_TCP_STATES" "$FILTER" 2>/dev/null | wc -l | tr -d ' ')
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            COUNT=0
+            ;;
+    esac
+    printf '%s\n' "$COUNT"
+}
+
+# True (0) if no busy TCP clients to this instance's backend SOCKS endpoint.
 # HAProxy talks to 10.66.<id>.2:1080 from the host netns; ss (iproute2) is available.
 is_instance_idle() {
     local INST_ID="$1"
@@ -198,23 +225,39 @@ is_instance_idle() {
         return 1
     fi
 
-    # Count established connections whose remote (dst) is the backend socks.
-    # ss -H: no header; -t: tcp; -n: numeric; state established.
-    COUNT=$(ss -Htn state established "dst ${NS_IP}:1080" 2>/dev/null | wc -l | tr -d ' ')
-    case "$COUNT" in
-        ''|*[!0-9]*)
-            COUNT=0
-            ;;
-    esac
-
+    COUNT=$(count_busy_tcp_sockets "dst ${NS_IP}:1080")
     [ "$COUNT" -eq 0 ]
 }
 
+# True (0) when healthy instances are strictly less than half of WARP_INSTANCE_COUNT.
+# Uses integer compare: healthy * 2 < total  (e.g. 1/3 → skip; 2/3 → allow; 1/2 → allow).
+healthy_instances_below_half() {
+    local TOTAL HEALTHY
+    TOTAL=${WARP_INSTANCE_COUNT:-1}
+    case "$TOTAL" in
+        ''|*[!0-9]*)
+            TOTAL=1
+            ;;
+    esac
+    if [ "$TOTAL" -le 0 ]; then
+        TOTAL=1
+    fi
+
+    HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
+    case "$HEALTHY" in
+        ''|*[!0-9]*)
+            HEALTHY=0
+            ;;
+    esac
+
+    [ "$((HEALTHY * 2))" -lt "$TOTAL" ]
+}
+
 # Returns 0 if this healthy instance should be force-rotated now:
-# continuous uptime >= MAX_CONN_DURATION AND currently idle.
+# continuous uptime >= MAX_CONN_DURATION AND currently idle AND pool not below half healthy.
 instance_should_force_rotate_for_max_conn() {
     local INST_ID="$1"
-    local THRESHOLD SINCE NOW_EPOCH ELAPSED
+    local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL
     THRESHOLD=$(get_max_conn_duration)
 
     if [ "$THRESHOLD" -le 0 ]; then
@@ -238,8 +281,19 @@ instance_should_force_rotate_for_max_conn() {
         return 1
     fi
 
+    # Capacity guard: never force-offline when healthy pool is already < half.
+    TOTAL=${WARP_INSTANCE_COUNT:-1}
+    case "$TOTAL" in
+        ''|*[!0-9]*) TOTAL=1 ;;
+    esac
+    if healthy_instances_below_half; then
+        HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但健康实例 ${HEALTHY}/${TOTAL} 少于一半，暂不强制下线"
+        return 1
+    fi
+
     if ! is_instance_idle "$INST_ID"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动连接，暂不强制重连"
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动/握手/半关闭连接，暂不强制重连"
         return 1
     fi
 
@@ -1026,7 +1080,8 @@ print_socks_health_check_success() {
     echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
 }
 
-# True if no ESTABLISHED clients on the external SOCKS listen port (single-instance).
+# True if no busy TCP clients on the external SOCKS listen port (single-instance).
+# Same busy-state set as multi-instance (handshake / transfer / teardown; not TIME-WAIT).
 is_single_socks_idle() {
     local PORT COUNT
     PORT=${LISTEN_PORT:-1080}
@@ -1035,18 +1090,13 @@ is_single_socks_idle() {
         return 1
     fi
 
-    # Server-side: established sockets with local sport = listen port.
-    COUNT=$(ss -Htn state established "sport = :${PORT}" 2>/dev/null | wc -l | tr -d ' ')
-    case "$COUNT" in
-        ''|*[!0-9]*)
-            COUNT=0
-            ;;
-    esac
-
+    # Server-side: busy sockets with local sport = listen port.
+    COUNT=$(count_busy_tcp_sockets "sport = :${PORT}")
     [ "$COUNT" -eq 0 ]
 }
 
 # Single-instance max uptime rotation when idle.
+# Half-pool guard does not apply meaningfully for N=1 (single is the whole pool).
 single_should_force_rotate_for_max_conn() {
     local THRESHOLD NOW_EPOCH ELAPSED
     THRESHOLD=$(get_max_conn_duration)
@@ -1072,7 +1122,7 @@ single_should_force_rotate_for_max_conn() {
     fi
 
     if ! is_single_socks_idle; then
-        echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动连接，暂不强制重连"
+        echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动/握手/半关闭连接，暂不强制重连"
         return 1
     fi
 

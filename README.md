@@ -105,7 +105,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - TEST_URLS_CHECK_INTERVAL=900 # Background TEST_URLS inspection interval in seconds; default 900
       - WARP_INSTANCES=1 # Number of in-container WARP tunnels (default 1, max 100). >1 enables single-port HAProxy LB over healthy instances only
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
-      - MAX_CONN_DURATION=0 # Max continuous healthy uptime (seconds) per instance; when exceeded AND currently idle (no active clients), force offline + reconnect (default 0=disable)
+      - MAX_CONN_DURATION=0 # Max continuous healthy uptime (seconds) per instance; when exceeded AND currently idle (no busy clients) AND healthy pool ≥ half, force offline + reconnect (default 0=disable)
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -131,7 +131,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
-*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy instance may stay continuously online. On each health probe, if uptime ≥ this value **and** the instance currently has **no active client connections** (idle), MicroWARP force-offs it and reconnects — multi-instance via the background recovery worker; single-instance via WG reconnect (then re-register if reconnect fails). Active traffic is never interrupted: busy instances are left alone until they become idle.)*
+*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy instance may stay continuously online. On each health probe, if uptime ≥ this value **and** the instance currently has **no busy client sockets** (not only ESTABLISHED — also SYN / FIN / CLOSE-WAIT style teardown; TIME-WAIT alone does not count) **and** healthy instances are **not strictly below half** of `WARP_INSTANCES`, MicroWARP force-offs it and reconnects — multi-instance via the background recovery worker; single-instance via WG reconnect (then re-register if reconnect fails). Busy traffic is never interrupted; a thin healthy pool is never thinned further by this policy.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -226,7 +226,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - TEST_URLS_CHECK_INTERVAL=900 # 后台 TEST_URLS 巡检间隔，单位秒；默认 900
       - WARP_INSTANCES=1 # 单容器内并行 WARP 隧道数量（默认 1，最大 100）。>1 时只暴露一个 SOCKS 端口，经 HAProxy 只负载到健康实例
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
-      - MAX_CONN_DURATION=0 # 每个实例最长连续健康在线秒数；超时且当前空闲（无活动客户端连接）则强制下线并重连（默认 0=关闭）
+      - MAX_CONN_DURATION=0 # 每个实例最长连续健康在线秒数；超时且当前空闲（无 busy 客户端连接）且健康实例不少于一半时，强制下线并重连（默认 0=关闭）
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -252,7 +252,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 >
-> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制每个实例最长连续健康在线时长。健康巡检时若已在线 ≥ 该值，**且当前无活动客户端连接（空闲）**，则强制下线并重连：多实例走后台复活 worker；单实例先 WG 重连，失败再走完整修复/重注册。有活动流量时不会打断，等空闲后再轮换。
+> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制每个实例最长连续健康在线时长。健康巡检时若已在线 ≥ 该值，**且当前无 busy 客户端连接（空闲）**，**且当前健康实例数不少于一半**（`healthy * 2 >= WARP_INSTANCES`），则强制下线并重连：多实例走后台复活 worker；单实例先 WG 重连，失败再走完整修复/重注册。busy 判定不止 `ESTABLISHED`，还包括握手中（SYN）与半关闭/收尾（FIN-WAIT / CLOSE-WAIT / LAST-ACK / CLOSING）；纯 `TIME-WAIT` 不算占用。有活动流量时不会打断；健康池已不足一半时也不会再因本策略下线。
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 

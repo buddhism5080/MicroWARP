@@ -710,6 +710,7 @@ test_effective_warp_api_proxy_rules() {
 
 test_max_conn_duration_helpers() {
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
+    local SAVED_WARP_COUNT="${WARP_INSTANCE_COUNT:-1}"
     MAX_CONN_DURATION=''
     assert_eq "$(get_max_conn_duration)" '0' 'blank MAX_CONN_DURATION defaults to 0 (disabled)'
 
@@ -725,8 +726,34 @@ test_max_conn_duration_helpers() {
     INSTANCE_STATE_DIR='/var/run/microwarp'
     assert_eq "$(get_instance_online_since_file 3)" '/var/run/microwarp/inst3.online_since' 'online_since path'
 
+    # half-pool helper: healthy * 2 < total
+    WARP_INSTANCE_COUNT=4
+    count_healthy_instances() { printf '1\n'; }
+    if ! healthy_instances_below_half; then
+        echo '1/4 should be below half' >&2
+        exit 1
+    fi
+    count_healthy_instances() { printf '2\n'; }
+    if healthy_instances_below_half; then
+        echo '2/4 is exactly half — must NOT be below half' >&2
+        exit 1
+    fi
+    WARP_INSTANCE_COUNT=3
+    count_healthy_instances() { printf '1\n'; }
+    if ! healthy_instances_below_half; then
+        echo '1/3 should be below half' >&2
+        exit 1
+    fi
+    count_healthy_instances() { printf '2\n'; }
+    if healthy_instances_below_half; then
+        echo '2/3 is above half — must NOT be below half' >&2
+        exit 1
+    fi
+
     # Disabled threshold must never force rotate.
     MAX_CONN_DURATION=0
+    WARP_INSTANCE_COUNT=4
+    count_healthy_instances() { printf '4\n'; }
     INSTANCE_STATE_DIR=$(mktemp -d)
     printf '%s\n' "$(( $(date +%s) - 99999 ))" > "$(get_instance_online_since_file 1)"
     is_instance_idle() { return 0; }
@@ -751,16 +778,26 @@ test_max_conn_duration_helpers() {
         exit 1
     fi
 
-    # Over threshold + idle → force rotate.
+    # Over threshold + idle + healthy below half → no rotate (capacity guard).
     is_instance_idle() { return 0; }
-    if ! instance_should_force_rotate_for_max_conn 1; then
-        echo 'idle + over threshold must force rotate' >&2
+    count_healthy_instances() { printf '1\n'; }
+    WARP_INSTANCE_COUNT=4
+    if instance_should_force_rotate_for_max_conn 1; then
+        echo 'healthy below half must not force rotate' >&2
         exit 1
     fi
 
-    unset -f is_instance_idle 2>/dev/null || true
+    # Over threshold + idle + healthy >= half → force rotate.
+    count_healthy_instances() { printf '3\n'; }
+    if ! instance_should_force_rotate_for_max_conn 1; then
+        echo 'idle + over threshold + healthy>=half must force rotate' >&2
+        exit 1
+    fi
+
+    unset -f is_instance_idle count_healthy_instances 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
+    WARP_INSTANCE_COUNT="$SAVED_WARP_COUNT"
     MAX_CONN_DURATION=0
 }
 
