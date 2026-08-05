@@ -708,6 +708,62 @@ test_effective_warp_api_proxy_rules() {
     LISTEN_PORT=1080
 }
 
+test_max_conn_duration_helpers() {
+    local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
+    MAX_CONN_DURATION=''
+    assert_eq "$(get_max_conn_duration)" '0' 'blank MAX_CONN_DURATION defaults to 0 (disabled)'
+
+    MAX_CONN_DURATION=0
+    assert_eq "$(get_max_conn_duration)" '0' '0 disables max-conn rotation'
+
+    MAX_CONN_DURATION=3600
+    assert_eq "$(get_max_conn_duration)" '3600' 'explicit positive duration honored'
+
+    MAX_CONN_DURATION=abc
+    assert_eq "$(get_max_conn_duration)" '0' 'invalid falls back to 0'
+
+    INSTANCE_STATE_DIR='/var/run/microwarp'
+    assert_eq "$(get_instance_online_since_file 3)" '/var/run/microwarp/inst3.online_since' 'online_since path'
+
+    # Disabled threshold must never force rotate.
+    MAX_CONN_DURATION=0
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    printf '%s\n' "$(( $(date +%s) - 99999 ))" > "$(get_instance_online_since_file 1)"
+    is_instance_idle() { return 0; }
+    if instance_should_force_rotate_for_max_conn 1; then
+        echo 'MAX_CONN_DURATION=0 must not force rotate' >&2
+        exit 1
+    fi
+
+    # Below threshold + idle → no rotate.
+    MAX_CONN_DURATION=3600
+    printf '%s\n' "$(( $(date +%s) - 10 ))" > "$(get_instance_online_since_file 1)"
+    if instance_should_force_rotate_for_max_conn 1; then
+        echo 'uptime below threshold must not force rotate' >&2
+        exit 1
+    fi
+
+    # Over threshold + not idle → no rotate (busy).
+    printf '%s\n' "$(( $(date +%s) - 4000 ))" > "$(get_instance_online_since_file 1)"
+    is_instance_idle() { return 1; }
+    if instance_should_force_rotate_for_max_conn 1; then
+        echo 'busy instance must not force rotate even when over threshold' >&2
+        exit 1
+    fi
+
+    # Over threshold + idle → force rotate.
+    is_instance_idle() { return 0; }
+    if ! instance_should_force_rotate_for_max_conn 1; then
+        echo 'idle + over threshold must force rotate' >&2
+        exit 1
+    fi
+
+    unset -f is_instance_idle 2>/dev/null || true
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
+    MAX_CONN_DURATION=0
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -734,5 +790,6 @@ test_reload_uses_soft_path_when_pidfile_live
 test_stagger_skips_after_last_instance
 test_health_check_stagger_is_interval_div_count
 test_config_stale_offline_threshold
+test_max_conn_duration_helpers
 
 printf 'PASS test_multi_instance_helpers\n'

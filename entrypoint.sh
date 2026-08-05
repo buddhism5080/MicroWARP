@@ -30,6 +30,11 @@ INSTANCE_START_STAGGER_SECONDS=1
 # If an instance stays offline this long, treat its WARP conf as stale and force re-register.
 # Default 7200s = 2 hours. Set 0 to disable.
 CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
+# Max continuous healthy uptime (seconds) per instance. When exceeded AND the
+# instance currently has no active client connections (idle), force it offline
+# and reconnect (rotate tunnel / identity path via recovery worker).
+# Default 0 = disabled.
+MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -139,6 +144,107 @@ get_config_stale_offline_seconds() {
             ;;
     esac
     printf '%s\n' "$RAW"
+}
+
+get_max_conn_duration() {
+    RAW=${MAX_CONN_DURATION:-0}
+    case "$RAW" in
+        ''|*[!0-9]*)
+            printf '0\n'
+            return 0
+            ;;
+    esac
+    printf '%s\n' "$RAW"
+}
+
+get_instance_online_since_file() {
+    # Ephemeral: online clock resets on container restart (fine for uptime rotation).
+    printf '%s/inst%s.online_since\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+record_instance_online_since() {
+    _oid=$1
+    FILE=$(get_instance_online_since_file "$_oid")
+    mkdir -p "$(dirname "$FILE")"
+    # Only stamp if missing so re-mark-up during healthy probes does not reset the clock.
+    if [ ! -f "$FILE" ]; then
+        date +%s > "$FILE"
+    fi
+}
+
+clear_instance_online_since() {
+    _oid=$1
+    rm -f "$(get_instance_online_since_file "$_oid")"
+}
+
+get_instance_online_since_epoch() {
+    FILE=$(get_instance_online_since_file "$1")
+    if [ -f "$FILE" ]; then
+        tr -d '\n' < "$FILE"
+    else
+        printf ''
+    fi
+}
+
+# True (0) if no ESTABLISHED TCP clients to this instance's backend SOCKS endpoint.
+# HAProxy talks to 10.66.<id>.2:1080 from the host netns; ss (iproute2) is available.
+is_instance_idle() {
+    local INST_ID="$1"
+    local NS_IP COUNT
+    NS_IP=$(get_instance_ns_ip "$INST_ID")
+
+    if ! command -v ss >/dev/null 2>&1; then
+        # Without ss we cannot prove idle; refuse forced rotation to avoid killing live traffic.
+        return 1
+    fi
+
+    # Count established connections whose remote (dst) is the backend socks.
+    # ss -H: no header; -t: tcp; -n: numeric; state established.
+    COUNT=$(ss -Htn state established "dst ${NS_IP}:1080" 2>/dev/null | wc -l | tr -d ' ')
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            COUNT=0
+            ;;
+    esac
+
+    [ "$COUNT" -eq 0 ]
+}
+
+# Returns 0 if this healthy instance should be force-rotated now:
+# continuous uptime >= MAX_CONN_DURATION AND currently idle.
+instance_should_force_rotate_for_max_conn() {
+    local INST_ID="$1"
+    local THRESHOLD SINCE NOW_EPOCH ELAPSED
+    THRESHOLD=$(get_max_conn_duration)
+
+    if [ "$THRESHOLD" -le 0 ]; then
+        return 1
+    fi
+
+    SINCE=$(get_instance_online_since_epoch "$INST_ID")
+    case "$SINCE" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    NOW_EPOCH=$(date +%s)
+    ELAPSED=$((NOW_EPOCH - SINCE))
+    if [ "$ELAPSED" -lt 0 ]; then
+        ELAPSED=0
+    fi
+
+    if [ "$ELAPSED" -lt "$THRESHOLD" ]; then
+        return 1
+    fi
+
+    if ! is_instance_idle "$INST_ID"; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动连接，暂不强制重连"
+        return 1
+    fi
+
+    echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，强制下线并重连以刷新连接"
+    return 0
 }
 
 # Returns 0 if offline long enough that conf should be considered stale.
@@ -920,6 +1026,60 @@ print_socks_health_check_success() {
     echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
 }
 
+# True if no ESTABLISHED clients on the external SOCKS listen port (single-instance).
+is_single_socks_idle() {
+    local PORT COUNT
+    PORT=${LISTEN_PORT:-1080}
+
+    if ! command -v ss >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Server-side: established sockets with local sport = listen port.
+    COUNT=$(ss -Htn state established "sport = :${PORT}" 2>/dev/null | wc -l | tr -d ' ')
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            COUNT=0
+            ;;
+    esac
+
+    [ "$COUNT" -eq 0 ]
+}
+
+# Single-instance max uptime rotation when idle.
+single_should_force_rotate_for_max_conn() {
+    local THRESHOLD NOW_EPOCH ELAPSED
+    THRESHOLD=$(get_max_conn_duration)
+
+    if [ "$THRESHOLD" -le 0 ]; then
+        return 1
+    fi
+
+    case "$SOCKS_ONLINE_AT_EPOCH" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    NOW_EPOCH=$(date +%s)
+    ELAPSED=$((NOW_EPOCH - SOCKS_ONLINE_AT_EPOCH))
+    if [ "$ELAPSED" -lt 0 ]; then
+        ELAPSED=0
+    fi
+
+    if [ "$ELAPSED" -lt "$THRESHOLD" ]; then
+        return 1
+    fi
+
+    if ! is_single_socks_idle; then
+        echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动连接，暂不强制重连"
+        return 1
+    fi
+
+    echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，强制断开并重连以刷新连接"
+    return 0
+}
+
 start_socks() {
     if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
         echo "==> [MicroWARP] 🟢 节点状态健康，正在启动 SOCKS 服务..."
@@ -1388,6 +1548,18 @@ periodic_test_url_monitor() {
         if check_test_urls; then
             print_socks_health_check_success
             clear_single_offline_since
+            if single_should_force_rotate_for_max_conn; then
+                stop_socks
+                record_single_offline_since
+                echo "==> [MicroWARP] 强制重连 WireGuard 以刷新连接..."
+                if try_wg_reconnect_recovery; then
+                    start_socks
+                    clear_single_offline_since
+                else
+                    # Reconnect exhausted → full ensure path (may re-register).
+                    ensure_network_ready
+                fi
+            fi
             continue
         fi
 
@@ -1913,6 +2085,7 @@ mark_instance_up() {
     start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
+    record_instance_online_since "$INST_ID"
     echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康并加入负载均衡池"
 }
 
@@ -1921,6 +2094,7 @@ mark_instance_down() {
     stop_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
+    clear_instance_online_since "$INST_ID"
     echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已标记为不健康并从负载均衡池剔除"
 }
 
@@ -2301,6 +2475,11 @@ probe_instance_and_schedule_recovery() {
         if [ "$OLD_STATUS" != "up" ]; then
             reload_haproxy_from_status
             echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
+        fi
+        # Max continuous uptime rotation: only when idle (no active clients).
+        if instance_should_force_rotate_for_max_conn "$INST_ID"; then
+            request_instance_recovery "$INST_ID"
+            return 0
         fi
         return 0
     fi
