@@ -794,6 +794,14 @@ test_max_conn_duration_helpers() {
         exit 1
     fi
 
+    # Single-instance (N<=1) must never force-rotate even when idle + over threshold.
+    WARP_INSTANCE_COUNT=1
+    count_healthy_instances() { printf '1\n'; }
+    if instance_should_force_rotate_for_max_conn 1; then
+        echo 'single-instance must never force-rotate via MAX_CONN_DURATION' >&2
+        exit 1
+    fi
+
     unset -f is_instance_idle count_healthy_instances 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"

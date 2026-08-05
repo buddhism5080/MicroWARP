@@ -30,10 +30,10 @@ INSTANCE_START_STAGGER_SECONDS=1
 # If an instance stays offline this long, treat its WARP conf as stale and force re-register.
 # Default 7200s = 2 hours. Set 0 to disable.
 CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
-# Max continuous healthy uptime (seconds) per instance. When exceeded AND the
-# instance currently has no active client connections (idle), force it offline
-# and reconnect (rotate tunnel / identity path via recovery worker).
-# Default 0 = disabled.
+# Max continuous healthy uptime (seconds) per multi-instance backend.
+# When exceeded AND the instance currently has no busy client connections (idle)
+# AND healthy pool is not below half, force it offline and reconnect.
+# Default 0 = disabled. Single-instance (WARP_INSTANCES<=1) never uses this.
 MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 WARP_INSTANCE_COUNT=1
 
@@ -253,14 +253,24 @@ healthy_instances_below_half() {
     [ "$((HEALTHY * 2))" -lt "$TOTAL" ]
 }
 
-# Returns 0 if this healthy instance should be force-rotated now:
+# Returns 0 if this healthy multi-instance backend should be force-rotated now:
 # continuous uptime >= MAX_CONN_DURATION AND currently idle AND pool not below half healthy.
+# Single-instance (WARP_INSTANCES<=1) always returns 1 — never force-offline.
 instance_should_force_rotate_for_max_conn() {
     local INST_ID="$1"
     local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL
     THRESHOLD=$(get_max_conn_duration)
 
     if [ "$THRESHOLD" -le 0 ]; then
+        return 1
+    fi
+
+    TOTAL=${WARP_INSTANCE_COUNT:-1}
+    case "$TOTAL" in
+        ''|*[!0-9]*) TOTAL=1 ;;
+    esac
+    # Single-instance path must never be force-rotated by MAX_CONN_DURATION.
+    if [ "$TOTAL" -le 1 ]; then
         return 1
     fi
 
@@ -282,10 +292,6 @@ instance_should_force_rotate_for_max_conn() {
     fi
 
     # Capacity guard: never force-offline when healthy pool is already < half.
-    TOTAL=${WARP_INSTANCE_COUNT:-1}
-    case "$TOTAL" in
-        ''|*[!0-9]*) TOTAL=1 ;;
-    esac
     if healthy_instances_below_half; then
         HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
         echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但健康实例 ${HEALTHY}/${TOTAL} 少于一半，暂不强制下线"
@@ -1080,56 +1086,6 @@ print_socks_health_check_success() {
     echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
 }
 
-# True if no busy TCP clients on the external SOCKS listen port (single-instance).
-# Same busy-state set as multi-instance (handshake / transfer / teardown; not TIME-WAIT).
-is_single_socks_idle() {
-    local PORT COUNT
-    PORT=${LISTEN_PORT:-1080}
-
-    if ! command -v ss >/dev/null 2>&1; then
-        return 1
-    fi
-
-    # Server-side: busy sockets with local sport = listen port.
-    COUNT=$(count_busy_tcp_sockets "sport = :${PORT}")
-    [ "$COUNT" -eq 0 ]
-}
-
-# Single-instance max uptime rotation when idle.
-# Half-pool guard does not apply meaningfully for N=1 (single is the whole pool).
-single_should_force_rotate_for_max_conn() {
-    local THRESHOLD NOW_EPOCH ELAPSED
-    THRESHOLD=$(get_max_conn_duration)
-
-    if [ "$THRESHOLD" -le 0 ]; then
-        return 1
-    fi
-
-    case "$SOCKS_ONLINE_AT_EPOCH" in
-        ''|*[!0-9]*)
-            return 1
-            ;;
-    esac
-
-    NOW_EPOCH=$(date +%s)
-    ELAPSED=$((NOW_EPOCH - SOCKS_ONLINE_AT_EPOCH))
-    if [ "$ELAPSED" -lt 0 ]; then
-        ELAPSED=0
-    fi
-
-    if [ "$ELAPSED" -lt "$THRESHOLD" ]; then
-        return 1
-    fi
-
-    if ! is_single_socks_idle; then
-        echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动/握手/半关闭连接，暂不强制重连"
-        return 1
-    fi
-
-    echo "==> [MicroWARP] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，强制断开并重连以刷新连接"
-    return 0
-}
-
 start_socks() {
     if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
         echo "==> [MicroWARP] 🟢 节点状态健康，正在启动 SOCKS 服务..."
@@ -1598,18 +1554,6 @@ periodic_test_url_monitor() {
         if check_test_urls; then
             print_socks_health_check_success
             clear_single_offline_since
-            if single_should_force_rotate_for_max_conn; then
-                stop_socks
-                record_single_offline_since
-                echo "==> [MicroWARP] 强制重连 WireGuard 以刷新连接..."
-                if try_wg_reconnect_recovery; then
-                    start_socks
-                    clear_single_offline_since
-                else
-                    # Reconnect exhausted → full ensure path (may re-register).
-                    ensure_network_ready
-                fi
-            fi
             continue
         fi
 
