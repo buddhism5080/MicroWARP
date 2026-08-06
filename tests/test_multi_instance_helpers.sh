@@ -896,7 +896,7 @@ test_instance_drain_helpers() {
     assert_contains "$out" '排空超时' 'timeout forces stop path'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
 
-    # mark_instance_down / detach: LB kick only — must NOT drain/stop (non-blocking).
+    # mark_instance_down / detach: soft drain only — must NOT wait/stop (non-blocking).
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR=$(mktemp -d)
     ORDER_LOG="$INSTANCE_STATE_DIR/order.log"
@@ -907,23 +907,20 @@ test_instance_drain_helpers() {
     reload_haproxy_from_status() { echo "reload" >> "$ORDER_LOG"; }
     wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
     stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
-    drain_and_stop_instance_socks() { echo "drain_and_stop" >> "$ORDER_LOG"; }
 
     mark_instance_down 7 >/dev/null 2>&1
     out=$(tr '\n' ' ' < "$ORDER_LOG")
     assert_contains "$out" 'status:draining' 'soft-detach marks draining (keeps existing TCP)'
     assert_contains "$out" 'reload' 'reloads LB'
-    if [[ "$out" == *drain* ]] || [[ "$out" == *stop_socks* ]]; then
+    # Note: "draining" contains the letters drain — check tokens, not bare substring.
+    if [[ "$out" == *' drain '* ]] || [[ "$out" == *stop_socks* ]]; then
         echo "mark_instance_down must not drain/stop (would block callers): $out" >&2
         exit 1
     fi
 
-    # drain_and_stop: wait + stop socks + hard remove (down) + reload
+    # drain_and_stop (real): wait + stop socks + hard remove (down) + reload
     : > "$ORDER_LOG"
-    unset -f drain_and_stop_instance_socks 2>/dev/null || true
-    # Use real drain_and_stop with mocked primitives
-    wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
-    stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
+    get_instance_status() { printf 'draining\n'; }
     drain_and_stop_instance_socks 7
     out=$(tr '\n' ' ' < "$ORDER_LOG")
     assert_contains "$out" 'drain' 'background helper drains'
@@ -933,7 +930,7 @@ test_instance_drain_helpers() {
 
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
         reload_haproxy_from_status wait_instance_drain stop_instance_socks \
-        drain_and_stop_instance_socks 2>/dev/null || true
+        get_instance_status 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
     INSTANCE_DRAIN_TIMEOUT=30
