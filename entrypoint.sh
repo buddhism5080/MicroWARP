@@ -2464,7 +2464,11 @@ instance_recovery_worker() {
     # IMPORTANT: use local INST_ID. Nested helpers (reload_haproxy, status loops)
     # also assign INST_ID; without local, a recovery for inst12 becomes inst20.
     local INST_ID="$1"
+    # Optional reason: "max_conn" forces full reconnect/re-register path (same
+    # effort as health-check failure), skipping "WARP still OK → only restart SOCKS".
+    local REASON="${2:-}"
     local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED CONF_PATH
+    local SKIP_HEALTHY_SHORTCUT=0
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     # Parent (request_instance_recovery) records the real job PID via $!.
     # Do NOT write $$ here: in BusyBox ash a backgrounded function often keeps
@@ -2474,7 +2478,15 @@ instance_recovery_worker() {
 
     BACKOFF=5
     MAX_BACKOFF=60
-    echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile)"
+    case "$REASON" in
+        max_conn|force_rotate|force)
+            SKIP_HEALTHY_SHORTCUT=1
+            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}，与巡检失败同等：强制重连/重注册)"
+            ;;
+        *)
+            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile${REASON:+, reason=$REASON})"
+            ;;
+    esac
 
     # Parent already kicked this backend out of HAProxy. Finish offline gracefully:
     # wait until not busy (or drain timeout), then stop internal SOCKS before we
@@ -2499,13 +2511,22 @@ instance_recovery_worker() {
             exit 0
         fi
 
-        if run_instance_health_checks "$INST_ID"; then
+        # Normal recovery (e.g. probe fail): if tunnel is already fine after SOCKS
+        # stop, just bring SOCKS back. MAX_CONN rotation must NOT take this shortcut
+        # — user wants the same treatment as health-check failure (reconnect/re-reg).
+        if [ "$SKIP_HEALTHY_SHORTCUT" -eq 0 ] && run_instance_health_checks "$INST_ID"; then
             mark_instance_up "$INST_ID"
             reload_haproxy_from_status
             echo "==> [MicroWARP] [inst${INST_ID}] 🎉 后台复活成功，已重新加入 LB"
             rm -f "$PID_FILE"
             trap - EXIT INT TERM
             exit 0
+        fi
+        if [ "$SKIP_HEALTHY_SHORTCUT" -eq 1 ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN/强制轮转：跳过「仍健康只拉 SOCKS」，执行 WG 重连/重注册"
+            # Only force the first cycle; after a full reconnect attempt, allow
+            # normal healthy success so we don't loop reconnect forever while up.
+            SKIP_HEALTHY_SHORTCUT=0
         fi
 
         FORCE_NEW=0
@@ -2564,8 +2585,10 @@ instance_recovery_worker() {
 # Synchronous work is intentionally minimal (status + soft-reload only).
 # Drain / stop SOCKS / reconnect / re-register all run inside the background worker
 # so the multi-instance monitor and other instances are never blocked by long offline.
+# $2 optional reason (e.g. max_conn) — passed through to the worker.
 request_instance_recovery() {
     local INST_ID="$1"
+    local REASON="${2:-}"
     local _rec_pid _pid_file
     mkdir -p "$INSTANCE_STATE_DIR"
 
@@ -2587,9 +2610,13 @@ request_instance_recovery() {
     detach_instance_from_lb "$INST_ID"
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
-    echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
+    if [ -n "$REASON" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（reason=${REASON}；排空/停 SOCKS/重连均在后台）..."
+    else
+        echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
+    fi
     # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
-    instance_recovery_worker "$INST_ID" &
+    instance_recovery_worker "$INST_ID" "$REASON" &
     _rec_pid=$!
     echo "$_rec_pid" > "$_pid_file"
     echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
@@ -2814,9 +2841,11 @@ probe_instance_and_schedule_recovery() {
                     ;;
             esac
         fi
-        # Max continuous uptime rotation: only when idle (no active clients).
+        # Max continuous uptime rotation: same recovery path as health-check failure
+        # (kick LB → drain → stop SOCKS → WG reconnect → re-register if needed).
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then
-            request_instance_recovery "$INST_ID"
+            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期且空闲 → 按巡检失败相同路径强制下线重连"
+            request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
         return 0
