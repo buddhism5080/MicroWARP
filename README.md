@@ -111,7 +111,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - HAPROXY_INTERNAL_PORT=1081 # When gate is on, HAProxy binds 127.0.0.1:this; public BIND still serves SOCKS via mw-gate
       - PUNISH_RULES= # Optional L7 punish: host|statuses|text;... e.g. "*.x.ai|429,403|rate limit;grok.com|429|"
       - GATE_BODY_LIMIT=4096 # Max response body bytes peeked for text match
-      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA dir (auto-generated at runtime; optional persist via volume)
+      - GATE_CA_DIR=/etc/wireguard/gate-ca # MITM CA dir (auto-generated; default under WireGuard volume for persistence)
       - GATE_CA_WEB=auto # auto/once: serve ca.crt until first download then stop; 1=always; 0=off
       - GATE_CA_WEB_ADDR=0.0.0.0:9180 # bootstrap HTTP for GET /ca.crt
       - GATE_PASS_DIRECT=1 # Passthrough dials healthy inst directly (skip HAProxy); 0=always via HAProxy
@@ -244,7 +244,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - HAPROXY_INTERNAL_PORT=1081 # gate 开启时 HAProxy 只绑 127.0.0.1:此端口；对外 BIND 仍由 mw-gate 提供 SOCKS
       - PUNISH_RULES= # 可选 L7 惩罚：host|状态码|正文;... 例 "*.x.ai|429,403|rate limit;grok.com|429|"
       - GATE_BODY_LIMIT=4096 # 正文匹配最多窥探的字节数
-      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA 目录（运行时自动生成；如需持久可挂卷）
+      - GATE_CA_DIR=/etc/wireguard/gate-ca # MITM CA 目录（运行时自动生成；默认落在 WireGuard 挂载卷内以持久化）
       - GATE_CA_WEB=auto # auto/once：提供 ca.crt 下载，首次下载后关闭；1=常开；0=关闭
       - GATE_CA_WEB_ADDR=0.0.0.0:9180 # 引导 HTTP，GET /ca.crt
       - GATE_PASS_DIRECT=1 # 透传直拨健康 inst（跳过 HAProxy）；0=始终经 HAProxy

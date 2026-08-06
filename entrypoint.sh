@@ -187,7 +187,8 @@ start_mw_gate() {
     export SOCKS_PASS
     export GATE_LISTEN="${LISTEN_ADDR}:${LISTEN_PORT}"
     export GATE_HAPROXY_ADDR="127.0.0.1:${HAPROXY_INTERNAL_PORT:-1081}"
-    export GATE_CA_DIR="${GATE_CA_DIR:-$INSTANCE_STATE_DIR/gate-ca}"
+    # Persist MITM CA next to WireGuard data (compose usually mounts /etc/wireguard).
+    export GATE_CA_DIR="${GATE_CA_DIR:-/etc/wireguard/gate-ca}"
     export GATE_BODY_LIMIT="${GATE_BODY_LIMIT:-4096}"
     export GATE_HEALTH_POLL_MS="${GATE_HEALTH_POLL_MS:-500}"
     export GATE_PASS_DIRECT="${GATE_PASS_DIRECT:-1}"

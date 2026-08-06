@@ -107,7 +107,7 @@ func loadConfig() Config {
 		Listen:      env("GATE_LISTEN", ""),
 		HAProxyAddr: env("GATE_HAPROXY_ADDR", "127.0.0.1:1081"),
 		StateDir:    env("INSTANCE_STATE_DIR", "/var/run/microwarp"),
-		CADir:       env("GATE_CA_DIR", "/var/run/microwarp/gate-ca"),
+		CADir:       env("GATE_CA_DIR", "/etc/wireguard/gate-ca"),
 		Rules:       parseRules(env("PUNISH_RULES", "")),
 		BodyLimit:   body,
 		HealthPoll:  time.Duration(pollMS) * time.Millisecond,
