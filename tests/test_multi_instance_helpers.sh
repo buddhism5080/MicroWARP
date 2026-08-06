@@ -774,16 +774,18 @@ test_max_conn_duration_helpers() {
         exit 1
     fi
 
-    # Over threshold + not idle → no rotate (busy).
+    # Over threshold + busy → still rotate (drain will wait idle or INSTANCE_DRAIN_TIMEOUT).
     printf '%s\n' "$(( $(date +%s) - 4000 ))" > "$(get_instance_online_since_file 1)"
     is_instance_idle() { return 1; }
-    if instance_should_force_rotate_for_max_conn 1; then
-        echo 'busy instance must not force rotate even when over threshold' >&2
+    count_instance_busy_clients() { printf '3\n'; }
+    if ! instance_should_force_rotate_for_max_conn 1; then
+        echo 'busy instance over threshold must still enter drain/rotate' >&2
         exit 1
     fi
 
     # Over threshold + idle + healthy below half → no rotate (capacity guard).
     is_instance_idle() { return 0; }
+    count_instance_busy_clients() { printf '0\n'; }
     count_healthy_instances() { printf '1\n'; }
     WARP_INSTANCE_COUNT=4
     if instance_should_force_rotate_for_max_conn 1; then

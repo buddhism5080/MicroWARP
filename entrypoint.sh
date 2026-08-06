@@ -613,11 +613,13 @@ healthy_instances_below_half() {
 }
 
 # Returns 0 if this healthy multi-instance backend should be force-rotated now:
-# continuous uptime >= MAX_CONN_DURATION AND currently idle AND pool not below half healthy.
+# continuous uptime >= MAX_CONN_DURATION AND pool not below half healthy.
+# Busy is OK: recovery enters runtime drain first, then waits idle OR INSTANCE_DRAIN_TIMEOUT
+# before stopping SOCKS — so MAX_CONN no longer stalls forever on long-lived TCP.
 # Single-instance (WARP_INSTANCES<=1) always returns 1 — never force-offline.
 instance_should_force_rotate_for_max_conn() {
     local INST_ID="$1"
-    local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL
+    local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL BUSY
     THRESHOLD=$(get_max_conn_duration)
 
     if [ "$THRESHOLD" -le 0 ]; then
@@ -657,12 +659,15 @@ instance_should_force_rotate_for_max_conn() {
         return 1
     fi
 
-    if ! is_instance_idle "$INST_ID"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但仍有活动/握手/半关闭连接，暂不强制重连"
-        return 1
+    BUSY=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
+    case "$BUSY" in
+        ''|*[!0-9]*) BUSY='?' ;;
+    esac
+    if [ "$BUSY" = "0" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(busy=0)，准备 drain 后强制重连"
+    else
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 INSTANCE_DRAIN_TIMEOUT 后再停 SOCKS/重连"
     fi
-
-    echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，准备强制下线并重连以刷新连接"
     return 0
 }
 
@@ -3017,41 +3022,47 @@ probe_instance_and_schedule_recovery() {
     print_instance_health_probe_start "$INST_ID"
     if run_instance_health_checks "$INST_ID"; then
         OLD_STATUS=$(get_instance_status "$INST_ID")
-        mark_instance_up "$INST_ID"
-        if [ "$OLD_STATUS" != "up" ]; then
-            reload_haproxy_from_status
-            echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
-        else
-            # Already-up path: restate pass + duration (mirrors single-instance SOCKS probe log).
-            ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
-            case "$ELAPSED" in
-                ''|*[!0-9]*)
-                    echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线"
-                    ;;
-                *)
-                    UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
-                    echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
-                    ;;
-            esac
-        fi
-        # Max continuous uptime rotation: only when truly idle (per-state ss count).
-        # Soft-detach (disabled) first so any race connection is not hard-killed by
-        # deleting the server line; worker then drains → stop SOCKS → hard remove.
-        if instance_should_force_rotate_for_max_conn "$INST_ID"; then
-            # Re-check idle immediately before detach (close the probe→detach race).
-            if ! is_instance_idle "$INST_ID"; then
-                echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN 二次确认：已出现 busy，取消本轮强制轮转"
+        case "$OLD_STATUS" in
+            draining)
+                # Never cancel an in-progress drain with ready — recovery worker owns this inst.
+                echo "==> [MicroWARP] [inst${INST_ID}] 出口仍通但状态=draining，不覆盖为 ready（等排空/复活）"
+                if ! is_instance_recovering "$INST_ID"; then
+                    echo "==> [MicroWARP] [inst${INST_ID}] draining 但无 worker → 补拉后台复活"
+                    request_instance_recovery "$INST_ID"
+                fi
                 return 0
-            fi
+                ;;
+            up)
+                # Already serving: do NOT mark_instance_up (avoids ready spam / accidental drain cancel).
+                ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
+                case "$ELAPSED" in
+                    ''|*[!0-9]*)
+                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线"
+                        ;;
+                    *)
+                        UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
+                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
+                        ;;
+                esac
+                ;;
+            *)
+                # down / unknown → bring back into pool
+                mark_instance_up "$INST_ID"
+                reload_haproxy_from_status || true
+                echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
+                ;;
+        esac
+        # MAX_CONN: enter drain even if busy; worker waits idle or INSTANCE_DRAIN_TIMEOUT.
+        if instance_should_force_rotate_for_max_conn "$INST_ID"; then
             BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期且空闲(busy=${BUSY_NOW}) → soft-drain 后重连"
+            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期(busy=${BUSY_NOW}) → runtime drain，空闲或超时后重连"
             request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → soft-drain 停新连接，后台排空后复活"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
     request_instance_recovery "$INST_ID"
     return 0
 }
