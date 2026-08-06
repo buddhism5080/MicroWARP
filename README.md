@@ -106,6 +106,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WARP_INSTANCES=1 # Number of in-container WARP tunnels (default 1, max 100). >1 enables single-port HAProxy LB over healthy instances only
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
       - MAX_CONN_DURATION=0 # Multi-instance only: max continuous healthy uptime (seconds) per backend; when exceeded AND idle AND healthy pool ≥ half, force offline + reconnect (default 0=disable; single-instance never rotates)
+      - INSTANCE_DRAIN_TIMEOUT=30 # Multi-instance: after LB kick, max seconds to wait for busy sockets to drain before stopping internal SOCKS (default 30; 0=stop immediately)
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -127,7 +128,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(Set `WARP_INSTANCES=N` (N>1) to run **multiple WARP tunnels inside one container**. Only one SOCKS port is exposed (`BIND_ADDR`/`BIND_PORT`); HAProxy round-robins to healthy in-container backends and immediately removes unhealthy ones from the pool. Per-instance configs live under `/etc/wireguard/instances/<id>/wg0.conf`. Multi-instance needs extra privileges for network namespaces — add `SYS_ADMIN` (in addition to the usual `NET_ADMIN` / `SYS_MODULE`). Default remains `1` and keeps the original single-tunnel path.)*
 
-*(Multi-instance runtime notes: HAProxy opens as soon as bootstrap begins (even with zero backends). Each instance is health-checked and joined to the pool **as soon as it comes up** — the container does **not** wait for all N tunnels before serving. Instances still start **serially with a 1s stagger**. Health probes are staggered by `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES`. A failed instance is removed from HAProxy immediately and revived by its own **background worker** (reconnect → re-register with backoff). If register/config fetch fails 3 times for an instance, it is **enqueued to a serial background config-retry queue** instead of exiting the container; one worker retries those registrations FIFO with backoff. Registration API calls remain serialized across workers/queue.)*
+*(Multi-instance runtime notes: HAProxy opens as soon as bootstrap begins (even with zero backends). Each instance is health-checked and joined to the pool **as soon as it comes up** — the container does **not** wait for all N tunnels before serving. Instances still start **serially with a 1s stagger**. Health probes are staggered by `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES`. A failed instance is **removed from HAProxy first** (soft-reload); internal SOCKS stays up until busy client sockets drain (or `INSTANCE_DRAIN_TIMEOUT`, default **30s**), then the per-instance **background worker** stops SOCKS and revives (reconnect → re-register with backoff). If register/config fetch fails 3 times for an instance, it is **enqueued to a serial background config-retry queue** instead of exiting the container; one worker retries those registrations FIFO with backoff. Registration API calls remain serialized across workers/queue.)*
 
 *(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
@@ -227,6 +228,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WARP_INSTANCES=1 # 单容器内并行 WARP 隧道数量（默认 1，最大 100）。>1 时只暴露一个 SOCKS 端口，经 HAProxy 只负载到健康实例
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
       - MAX_CONN_DURATION=0 # 仅多实例：每个后端最长连续健康在线秒数；超时且空闲且健康实例不少于一半时强制下线重连（默认 0=关闭；单实例永不因本策略下线）
+      - INSTANCE_DRAIN_TIMEOUT=30 # 多实例：踢出 LB 后，最多等待多少秒排空 busy 连接再停内部 SOCKS（默认 30；0=立刻停）
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -248,7 +250,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 设置 `WARP_INSTANCES=N`（N>1）可在**同一个容器内**并行多条 WARP 隧道：对外仍只暴露一个 SOCKS 端口（`BIND_ADDR`/`BIND_PORT`），由 HAProxy 轮询健康后端，不健康实例会立刻从池中剔除。各实例配置保存在 `/etc/wireguard/instances/<id>/wg0.conf`。多实例依赖 network namespace，除常规 `NET_ADMIN` / `SYS_MODULE` 外建议再加 `SYS_ADMIN`。默认仍是 `1`，完全走原来的单隧道路径。
 >
-> 多实例运行细节：启动时 **HAProxy 会立刻监听**（即使暂时 0 后端）；**每个实例一旦启动完成就立刻测活并加入池**，不必等全部 N 条隧道都起来才开放服务。实例仍**串行启动并间隔 1 秒错峰**；健康巡检按 `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES` 错峰。失败实例会立刻踢出 HAProxy，并由各自的**后台 worker**独立复活（重连 → 重注册，带退避）。若某个实例**获取配置连续失败 3 次**，不会再拖垮整容器退出，而是进入**后台串行配置重试队列**（FIFO + 退避）继续注册。各 worker/队列对注册 API 的请求会串行化，降低打爆注册接口的风险。
+> 多实例运行细节：启动时 **HAProxy 会立刻监听**（即使暂时 0 后端）；**每个实例一旦启动完成就立刻测活并加入池**，不必等全部 N 条隧道都起来才开放服务。实例仍**串行启动并间隔 1 秒错峰**；健康巡检按 `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES` 错峰。失败实例会**先踢出 HAProxy**（soft-reload），内部 SOCKS 先保留；等 busy 客户端连接排空（或超过 `INSTANCE_DRAIN_TIMEOUT`，默认 **30 秒**）后再停 SOCKS，并由各自的**后台 worker**独立复活（重连 → 重注册，带退避）。若某个实例**获取配置连续失败 3 次**，不会再拖垮整容器退出，而是进入**后台串行配置重试队列**（FIFO + 退避）继续注册。各 worker/队列对注册 API 的请求会串行化，降低打爆注册接口的风险。
 >
 > 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 >

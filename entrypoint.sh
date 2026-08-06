@@ -35,6 +35,10 @@ CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
 # AND healthy pool is not below half, force it offline and reconnect.
 # Default 0 = disabled. Single-instance (WARP_INSTANCES<=1) never uses this.
 MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
+# After kicking a multi-instance backend out of HAProxy, wait up to this many
+# seconds for busy client sockets to drain before stopping internal SOCKS.
+# Default 30. Set 0 to stop SOCKS immediately after LB reload (no drain wait).
+INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT:-30}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -270,16 +274,86 @@ count_busy_tcp_sockets() {
 # HAProxy talks to 10.66.<id>.2:1080 from the host netns; ss (iproute2) is available.
 is_instance_idle() {
     local INST_ID="$1"
-    local NS_IP COUNT
-    NS_IP=$(get_instance_ns_ip "$INST_ID")
+    local COUNT
 
     if ! command -v ss >/dev/null 2>&1; then
         # Without ss we cannot prove idle; refuse forced rotation to avoid killing live traffic.
         return 1
     fi
 
-    COUNT=$(count_busy_tcp_sockets "dst ${NS_IP}:1080")
+    COUNT=$(count_instance_busy_clients "$INST_ID")
     [ "$COUNT" -eq 0 ]
+}
+
+get_instance_drain_timeout() {
+    RAW=${INSTANCE_DRAIN_TIMEOUT:-30}
+    case "$RAW" in
+        ''|*[!0-9]*)
+            printf '30\n'
+            return 0
+            ;;
+    esac
+    printf '%s\n' "$RAW"
+}
+
+# Busy HAProxy→backend sockets for one instance (host netns view).
+count_instance_busy_clients() {
+    local INST_ID="$1"
+    local NS_IP
+
+    NS_IP=$(get_instance_ns_ip "$INST_ID")
+    count_busy_tcp_sockets "dst ${NS_IP}:1080"
+}
+
+# Wait until instance has no busy client sockets, or INSTANCE_DRAIN_TIMEOUT elapses.
+# Returns 0 if drained idle, 1 if timed out / cannot observe (caller still stops SOCKS).
+wait_instance_drain() {
+    local INST_ID="$1"
+    local TIMEOUT COUNT SLEPT
+
+    TIMEOUT=$(get_instance_drain_timeout)
+    if [ "$TIMEOUT" -le 0 ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] INSTANCE_DRAIN_TIMEOUT=0，跳过连接排空，立即停服务"
+        return 1
+    fi
+
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无 ss，无法观察 busy 连接，跳过排空直接停服务"
+        return 1
+    fi
+
+    COUNT=$(count_instance_busy_clients "$INST_ID")
+    if [ "$COUNT" -eq 0 ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已无 busy 连接，可以停服务"
+        return 0
+    fi
+
+    echo "==> [MicroWARP] [inst${INST_ID}] 已踢出 LB，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+    SLEPT=0
+    while true; do
+        sleep 1
+        SLEPT=$((SLEPT + 1))
+        COUNT=$(count_instance_busy_clients "$INST_ID")
+        if [ "$COUNT" -eq 0 ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 连接已排空（等待 ${SLEPT}s），准备停服务"
+            return 0
+        fi
+        if [ "$SLEPT" -ge "$TIMEOUT" ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 排空超时 ${TIMEOUT}s，仍有 busy=${COUNT}，强制停服务"
+            return 1
+        fi
+        # Keep log noise low: every 5s.
+        if [ $((SLEPT % 5)) -eq 0 ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s/${TIMEOUT}s"
+        fi
+    done
+}
+
+# After LB kick: wait for idle (or timeout), then stop internal SOCKS.
+drain_and_stop_instance_socks() {
+    local INST_ID="$1"
+    wait_instance_drain "$INST_ID" || true
+    stop_instance_socks "$INST_ID"
 }
 
 # True (0) when healthy instances are strictly less than half of WARP_INSTANCE_COUNT.
@@ -606,8 +680,6 @@ bring_up_instance_after_config() {
     fi
 
     echo "==> [MicroWARP] [inst${INST_ID}] 配置已生成但连通性未过，交给常规后台复活 worker"
-    mark_instance_down "$INST_ID"
-    reload_haproxy_from_status
     request_instance_recovery "$INST_ID"
     return 1
 }
@@ -2138,11 +2210,17 @@ mark_instance_up() {
 
 mark_instance_down() {
     local INST_ID="$1"
-    stop_instance_socks "$INST_ID"
+
+    # 1) Kick out of LB first while internal SOCKS still accepts existing sessions.
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已标记为不健康并从负载均衡池剔除"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已标记不健康并从负载均衡池剔除（服务暂保留至连接排空）"
+    reload_haproxy_from_status
+
+    # 2) Wait until not busy (or INSTANCE_DRAIN_TIMEOUT), then stop SOCKS.
+    drain_and_stop_instance_socks "$INST_ID"
+    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止"
 }
 
 _reload_haproxy_from_status_unlocked() {
@@ -2211,6 +2289,12 @@ instance_recovery_worker() {
     MAX_BACKOFF=60
     echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile)"
 
+    # Parent already kicked this backend out of HAProxy. Finish offline gracefully:
+    # wait until not busy (or drain timeout), then stop internal SOCKS before we
+    # touch the tunnel / re-register.
+    drain_and_stop_instance_socks "$INST_ID"
+    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止，开始复活流程"
+
     while true; do
         CONF_PATH=$(get_instance_conf_path "$INST_ID")
         if [ ! -f "$CONF_PATH" ]; then
@@ -2277,7 +2361,6 @@ instance_recovery_worker() {
         fi
 
         mark_instance_down "$INST_ID"
-        reload_haproxy_from_status
         echo "==> [MicroWARP] [inst${INST_ID}] 后台复活本轮失败，${BACKOFF}s 后继续（永不放弃）"
         sleep "$BACKOFF"
         BACKOFF=$((BACKOFF * 2))
@@ -2287,13 +2370,20 @@ instance_recovery_worker() {
     done
 }
 
-# Kick off background revival if not already running. Non-blocking.
+# Kick off background revival if not already running.
+# LB kick is synchronous (fast); connection drain + SOCKS stop run inside the worker
+# so the multi-instance monitor is not blocked for INSTANCE_DRAIN_TIMEOUT.
 request_instance_recovery() {
     local INST_ID="$1"
     local _rec_pid _pid_file
     mkdir -p "$INSTANCE_STATE_DIR"
 
     if [ ! -f "$(get_instance_conf_path "$INST_ID")" ] || is_instance_queued_for_config_retry "$INST_ID"; then
+        # Still detach from LB if we had been up with a missing conf edge case.
+        set_instance_status "$INST_ID" "down"
+        record_instance_offline_since "$INST_ID"
+        clear_instance_online_since "$INST_ID"
+        reload_haproxy_from_status || true
         enqueue_instance_config_retry "$INST_ID"
         return 0
     fi
@@ -2303,9 +2393,11 @@ request_instance_recovery() {
         return 0
     fi
 
-    # Ensure status is down and socks is off before spawning recovery.
-    # NOTE: mark/reload helpers must not clobber our INST_ID (they use local or other names).
-    mark_instance_down "$INST_ID"
+    # 1) Kick LB immediately while SOCKS still serves existing sessions.
+    set_instance_status "$INST_ID" "down"
+    record_instance_offline_since "$INST_ID"
+    clear_instance_online_since "$INST_ID"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池剔除，后台将排空连接后停服务并复活"
     reload_haproxy_from_status
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
@@ -2332,8 +2424,6 @@ ensure_instance_ready() {
     fi
 
     echo "==> [MicroWARP] [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
-    mark_instance_down "$_eid"
-    reload_haproxy_from_status
     request_instance_recovery "$_eid"
     return 1
 }

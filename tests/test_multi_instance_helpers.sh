@@ -841,6 +841,100 @@ test_instance_online_duration_probe_log() {
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
 }
 
+test_instance_drain_helpers() {
+    local out calls
+
+    INSTANCE_DRAIN_TIMEOUT=''
+    assert_eq "$(get_instance_drain_timeout)" '30' 'blank drain timeout defaults to 30'
+
+    INSTANCE_DRAIN_TIMEOUT=0
+    assert_eq "$(get_instance_drain_timeout)" '0' '0 disables drain wait'
+
+    INSTANCE_DRAIN_TIMEOUT=45
+    assert_eq "$(get_instance_drain_timeout)" '45' 'explicit drain timeout honored'
+
+    INSTANCE_DRAIN_TIMEOUT=abc
+    assert_eq "$(get_instance_drain_timeout)" '30' 'invalid drain timeout falls back to 30'
+
+    # timeout=0 → skip wait
+    INSTANCE_DRAIN_TIMEOUT=0
+    out=$(wait_instance_drain 1 2>&1) || true
+    assert_contains "$out" 'INSTANCE_DRAIN_TIMEOUT=0' 'timeout 0 logs skip'
+
+    # already idle → immediate success
+    INSTANCE_DRAIN_TIMEOUT=5
+    count_instance_busy_clients() { printf '0\n'; }
+    out=$(wait_instance_drain 3 2>&1)
+    assert_contains "$out" '已无 busy 连接' 'idle skips wait loop'
+    unset -f count_instance_busy_clients 2>/dev/null || true
+
+    # busy then idle after one sleep
+    local BUSY_STATE
+    BUSY_STATE=$(mktemp)
+    echo 1 > "$BUSY_STATE"
+    count_instance_busy_clients() {
+        if [ "$(cat "$BUSY_STATE")" = 1 ]; then
+            echo 0 > "$BUSY_STATE"
+            printf '2\n'
+        else
+            printf '0\n'
+        fi
+    }
+    sleep() { :; }
+    out=$(wait_instance_drain 4 2>&1)
+    assert_contains "$out" '连接已排空' 'drains after busy clears'
+    unset -f count_instance_busy_clients sleep 2>/dev/null || true
+    rm -f "$BUSY_STATE"
+
+    # busy until timeout → force path (sleep mocked; SLEPT-based timeout must still fire)
+    INSTANCE_DRAIN_TIMEOUT=2
+    count_instance_busy_clients() { printf '3\n'; }
+    sleep() { :; }
+    out=$(wait_instance_drain 5 2>&1) || true
+    assert_contains "$out" '排空超时' 'timeout forces stop path'
+    unset -f count_instance_busy_clients sleep 2>/dev/null || true
+
+    # mark_instance_down order: status/reload before stop socks
+    local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    ORDER_LOG="$INSTANCE_STATE_DIR/order.log"
+    : > "$ORDER_LOG"
+    set_instance_status() { echo "status:$2" >> "$ORDER_LOG"; }
+    record_instance_offline_since() { echo "offline" >> "$ORDER_LOG"; }
+    clear_instance_online_since() { echo "clear_online" >> "$ORDER_LOG"; }
+    reload_haproxy_from_status() { echo "reload" >> "$ORDER_LOG"; }
+    wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
+    stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
+
+    mark_instance_down 7 >/dev/null 2>&1
+    out=$(tr '\n' ' ' < "$ORDER_LOG")
+    assert_contains "$out" 'status:down' 'marks down'
+    assert_contains "$out" 'reload' 'reloads LB'
+    assert_contains "$out" 'drain' 'waits drain'
+    assert_contains "$out" 'stop_socks' 'stops socks'
+    # reload must appear before stop_socks
+    case "$out" in
+        *reload*stop_socks*) ;;
+        *)
+            echo "expected reload before stop_socks, got: $out" >&2
+            exit 1
+            ;;
+    esac
+    case "$out" in
+        *drain*stop_socks*) ;;
+        *)
+            echo "expected drain before stop_socks, got: $out" >&2
+            exit 1
+            ;;
+    esac
+
+    unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
+        reload_haproxy_from_status wait_instance_drain stop_instance_socks 2>/dev/null || true
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
+    INSTANCE_DRAIN_TIMEOUT=30
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -869,5 +963,6 @@ test_health_check_stagger_is_interval_div_count
 test_config_stale_offline_threshold
 test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
+test_instance_drain_helpers
 
 printf 'PASS test_multi_instance_helpers\n'
