@@ -1,7 +1,17 @@
 # ==========================================
+# 阶段 0：编译外层 SOCKS gate（可选 L7 惩罚）
+# ==========================================
+ARG GO_IMAGE=golang:1.22-alpine
+ARG ALPINE_IMAGE=alpine:latest
+FROM ${GO_IMAGE} AS gatebuilder
+WORKDIR /src
+COPY gate/ ./
+RUN CGO_ENABLED=0 go test ./... \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /mw-gate .
+
+# ==========================================
 # 阶段 1：极速编译 MicroSOCKS 引擎
 # ==========================================
-ARG ALPINE_IMAGE=alpine:latest
 FROM ${ALPINE_IMAGE} AS builder
 # 安装 C 语言编译环境
 RUN apk add --no-cache build-base git
@@ -22,8 +32,9 @@ RUN apk add --no-cache wireguard-tools iptables iproute2 curl tzdata haproxy && 
     ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime && \
     echo "${TZ}" > /etc/timezone
 
-# 打包microsocks
+# 打包 microsocks + mw-gate
 COPY --from=builder /src/microsocks /usr/local/bin/microsocks
+COPY --from=gatebuilder /mw-gate /usr/local/bin/mw-gate
 
 WORKDIR /app
 COPY entrypoint.sh .

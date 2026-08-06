@@ -925,6 +925,30 @@ test_instance_drain_helpers() {
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
         reload_haproxy_from_status wait_instance_drain stop_instance_socks \
         drain_and_stop_instance_socks 2>/dev/null || true
+    # Restore real helpers mocked above (later tests need them).
+    source <(python3 - <<'PY'
+from pathlib import Path
+import re
+text = Path('entrypoint.sh').read_text()
+marker = "# ==========================================\n# 1. 初始化\n# ==========================================\n"
+pre = text.split(marker)[0]
+# Keep only function definitions we may have clobbered + dependencies already loaded.
+names = [
+    'set_instance_status',
+    'record_instance_offline_since',
+    'clear_instance_online_since',
+    'reload_haproxy_from_status',
+    'wait_instance_drain',
+    'stop_instance_socks',
+    'drain_and_stop_instance_socks',
+    'mark_instance_down',
+    'detach_instance_from_lb',
+    'refresh_healthy_snapshot',
+]
+# Naive: re-print whole preamble; redefining functions is fine.
+print(pre, end='')
+PY
+)
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
     INSTANCE_DRAIN_TIMEOUT=30
@@ -959,5 +983,41 @@ test_config_stale_offline_threshold
 test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
+
+test_healthy_snapshot_and_gate_bind() {
+    local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
+    local SAVED_COUNT="${WARP_INSTANCE_COUNT:-1}"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    WARP_INSTANCE_COUNT=3
+    GATE_ENABLED=0
+    LISTEN_ADDR=0.0.0.0
+    LISTEN_PORT=1080
+    HAPROXY_INTERNAL_PORT=1081
+
+    set_instance_status 1 up
+    set_instance_status 2 down
+    set_instance_status 3 up
+    refresh_healthy_snapshot
+    list=$(tr -d '\n' < "$INSTANCE_STATE_DIR/healthy.list")
+    assert_eq "$list" '1 3' 'healthy.list only up ids'
+    gen1=$(tr -d '\n' < "$INSTANCE_STATE_DIR/pool.gen")
+    refresh_healthy_snapshot
+    gen2=$(tr -d '\n' < "$INSTANCE_STATE_DIR/pool.gen")
+    if [ "$gen2" -le "$gen1" ]; then
+        echo "pool.gen should bump: $gen1 -> $gen2" >&2
+        exit 1
+    fi
+
+    # Without mw-gate binary, gate stays off
+    assert_eq "$(get_haproxy_bind_addr)" '0.0.0.0' 'gate off uses public bind'
+    assert_eq "$(get_haproxy_bind_port)" '1080' 'gate off uses LISTEN_PORT'
+
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
+    WARP_INSTANCE_COUNT="$SAVED_COUNT"
+    GATE_ENABLED=auto
+}
+
+test_healthy_snapshot_and_gate_bind
 
 printf 'PASS test_multi_instance_helpers\n'

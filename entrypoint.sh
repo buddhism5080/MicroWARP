@@ -39,6 +39,14 @@ MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # seconds for busy client sockets to drain before stopping internal SOCKS.
 # Default 30. Set 0 to stop SOCKS immediately after LB reload (no drain wait).
 INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT:-30}"
+# Outer thin SOCKS gate (multi-instance): terminates SOCKS, optional MITM punish path.
+# auto = enable when /usr/local/bin/mw-gate exists. 0/false=off. 1/true=on.
+GATE_ENABLED="${GATE_ENABLED:-auto}"
+# When gate is on, HAProxy binds loopback only; gate listens on BIND_ADDR:BIND_PORT.
+HAPROXY_INTERNAL_PORT="${HAPROXY_INTERNAL_PORT:-1081}"
+# Punish rules for gate MITM path (see README). Empty = passthrough-only gate.
+PUNISH_RULES="${PUNISH_RULES:-}"
+GATE_PID=""
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -46,6 +54,160 @@ is_enabled() {
         1|true|yes|on) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Multi-instance outer gate (thin SOCKS + optional L7 punish).
+is_gate_enabled() {
+    # Single-instance keeps classic microsocks path — no gate.
+    case "${WARP_INSTANCE_COUNT:-1}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${WARP_INSTANCE_COUNT:-1}" -gt 1 ] || return 1
+
+    case "$(printf '%s' "${GATE_ENABLED:-auto}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off) return 1 ;;
+        1|true|yes|on)
+            if [ ! -x /usr/local/bin/mw-gate ] && [ ! -x ./mw-gate ]; then
+                return 1
+            fi
+            ;;
+        auto|'')
+            if [ ! -x /usr/local/bin/mw-gate ] && [ ! -x ./mw-gate ]; then
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+get_haproxy_bind_addr() {
+    if is_gate_enabled; then
+        printf '127.0.0.1\n'
+    else
+        printf '%s\n' "$LISTEN_ADDR"
+    fi
+}
+
+get_haproxy_bind_port() {
+    if is_gate_enabled; then
+        printf '%s\n' "${HAPROXY_INTERNAL_PORT:-1081}"
+    else
+        printf '%s\n' "$LISTEN_PORT"
+    fi
+}
+
+# In-memory-friendly snapshot for mw-gate (healthy.list + pool.gen). Hot path never scans.
+refresh_healthy_snapshot() {
+    local LIST="" _iid GEN_FILE LIST_FILE GEN
+    mkdir -p "$INSTANCE_STATE_DIR"
+    LIST_FILE="$INSTANCE_STATE_DIR/healthy.list"
+    GEN_FILE="$INSTANCE_STATE_DIR/pool.gen"
+
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        if [ "$(get_instance_status "$_iid")" = "up" ]; then
+            if [ -n "$LIST" ]; then
+                LIST="$LIST $_iid"
+            else
+                LIST="$_iid"
+            fi
+        fi
+    done
+    printf '%s\n' "$LIST" > "$LIST_FILE"
+
+    GEN=0
+    if [ -f "$GEN_FILE" ]; then
+        GEN=$(tr -d '\n' < "$GEN_FILE" 2>/dev/null || printf '0')
+    fi
+    case "$GEN" in
+        ''|*[!0-9]*) GEN=0 ;;
+    esac
+    GEN=$((GEN + 1))
+    printf '%s\n' "$GEN" > "$GEN_FILE"
+}
+
+# Consume punish requests written by mw-gate → existing recovery (kick LB, drain, reconnect).
+process_punish_requests() {
+    local QDIR F INST_ID REASON
+    QDIR="$INSTANCE_STATE_DIR/punish_requests"
+    [ -d "$QDIR" ] || return 0
+
+    for F in "$QDIR"/*; do
+        [ -e "$F" ] || continue
+        [ -f "$F" ] || continue
+        INST_ID=$(basename "$F")
+        case "$INST_ID" in
+            ''|*[!0-9]*)
+                rm -f "$F"
+                continue
+                ;;
+        esac
+        REASON=$(tr -d '\r' < "$F" 2>/dev/null | head -n1 || true)
+        rm -f "$F"
+        echo "==> [MicroWARP] [inst${INST_ID}] L7 惩罚命中，走下线重连流程${REASON:+: $REASON}"
+        request_instance_recovery "$INST_ID" || true
+    done
+}
+
+punish_request_watcher() {
+    echo "==> [MicroWARP] 已启动 L7 惩罚请求监视（1s）"
+    while true; do
+        process_punish_requests
+        sleep 1
+    done
+}
+
+resolve_mw_gate_bin() {
+    if [ -x /usr/local/bin/mw-gate ]; then
+        printf '%s\n' /usr/local/bin/mw-gate
+        return 0
+    fi
+    if [ -x ./mw-gate ]; then
+        printf '%s\n' ./mw-gate
+        return 0
+    fi
+    return 1
+}
+
+start_mw_gate() {
+    local BIN
+    is_gate_enabled || return 0
+    if ! BIN=$(resolve_mw_gate_bin); then
+        echo "==> [MicroWARP] [WARN] GATE 已启用但找不到 mw-gate 二进制"
+        return 1
+    fi
+    if [ -n "$GATE_PID" ] && kill -0 "$GATE_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    export INSTANCE_STATE_DIR
+    export INSTANCE_SUBNET_PREFIX
+    export PUNISH_RULES
+    export SOCKS_USER
+    export SOCKS_PASS
+    export GATE_LISTEN="${LISTEN_ADDR}:${LISTEN_PORT}"
+    export GATE_HAPROXY_ADDR="127.0.0.1:${HAPROXY_INTERNAL_PORT:-1081}"
+    export GATE_CA_DIR="${GATE_CA_DIR:-$INSTANCE_STATE_DIR/gate-ca}"
+    export GATE_BODY_LIMIT="${GATE_BODY_LIMIT:-4096}"
+    export GATE_HEALTH_POLL_MS="${GATE_HEALTH_POLL_MS:-500}"
+
+    echo "==> [MicroWARP] 启动外层 SOCKS gate: ${GATE_LISTEN} → HAProxy ${GATE_HAPROXY_ADDR}"
+    if [ -n "${PUNISH_RULES}" ]; then
+        echo "==> [MicroWARP] PUNISH_RULES 已配置（MITM 惩罚路径启用；客户端需信任 ${GATE_CA_DIR}/ca.crt）"
+    else
+        echo "==> [MicroWARP] PUNISH_RULES 为空：gate 仅做 SOCKS 终结 + 转发 HAProxy"
+    fi
+    "$BIN" &
+    GATE_PID=$!
+    echo "==> [MicroWARP] mw-gate PID ${GATE_PID}"
+}
+
+stop_mw_gate() {
+    if [ -n "$GATE_PID" ] && kill -0 "$GATE_PID" 2>/dev/null; then
+        kill "$GATE_PID" 2>/dev/null || true
+        wait "$GATE_PID" 2>/dev/null || true
+    fi
+    GATE_PID=""
 }
 
 get_warp_instance_count() {
@@ -2051,7 +2213,11 @@ start_instance_socks() {
     fi
 
     echo "==> [MicroWARP] [inst${INST_ID}] 启动内部 MicroSOCKS (${NS_IP}:1080)"
-    if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
+    # When outer mw-gate is enabled, client auth is enforced at the gate only.
+    # Internal backends stay on the 10.66/32 path and use NO AUTH.
+    if is_gate_enabled; then
+        ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 > /dev/null 2>&1 &
+    elif [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
         ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
     else
         ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 > /dev/null 2>&1 &
@@ -2205,6 +2371,7 @@ mark_instance_up() {
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
+    refresh_healthy_snapshot
     echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康并加入负载均衡池"
 }
 
@@ -2216,6 +2383,7 @@ detach_instance_from_lb() {
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
+    refresh_healthy_snapshot
     echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池剔除（SOCKS 暂保留，排空由后台进行）"
     reload_haproxy_from_status
 }
@@ -2233,8 +2401,11 @@ _reload_haproxy_from_status_unlocked() {
     STATUS_LIST=$(collect_instance_status_list)
     HEALTHY=$(count_healthy_instances)
 
-    render_haproxy_config "$LISTEN_ADDR" "$LISTEN_PORT" "$STATUS_LIST" > "$HAPROXY_CFG"
-    echo "==> [MicroWARP] 刷新 HAProxy 后端（健康实例: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
+    HAP_BIND_ADDR=$(get_haproxy_bind_addr)
+    HAP_BIND_PORT=$(get_haproxy_bind_port)
+    render_haproxy_config "$HAP_BIND_ADDR" "$HAP_BIND_PORT" "$STATUS_LIST" > "$HAPROXY_CFG"
+    refresh_healthy_snapshot
+    echo "==> [MicroWARP] 刷新 HAProxy 后端（bind ${HAP_BIND_ADDR}:${HAP_BIND_PORT}，健康实例: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
 
     # CRITICAL: re-sync from pidfile every time. Do NOT trust the shell copy of
     # HAPROXY_PID alone — recovery workers fork with a stale value; a dead-but
@@ -2257,7 +2428,7 @@ _reload_haproxy_from_status_unlocked() {
     fi
 
     if haproxy_cold_start "$HAPROXY_CFG"; then
-        echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+        echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: $(get_haproxy_bind_addr):$(get_haproxy_bind_port), master PID: ${HAPROXY_PID})"
         return 0
     fi
 
@@ -2455,6 +2626,9 @@ bootstrap_multi_instances() {
         record_instance_offline_since "$_bid"
     done
     reload_haproxy_from_status
+    start_mw_gate || true
+    # Fast path for L7 punish files from mw-gate (does not block probes).
+    punish_request_watcher &
 
     for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
         CONF_PATH=$(get_instance_conf_path "$_bid")
@@ -2679,6 +2853,7 @@ multi_periodic_monitor() {
 multi_cleanup_on_exit() {
     echo "==> [MicroWARP] 收到退出信号，正在清理多实例资源..."
 
+    stop_mw_gate
     stop_all_instance_recoveries
 
     refresh_haproxy_pid || true
