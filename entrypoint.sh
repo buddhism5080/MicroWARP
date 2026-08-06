@@ -193,6 +193,9 @@ start_mw_gate() {
     export GATE_PASS_DIRECT="${GATE_PASS_DIRECT:-1}"
     export GATE_SOCK_BUF="${GATE_SOCK_BUF:-524288}"
     export GATE_LOG_PASS_VIA="${GATE_LOG_PASS_VIA:-0}"
+    # CA cert bootstrap HTTP: auto/once = one download then stop; 1=always; 0=off
+    export GATE_CA_WEB="${GATE_CA_WEB:-auto}"
+    export GATE_CA_WEB_ADDR="${GATE_CA_WEB_ADDR:-0.0.0.0:9180}"
 
     echo "==> [MicroWARP] 启动外层 SOCKS gate: ${GATE_LISTEN} → HAProxy ${GATE_HAPROXY_ADDR}"
     if is_enabled "${GATE_PASS_DIRECT:-1}"; then
@@ -201,7 +204,8 @@ start_mw_gate() {
         echo "==> [MicroWARP] 透传经 HAProxy RR（GATE_PASS_DIRECT=0）"
     fi
     if [ -n "${PUNISH_RULES}" ]; then
-        echo "==> [MicroWARP] PUNISH_RULES 已配置（MITM 惩罚路径启用；客户端需信任 ${GATE_CA_DIR}/ca.crt）"
+        echo "==> [MicroWARP] PUNISH_RULES 已配置（MITM 启用；CA 启动时自动生成，crt 经 GATE_CA_WEB_ADDR 一次性下载）"
+        echo "==> [MicroWARP] 下载 CA: http://<host>:${GATE_CA_WEB_ADDR##*:}/ca.crt  （GATE_CA_WEB=${GATE_CA_WEB}）"
     else
         echo "==> [MicroWARP] PUNISH_RULES 为空：gate 仅做 SOCKS 终结 + 高性能透传"
     fi

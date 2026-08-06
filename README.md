@@ -111,7 +111,9 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - HAPROXY_INTERNAL_PORT=1081 # When gate is on, HAProxy binds 127.0.0.1:this; public BIND still serves SOCKS via mw-gate
       - PUNISH_RULES= # Optional L7 punish: host|statuses|text;... e.g. "*.x.ai|429,403|rate limit;grok.com|429|"
       - GATE_BODY_LIMIT=4096 # Max response body bytes peeked for text match
-      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA (clients must trust ca.crt for punish hosts)
+      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA dir (auto-generated at runtime; optional persist via volume)
+      - GATE_CA_WEB=auto # auto/once: serve ca.crt until first download then stop; 1=always; 0=off
+      - GATE_CA_WEB_ADDR=0.0.0.0:9180 # bootstrap HTTP for GET /ca.crt
       - GATE_PASS_DIRECT=1 # Passthrough dials healthy inst directly (skip HAProxy); 0=always via HAProxy
       - GATE_SOCK_BUF=524288 # SO_RCVBUF/SO_SNDBUF hint for gate TCP sockets (bytes)
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
@@ -137,7 +139,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(Multi-instance runtime notes: HAProxy opens as soon as bootstrap begins (even with zero backends). Each instance is health-checked and joined to the pool **as soon as it comes up** — the container does **not** wait for all N tunnels before serving. Instances still start **serially with a 1s stagger**. Health probes are staggered by `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES`. A failed instance is **removed from HAProxy first** via a **fast** soft-reload on the monitor path (no drain wait). Connection drain (up to `INSTANCE_DRAIN_TIMEOUT`, default **30s**), SOCKS stop, reconnect and re-register all run inside that instance's **background worker**, so other instances' probes and the main loop are not blocked. If register/config fetch fails 3 times for an instance, it is **enqueued to a serial background config-retry queue** instead of exiting the container; one worker retries those registrations FIFO with backoff. Registration API calls remain serialized across workers/queue.)*
 
-*(Optional multi-instance **outer SOCKS gate** (`mw-gate`, `GATE_ENABLED=auto`): public `BIND_ADDR:BIND_PORT` is a thin SOCKS5 terminator. **Passthrough** (default) dials a healthy inst **directly** from an in-memory pool (`GATE_PASS_DIRECT=1`, skip HAProxy hop; falls back to loopback HAProxy on failure). Healthy memory is refreshed by **inotify** on `healthy.list`/`pool.gen` (poll is only a safety net). On Linux the bulk pump uses kernel **`splice`** (zero-copy pages via pipe) with pooled `CopyBuffer` fallback; sockets get `TCP_NODELAY` and larger buffers (`GATE_SOCK_BUF`, default 512KiB). When `PUNISH_RULES` is set, matching `host:443` traffic is MITM'd (HTTP/1.1) via a **picked healthy inst**. Match order: **host → status code → optional response text**; on hit, gate writes `punish_requests/<id>` and entrypoint runs the normal **kick LB → drain → reconnect** recovery. Clients that use punish hosts must trust `$GATE_CA_DIR/ca.crt`.)*
+*(Optional multi-instance **outer SOCKS gate** (`mw-gate`, `GATE_ENABLED=auto`): public `BIND_ADDR:BIND_PORT` is a thin SOCKS5 terminator. **Passthrough** (default) dials a healthy inst **directly** from an in-memory pool (`GATE_PASS_DIRECT=1`, skip HAProxy hop; falls back to loopback HAProxy on failure). Healthy memory is refreshed by **inotify** on `healthy.list`/`pool.gen` (poll is only a safety net). On Linux the bulk pump uses kernel **`splice`** (zero-copy pages via pipe) with pooled `CopyBuffer` fallback; sockets get `TCP_NODELAY` and larger buffers (`GATE_SOCK_BUF`, default 512KiB). When `PUNISH_RULES` is set, matching `host:443` traffic is MITM'd (HTTP/1.1) via a **picked healthy inst**. The MITM CA is **generated at runtime** (not in git/image); clients download **`http://<host>:9180/ca.crt`** — by default the cert web is **one-shot** (stops after first download; `GATE_CA_WEB=1` keeps it on). Match order: **host → status → optional text** on the first host-matching rule only. On hit, gate writes `punish_requests/<id>` and entrypoint runs **kick LB → drain → reconnect**.)*
 
 *(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
@@ -242,7 +244,9 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - HAPROXY_INTERNAL_PORT=1081 # gate 开启时 HAProxy 只绑 127.0.0.1:此端口；对外 BIND 仍由 mw-gate 提供 SOCKS
       - PUNISH_RULES= # 可选 L7 惩罚：host|状态码|正文;... 例 "*.x.ai|429,403|rate limit;grok.com|429|"
       - GATE_BODY_LIMIT=4096 # 正文匹配最多窥探的字节数
-      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA（惩罚域名的客户端需信任 ca.crt）
+      - GATE_CA_DIR=/var/run/microwarp/gate-ca # MITM CA 目录（运行时自动生成；如需持久可挂卷）
+      - GATE_CA_WEB=auto # auto/once：提供 ca.crt 下载，首次下载后关闭；1=常开；0=关闭
+      - GATE_CA_WEB_ADDR=0.0.0.0:9180 # 引导 HTTP，GET /ca.crt
       - GATE_PASS_DIRECT=1 # 透传直拨健康 inst（跳过 HAProxy）；0=始终经 HAProxy
       - GATE_SOCK_BUF=524288 # gate TCP 套接字 SO_RCVBUF/SO_SNDBUF 提示（字节）
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
@@ -268,7 +272,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 多实例运行细节：启动时 **HAProxy 会立刻监听**（即使暂时 0 后端）；**每个实例一旦启动完成就立刻测活并加入池**，不必等全部 N 条隧道都起来才开放服务。实例仍**串行启动并间隔 1 秒错峰**；健康巡检按 `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES` 错峰。失败实例会在巡检路径上**快速踢出 HAProxy**（soft-reload，**不等待排空**）；busy 连接排空（最多 `INSTANCE_DRAIN_TIMEOUT`，默认 **30 秒**）、停 SOCKS、重连/重注册都在该实例的**后台 worker**里做，**不阻塞**其它实例巡检与主循环。若某个实例**获取配置连续失败 3 次**，不会再拖垮整容器退出，而是进入**后台串行配置重试队列**（FIFO + 退避）继续注册。各 worker/队列对注册 API 的请求会串行化，降低打爆注册接口的风险。
 >
-> 可选**外层 SOCKS gate**（`mw-gate`，`GATE_ENABLED=auto`）：对外 `BIND` 仍是 SOCKS5。**透传**默认从内存健康池**直拨 inst**（`GATE_PASS_DIRECT=1`，跳过 HAProxy 一跳；失败再回退本机 HAProxy）。健康内存列表由 **inotify** 监视 `healthy.list`/`pool.gen` 近实时刷新（poll 仅兜底）。Linux 上 bulk 转发用内核 **`splice` 零拷贝**（失败则大缓冲 `CopyBuffer`），并设 `TCP_NODELAY` / 更大 socket buffer（`GATE_SOCK_BUF`，默认 512KiB）。配置 `PUNISH_RULES` 后，命中 host 的 **443** 走 MITM（HTTP/1.1），点名 up 的 inst 出 WARP；匹配顺序 **host → 状态码 → 可选响应正文**，命中则写 `punish_requests/<id>`，走现有 **踢 LB → 排空 → 重连**。惩罚域名客户端需信任 `$GATE_CA_DIR/ca.crt`。
+> 可选**外层 SOCKS gate**（`mw-gate`，`GATE_ENABLED=auto`）：对外 `BIND` 仍是 SOCKS5。**透传**默认从内存健康池**直拨 inst**（`GATE_PASS_DIRECT=1`，跳过 HAProxy 一跳；失败再回退本机 HAProxy）。健康内存列表由 **inotify** 监视 `healthy.list`/`pool.gen` 近实时刷新（poll 仅兜底）。Linux 上 bulk 转发用内核 **`splice` 零拷贝**（失败则大缓冲 `CopyBuffer`）。配置 `PUNISH_RULES` 后，命中 host 的 **443** 走 MITM（HTTP/1.1）。**MITM CA 运行时自动生成**（不进仓库/镜像）；客户端下载 **`http://<主机>:9180/ca.crt`**——默认 **一次性 Web**（首次下载后关闭；`GATE_CA_WEB=1` 可常开）。惩罚匹配：按规则顺序，**第一条 host 命中的规则**决定 status/text，不中则放行不再往后匹配。命中则写 `punish_requests/<id>`，走 **踢 LB → 排空 → 重连**。
 >
 > 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 >

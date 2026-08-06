@@ -25,6 +25,10 @@ type Config struct {
 	SockBuf int
 	// LogPassVia: log each passthrough backend choice (noisy; debug only).
 	LogPassVia bool
+	// CAWeb: off | once | on — bootstrap HTTP for ca.crt download.
+	CAWeb CAWebMode
+	// CAWebAddr: listen address for CA cert HTTP (default 0.0.0.0:9180).
+	CAWebAddr string
 }
 
 func env(k, def string) string {
@@ -61,6 +65,26 @@ func envBool(k string, def bool) bool {
 	}
 }
 
+// parseCAWeb: GATE_CA_WEB=
+//   unset/auto → once when MITM enabled (caller may still skip if already downloaded)
+//   0/false/off → off
+//   1/true/on/always → on (keep serving)
+//   once → once
+func parseCAWeb(raw string) CAWebMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no", "off":
+		return CAWebOff
+	case "1", "true", "yes", "on", "always":
+		return CAWebOn
+	case "once":
+		return CAWebOnce
+	case "", "auto":
+		return CAWebOnce // default intent; main disables if MITM off
+	default:
+		return CAWebOnce
+	}
+}
+
 func loadConfig() Config {
 	body := envInt("GATE_BODY_LIMIT", 4096)
 	if body > 1<<20 {
@@ -93,6 +117,8 @@ func loadConfig() Config {
 		PassDirect:  envBool("GATE_PASS_DIRECT", true),
 		SockBuf:     sockBuf,
 		LogPassVia:  envBool("GATE_LOG_PASS_VIA", false),
+		CAWeb:       parseCAWeb(os.Getenv("GATE_CA_WEB")),
+		CAWebAddr:   env("GATE_CA_WEB_ADDR", "0.0.0.0:9180"),
 	}
 	if cfg.Listen == "" {
 		bind := env("BIND_ADDR", "0.0.0.0")
@@ -100,5 +126,9 @@ func loadConfig() Config {
 		cfg.Listen = bind + ":" + port
 	}
 	cfg.EnabledMITM = len(cfg.Rules) > 0
+	// No MITM → no CA web unless forced on (still useless without rules, keep off).
+	if !cfg.EnabledMITM && cfg.CAWeb != CAWebOn {
+		cfg.CAWeb = CAWebOff
+	}
 	return cfg
 }

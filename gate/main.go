@@ -28,12 +28,23 @@ func main() {
 
 	var ca *CA
 	var err error
+	var stopCAWeb func()
 	if cfg.EnabledMITM {
 		ca, err = LoadOrCreateCA(cfg.CADir)
 		if err != nil {
 			logger.Fatalf("CA: %v", err)
 		}
-		logger.Printf("MITM CA ready: %s (install on clients that use punish hosts)", ca.CertPEMPath())
+		if ca.Created {
+			logger.Printf("MITM CA generated at %s (not in image/repo)", ca.CertPEMPath())
+		} else {
+			logger.Printf("MITM CA loaded from %s", ca.CertPEMPath())
+		}
+		stopCAWeb, _ = StartCACertWeb(cfg.CAWebAddr, cfg.CAWeb, ca, logger)
+		defer func() {
+			if stopCAWeb != nil {
+				stopCAWeb()
+			}
+		}()
 	}
 
 	g := &Gate{cfg: cfg, pool: pool, ca: ca, logger: logger}
@@ -49,11 +60,13 @@ func main() {
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 		<-ch
 		logger.Printf("signal received, closing")
+		if stopCAWeb != nil {
+			stopCAWeb()
+		}
 		_ = ln.Close()
 	}()
 
 	if err := g.Serve(ln); err != nil {
-		// closed listener
 		logger.Printf("serve done: %v", err)
 	}
 }
