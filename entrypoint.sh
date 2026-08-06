@@ -2208,19 +2208,22 @@ mark_instance_up() {
     echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康并加入负载均衡池"
 }
 
-mark_instance_down() {
+# Fast path only: mark down + soft-reload HAProxy. Does NOT drain or stop SOCKS.
+# Safe to call from the multi-instance monitor / request paths — must not block.
+detach_instance_from_lb() {
     local INST_ID="$1"
 
-    # 1) Kick out of LB first while internal SOCKS still accepts existing sessions.
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已标记不健康并从负载均衡池剔除（服务暂保留至连接排空）"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池剔除（SOCKS 暂保留，排空由后台进行）"
     reload_haproxy_from_status
+}
 
-    # 2) Wait until not busy (or INSTANCE_DRAIN_TIMEOUT), then stop SOCKS.
-    drain_and_stop_instance_socks "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止"
+# Back-compat name: historically stopped SOCKS immediately. Now only detaches from LB.
+# Drain + stop SOCKS happen in instance_recovery_worker so other tasks are never blocked.
+mark_instance_down() {
+    detach_instance_from_lb "$1"
 }
 
 _reload_haproxy_from_status_unlocked() {
@@ -2360,7 +2363,10 @@ instance_recovery_worker() {
             exit 0
         fi
 
-        mark_instance_down "$INST_ID"
+        # Stay detached; SOCKS already stopped at worker start. Do NOT drain again
+        # (would only delay this worker's next retry; LB kick is already done).
+        set_instance_status "$INST_ID" "down"
+        stop_instance_socks "$INST_ID"
         echo "==> [MicroWARP] [inst${INST_ID}] 后台复活本轮失败，${BACKOFF}s 后继续（永不放弃）"
         sleep "$BACKOFF"
         BACKOFF=$((BACKOFF * 2))
@@ -2371,8 +2377,9 @@ instance_recovery_worker() {
 }
 
 # Kick off background revival if not already running.
-# LB kick is synchronous (fast); connection drain + SOCKS stop run inside the worker
-# so the multi-instance monitor is not blocked for INSTANCE_DRAIN_TIMEOUT.
+# Synchronous work is intentionally minimal (status + soft-reload only).
+# Drain / stop SOCKS / reconnect / re-register all run inside the background worker
+# so the multi-instance monitor and other instances are never blocked by long offline.
 request_instance_recovery() {
     local INST_ID="$1"
     local _rec_pid _pid_file
@@ -2380,10 +2387,9 @@ request_instance_recovery() {
 
     if [ ! -f "$(get_instance_conf_path "$INST_ID")" ] || is_instance_queued_for_config_retry "$INST_ID"; then
         # Still detach from LB if we had been up with a missing conf edge case.
-        set_instance_status "$INST_ID" "down"
-        record_instance_offline_since "$INST_ID"
-        clear_instance_online_since "$INST_ID"
-        reload_haproxy_from_status || true
+        detach_instance_from_lb "$INST_ID" || true
+        # Best-effort: stop SOCKS in background so we don't block the caller on drain.
+        ( drain_and_stop_instance_socks "$INST_ID" ) >/dev/null 2>&1 &
         enqueue_instance_config_retry "$INST_ID"
         return 0
     fi
@@ -2393,15 +2399,11 @@ request_instance_recovery() {
         return 0
     fi
 
-    # 1) Kick LB immediately while SOCKS still serves existing sessions.
-    set_instance_status "$INST_ID" "down"
-    record_instance_offline_since "$INST_ID"
-    clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池剔除，后台将排空连接后停服务并复活"
-    reload_haproxy_from_status
+    # 1) Kick LB immediately (fast). SOCKS kept for existing sessions until worker drains.
+    detach_instance_from_lb "$INST_ID"
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
-    echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker..."
+    echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
     # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
     instance_recovery_worker "$INST_ID" &
     _rec_pid=$!

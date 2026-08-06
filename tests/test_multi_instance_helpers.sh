@@ -894,7 +894,7 @@ test_instance_drain_helpers() {
     assert_contains "$out" '排空超时' 'timeout forces stop path'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
 
-    # mark_instance_down order: status/reload before stop socks
+    # mark_instance_down / detach: LB kick only — must NOT drain/stop (non-blocking).
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR=$(mktemp -d)
     ORDER_LOG="$INSTANCE_STATE_DIR/order.log"
@@ -905,31 +905,26 @@ test_instance_drain_helpers() {
     reload_haproxy_from_status() { echo "reload" >> "$ORDER_LOG"; }
     wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
     stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
+    drain_and_stop_instance_socks() { echo "drain_and_stop" >> "$ORDER_LOG"; }
 
     mark_instance_down 7 >/dev/null 2>&1
     out=$(tr '\n' ' ' < "$ORDER_LOG")
     assert_contains "$out" 'status:down' 'marks down'
     assert_contains "$out" 'reload' 'reloads LB'
-    assert_contains "$out" 'drain' 'waits drain'
-    assert_contains "$out" 'stop_socks' 'stops socks'
-    # reload must appear before stop_socks
-    case "$out" in
-        *reload*stop_socks*) ;;
-        *)
-            echo "expected reload before stop_socks, got: $out" >&2
-            exit 1
-            ;;
-    esac
-    case "$out" in
-        *drain*stop_socks*) ;;
-        *)
-            echo "expected drain before stop_socks, got: $out" >&2
-            exit 1
-            ;;
-    esac
+    if [[ "$out" == *drain* ]] || [[ "$out" == *stop_socks* ]]; then
+        echo "mark_instance_down must not drain/stop (would block callers): $out" >&2
+        exit 1
+    fi
+
+    # drain_and_stop stays the blocking helper used only in background workers.
+    : > "$ORDER_LOG"
+    drain_and_stop_instance_socks 7
+    out=$(tr '\n' ' ' < "$ORDER_LOG")
+    assert_contains "$out" 'drain_and_stop' 'background helper still drains'
 
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
-        reload_haproxy_from_status wait_instance_drain stop_instance_socks 2>/dev/null || true
+        reload_haproxy_from_status wait_instance_drain stop_instance_socks \
+        drain_and_stop_instance_socks 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
     INSTANCE_DRAIN_TIMEOUT=30
