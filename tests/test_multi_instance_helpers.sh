@@ -851,7 +851,7 @@ test_instance_drain_helpers() {
     local out calls
 
     INSTANCE_DRAIN_TIMEOUT=''
-    assert_eq "$(get_instance_drain_timeout)" '30' 'blank drain timeout defaults to 30'
+    assert_eq "$(get_instance_drain_timeout)" '' 'blank drain timeout = infinite (no cap)'
 
     INSTANCE_DRAIN_TIMEOUT=0
     assert_eq "$(get_instance_drain_timeout)" '0' '0 disables drain wait'
@@ -860,7 +860,7 @@ test_instance_drain_helpers() {
     assert_eq "$(get_instance_drain_timeout)" '45' 'explicit drain timeout honored'
 
     INSTANCE_DRAIN_TIMEOUT=abc
-    assert_eq "$(get_instance_drain_timeout)" '30' 'invalid drain timeout falls back to 30'
+    assert_eq "$(get_instance_drain_timeout)" '' 'invalid drain timeout = infinite (IM-safe)'
 
     # timeout=0 → skip wait
     INSTANCE_DRAIN_TIMEOUT=0
@@ -889,6 +889,29 @@ test_instance_drain_helpers() {
     sleep() { :; }
     out=$(wait_instance_drain 4 2>&1)
     assert_contains "$out" '连接已排空' 'drains after busy clears'
+    unset -f count_instance_busy_clients sleep 2>/dev/null || true
+    rm -f "$BUSY_STATE"
+
+    # unset timeout = infinite: busy then idle still drains (no force timeout path)
+    INSTANCE_DRAIN_TIMEOUT=
+    BUSY_STATE=$(mktemp)
+    echo 1 > "$BUSY_STATE"
+    count_instance_busy_clients() {
+        if [ "$(cat "$BUSY_STATE")" = 1 ]; then
+            echo 0 > "$BUSY_STATE"
+            printf '1\n'
+        else
+            printf '0\n'
+        fi
+    }
+    sleep() { :; }
+    out=$(wait_instance_drain 9 2>&1)
+    assert_contains "$out" '无限期等待' 'unset timeout logs infinite wait'
+    assert_contains "$out" '连接已排空' 'infinite mode still ends when idle'
+    if [[ "$out" == *排空超时* ]]; then
+        echo "unset INSTANCE_DRAIN_TIMEOUT must not force-timeout: $out" >&2
+        exit 1
+    fi
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
     rm -f "$BUSY_STATE"
 

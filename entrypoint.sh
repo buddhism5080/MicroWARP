@@ -36,10 +36,11 @@ CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
 # AND healthy pool is not below half, force it offline and reconnect.
 # Default 0 = disabled. Single-instance (WARP_INSTANCES<=1) never uses this.
 MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
-# After kicking a multi-instance backend out of HAProxy, wait up to this many
-# seconds for busy client sockets to drain before stopping internal SOCKS.
-# Default 30. Set 0 to stop SOCKS immediately after LB reload (no drain wait).
-INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT:-30}"
+# After kicking a multi-instance backend out of HAProxy, wait for busy client
+# sockets to drain before stopping internal SOCKS.
+# Unset/empty = wait indefinitely until idle (IM-friendly; no force-kill on timeout).
+# 0 = stop SOCKS immediately. Positive N = max wait seconds then force stop.
+INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
 # Outer thin SOCKS gate (multi-instance): terminates SOCKS, optional MITM punish path.
 # auto = enable when /usr/local/bin/mw-gate exists. 0/false=off. 1/true=on.
 GATE_ENABLED="${GATE_ENABLED:-auto}"
@@ -500,11 +501,20 @@ is_instance_idle() {
     [ "$COUNT" -eq 0 ]
 }
 
+# Prints drain wait budget:
+#   empty  → infinite (wait until busy=0; no force timeout)
+#   0      → skip wait / stop immediately
+#   N>0    → max seconds
+# Blank/unset/non-numeric → infinite (prefer not killing long-lived IM sessions).
 get_instance_drain_timeout() {
-    RAW=${INSTANCE_DRAIN_TIMEOUT:-30}
+    RAW=${INSTANCE_DRAIN_TIMEOUT-}
     case "$RAW" in
-        ''|*[!0-9]*)
-            printf '30\n'
+        '')
+            printf '\n'
+            return 0
+            ;;
+        *[!0-9]*)
+            printf '\n'
             return 0
             ;;
     esac
@@ -521,14 +531,17 @@ count_instance_busy_clients() {
     count_busy_tcp_sockets "dst ${NS_IP}:1080"
 }
 
-# Wait until instance has no busy client sockets, or INSTANCE_DRAIN_TIMEOUT elapses.
+# Wait until instance has no busy client sockets.
+# INSTANCE_DRAIN_TIMEOUT empty/unset → wait indefinitely (IM-friendly).
+# 0 → skip wait; positive N → force-stop after N seconds.
 # Returns 0 if drained idle, 1 if timed out / cannot observe (caller still stops SOCKS).
 wait_instance_drain() {
     local INST_ID="$1"
     local TIMEOUT COUNT SLEPT
 
     TIMEOUT=$(get_instance_drain_timeout)
-    if [ "$TIMEOUT" -le 0 ]; then
+    # Explicit 0 only: empty TIMEOUT means infinite wait below.
+    if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -le 0 ]; then
         echo "==> [MicroWARP] [inst${INST_ID}] INSTANCE_DRAIN_TIMEOUT=0，跳过连接排空，立即停服务"
         return 1
     fi
@@ -541,7 +554,11 @@ wait_instance_drain() {
     COUNT=$(count_instance_busy_clients "$INST_ID")
     case "$COUNT" in
         ''|*[!0-9]*)
-            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
+            if [ -n "$TIMEOUT" ]; then
+                echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
+            else
+                echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），无限期等待至可观测且空闲（未设 INSTANCE_DRAIN_TIMEOUT）"
+            fi
             COUNT=-1
             ;;
     esac
@@ -550,8 +567,12 @@ wait_instance_drain() {
         return 0
     fi
 
-    if [ "$COUNT" -gt 0 ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+    if [ "$COUNT" -gt 0 ] || [ "$COUNT" -lt 0 ]; then
+        if [ -n "$TIMEOUT" ]; then
+            echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+        else
+            echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，无限期等待 busy 排空（当前 ${COUNT}；未设 INSTANCE_DRAIN_TIMEOUT，不强制打断长连接）..."
+        fi
     fi
     SLEPT=0
     while true; do
@@ -565,13 +586,17 @@ wait_instance_drain() {
             echo "==> [MicroWARP] [inst${INST_ID}] 连接已排空（等待 ${SLEPT}s），准备停服务"
             return 0
         fi
-        if [ "$SLEPT" -ge "$TIMEOUT" ]; then
+        if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
             echo "==> [MicroWARP] [inst${INST_ID}] 排空超时 ${TIMEOUT}s，仍有 busy=${COUNT}，强制停服务"
             return 1
         fi
         # Keep log noise low: every 5s.
         if [ $((SLEPT % 5)) -eq 0 ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s/${TIMEOUT}s"
+            if [ -n "$TIMEOUT" ]; then
+                echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s/${TIMEOUT}s"
+            else
+                echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s（无超时上限，等到空闲）"
+            fi
         fi
     done
 }
@@ -613,13 +638,13 @@ healthy_instances_below_half() {
 }
 
 # Returns 0 if this healthy multi-instance backend should be force-rotated now:
-# continuous uptime >= MAX_CONN_DURATION AND pool not below half healthy.
-# Busy is OK: recovery enters runtime drain first, then waits idle OR INSTANCE_DRAIN_TIMEOUT
-# before stopping SOCKS — so MAX_CONN no longer stalls forever on long-lived TCP.
+# continuous uptime >= MAX_CONN_DURATION AND ready/up pool not below half.
+# Busy is OK: recovery enters runtime drain first, then waits until idle (or until
+# INSTANCE_DRAIN_TIMEOUT if set) before stopping SOCKS.
 # Single-instance (WARP_INSTANCES<=1) always returns 1 — never force-offline.
 instance_should_force_rotate_for_max_conn() {
     local INST_ID="$1"
-    local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL BUSY
+    local THRESHOLD SINCE NOW_EPOCH ELAPSED HEALTHY TOTAL BUSY DRAIN_TO
     THRESHOLD=$(get_max_conn_duration)
 
     if [ "$THRESHOLD" -le 0 ]; then
@@ -652,10 +677,10 @@ instance_should_force_rotate_for_max_conn() {
         return 1
     fi
 
-    # Capacity guard: never force-offline when healthy pool is already < half.
+    # Capacity guard: never MAX_CONN-drain when ready(up) pool is already < half.
     if healthy_instances_below_half; then
         HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但健康实例 ${HEALTHY}/${TOTAL} 少于一半，暂不强制下线"
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但 ready 实例 ${HEALTHY}/${TOTAL} 少于一半，跳过 MAX_CONN drain"
         return 1
     fi
 
@@ -663,10 +688,13 @@ instance_should_force_rotate_for_max_conn() {
     case "$BUSY" in
         ''|*[!0-9]*) BUSY='?' ;;
     esac
+    DRAIN_TO=$(get_instance_drain_timeout)
     if [ "$BUSY" = "0" ]; then
         echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(busy=0)，准备 drain 后强制重连"
+    elif [ -n "$DRAIN_TO" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
     else
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 INSTANCE_DRAIN_TIMEOUT 后再停 SOCKS/重连"
+        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，无限期等到空闲后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
     fi
     return 0
 }
@@ -3052,10 +3080,10 @@ probe_instance_and_schedule_recovery() {
                 echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
                 ;;
         esac
-        # MAX_CONN: enter drain even if busy; worker waits idle or INSTANCE_DRAIN_TIMEOUT.
+        # MAX_CONN: enter drain even if busy; worker waits until idle (or INSTANCE_DRAIN_TIMEOUT if set).
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then
             BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期(busy=${BUSY_NOW}) → runtime drain，空闲或超时后重连"
+            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期(busy=${BUSY_NOW}) → runtime drain，空闲后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
             request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
