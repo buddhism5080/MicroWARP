@@ -6,6 +6,8 @@ ARG ALPINE_IMAGE=alpine:latest
 FROM ${GO_IMAGE} AS gatebuilder
 WORKDIR /src
 COPY gate/ ./
+# Pin module to Go 1.22-compatible deps; GOTOOLCHAIN=local avoids surprise upgrades.
+ENV GOTOOLCHAIN=local
 RUN CGO_ENABLED=0 go test ./... \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /mw-gate .
 
