@@ -186,6 +186,59 @@ get_instance_online_since_epoch() {
     fi
 }
 
+# Seconds since mark-up (empty string if never online / no stamp).
+get_instance_online_elapsed_seconds() {
+    local SINCE NOW ELAPSED
+    SINCE=$(get_instance_online_since_epoch "$1")
+    case "$SINCE" in
+        ''|*[!0-9]*)
+            printf ''
+            return 0
+            ;;
+    esac
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - SINCE))
+    if [ "$ELAPSED" -lt 0 ]; then
+        ELAPSED=0
+    fi
+    printf '%s\n' "$ELAPSED"
+}
+
+# Human-readable start time from epoch (Alpine busybox: date -d @epoch).
+format_epoch_local_text() {
+    local EPOCH="$1"
+    case "$EPOCH" in
+        ''|*[!0-9]*)
+            printf ''
+            return 0
+            ;;
+    esac
+    date -d "@${EPOCH}" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || printf '%s' "$EPOCH"
+}
+
+# Log line used at multi-instance health probe start: include continuous online duration when known.
+print_instance_health_probe_start() {
+    local INST_ID="$1"
+    local ELAPSED UPTIME_TEXT SINCE ONLINE_AT
+
+    ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
+    case "$ELAPSED" in
+        ''|*[!0-9]*)
+            echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检..."
+            return 0
+            ;;
+    esac
+
+    UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
+    SINCE=$(get_instance_online_since_epoch "$INST_ID")
+    ONLINE_AT=$(format_epoch_local_text "$SINCE")
+    if [ -n "$ONLINE_AT" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检（上线时间: ${ONLINE_AT}，已在线: ${UPTIME_TEXT}）..."
+    else
+        echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检（已在线: ${UPTIME_TEXT}）..."
+    fi
+}
+
 # Busy (non-idle) TCP states for client sessions:
 #   established  — active data path
 #   syn-sent / syn-recv — handshake in progress
@@ -2441,7 +2494,7 @@ get_health_check_stagger_seconds() {
 # Lightweight monitor visit: if healthy keep/restore up; if not, kick off background revival and move on.
 probe_instance_and_schedule_recovery() {
     local INST_ID="$1"
-    local OLD_STATUS
+    local OLD_STATUS ELAPSED UPTIME_TEXT
 
     # Config retry queue owns registration for conf-less / register-failed insts.
     if is_instance_queued_for_config_retry "$INST_ID"; then
@@ -2462,13 +2515,25 @@ probe_instance_and_schedule_recovery() {
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检..."
+    print_instance_health_probe_start "$INST_ID"
     if run_instance_health_checks "$INST_ID"; then
         OLD_STATUS=$(get_instance_status "$INST_ID")
         mark_instance_up "$INST_ID"
         if [ "$OLD_STATUS" != "up" ]; then
             reload_haproxy_from_status
             echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
+        else
+            # Already-up path: restate pass + duration (mirrors single-instance SOCKS probe log).
+            ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
+            case "$ELAPSED" in
+                ''|*[!0-9]*)
+                    echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线"
+                    ;;
+                *)
+                    UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
+                    echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
+                    ;;
+            esac
         fi
         # Max continuous uptime rotation: only when idle (no active clients).
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then

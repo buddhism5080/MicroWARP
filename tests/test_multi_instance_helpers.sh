@@ -809,6 +809,38 @@ test_max_conn_duration_helpers() {
     MAX_CONN_DURATION=0
 }
 
+test_instance_online_duration_probe_log() {
+    local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
+    local out elapsed
+
+    INSTANCE_STATE_DIR=$(mktemp -d)
+
+    # No stamp → generic start line, no duration.
+    out=$(print_instance_health_probe_start 2 2>&1)
+    assert_contains "$out" '[inst2] 执行健康巡检...' 'missing stamp still probes'
+    if [[ "$out" == *'已在线'* ]]; then
+        echo "unexpected duration without online_since: $out" >&2
+        exit 1
+    fi
+
+    # Stamp 3661s ago → 01h 01m 01s
+    printf '%s\n' "$(( $(date +%s) - 3661 ))" > "$(get_instance_online_since_file 2)"
+    elapsed=$(get_instance_online_elapsed_seconds 2)
+    # Allow 0-2s skew from slow CI.
+    if [ "$elapsed" -lt 3661 ] || [ "$elapsed" -gt 3665 ]; then
+        echo "elapsed out of expected window: $elapsed" >&2
+        exit 1
+    fi
+    out=$(print_instance_health_probe_start 2 2>&1)
+    assert_contains "$out" '[inst2] 执行健康巡检' 'probe start still logs'
+    assert_contains "$out" '已在线:' 'probe start includes online duration'
+    assert_contains "$out" '上线时间:' 'probe start includes online-at text'
+    assert_contains "$out" '01h 01m' 'formatted duration near 1h1m'
+
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -836,5 +868,6 @@ test_stagger_skips_after_last_instance
 test_health_check_stagger_is_interval_div_count
 test_config_stale_offline_threshold
 test_max_conn_duration_helpers
+test_instance_online_duration_probe_log
 
 printf 'PASS test_multi_instance_helpers\n'
