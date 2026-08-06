@@ -190,12 +190,20 @@ start_mw_gate() {
     export GATE_CA_DIR="${GATE_CA_DIR:-$INSTANCE_STATE_DIR/gate-ca}"
     export GATE_BODY_LIMIT="${GATE_BODY_LIMIT:-4096}"
     export GATE_HEALTH_POLL_MS="${GATE_HEALTH_POLL_MS:-500}"
+    export GATE_PASS_DIRECT="${GATE_PASS_DIRECT:-1}"
+    export GATE_SOCK_BUF="${GATE_SOCK_BUF:-524288}"
+    export GATE_LOG_PASS_VIA="${GATE_LOG_PASS_VIA:-0}"
 
     echo "==> [MicroWARP] 启动外层 SOCKS gate: ${GATE_LISTEN} → HAProxy ${GATE_HAPROXY_ADDR}"
+    if is_enabled "${GATE_PASS_DIRECT:-1}"; then
+        echo "==> [MicroWARP] 透传优先直拨健康 inst（GATE_PASS_DIRECT=1，失败回退 HAProxy）"
+    else
+        echo "==> [MicroWARP] 透传经 HAProxy RR（GATE_PASS_DIRECT=0）"
+    fi
     if [ -n "${PUNISH_RULES}" ]; then
         echo "==> [MicroWARP] PUNISH_RULES 已配置（MITM 惩罚路径启用；客户端需信任 ${GATE_CA_DIR}/ca.crt）"
     else
-        echo "==> [MicroWARP] PUNISH_RULES 为空：gate 仅做 SOCKS 终结 + 转发 HAProxy"
+        echo "==> [MicroWARP] PUNISH_RULES 为空：gate 仅做 SOCKS 终结 + 高性能透传"
     fi
     "$BIN" &
     GATE_PID=$!

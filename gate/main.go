@@ -13,9 +13,9 @@ func main() {
 	cfg := loadConfig()
 
 	if len(cfg.Rules) == 0 {
-		logger.Printf("PUNISH_RULES empty: MITM inspect disabled; all traffic passthrough → %s", cfg.HAProxyAddr)
+		logger.Printf("PUNISH_RULES empty: MITM off; passthrough direct=%v sock_buf=%d", cfg.PassDirect, cfg.SockBuf)
 	} else {
-		logger.Printf("loaded %d punish rule(s); MITM on matching host:443", len(cfg.Rules))
+		logger.Printf("loaded %d punish rule(s); MITM on matching host:443; passthrough direct=%v", len(cfg.Rules), cfg.PassDirect)
 		for i, r := range cfg.Rules {
 			logger.Printf("  rule[%d]=%s", i, r.Raw)
 		}

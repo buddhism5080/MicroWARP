@@ -39,7 +39,6 @@ func (g *Gate) handle(client net.Conn) {
 		g.logger.Printf("socks handshake: %v", err)
 		return
 	}
-	// clear read deadline for long-lived tunnels after handshake
 	_ = client.SetDeadline(time.Time{})
 
 	needMITM := g.cfg.EnabledMITM && port == 443 && HostNeedsMITM(g.cfg.Rules, host)
@@ -58,12 +57,53 @@ func (g *Gate) handlePassthrough(client net.Conn, host string, port int) error {
 	if err := socksOK(client); err != nil {
 		return err
 	}
-	up, err := g.dialViaHAProxy(host, port)
+	up, via, err := g.dialPassthroughUpstream(host, port)
 	if err != nil {
 		return err
 	}
 	defer up.Close()
-	return splice(client, up)
+
+	tuneTCP(client, g.cfg.SockBuf, g.cfg.SockBuf)
+	tuneTCP(up, g.cfg.SockBuf, g.cfg.SockBuf)
+
+	if g.cfg.LogPassVia {
+		g.logger.Printf("pass %s:%d via %s", host, port, via)
+	}
+	return bidirectionalRelay(client, up)
+}
+
+// dialPassthroughUpstream prefers direct dial to a healthy inst (skip HAProxy hop).
+// Falls back to HAProxy RR SOCKS if direct is disabled or direct dials fail.
+func (g *Gate) dialPassthroughUpstream(host string, port int) (net.Conn, string, error) {
+	if g.cfg.PassDirect {
+		tried := make(map[int]struct{}, 4)
+		for attempt := 0; attempt < 3; attempt++ {
+			id, ok := g.pool.Pick()
+			if !ok {
+				break
+			}
+			if _, seen := tried[id]; seen {
+				if g.pool.Len() <= len(tried) {
+					break
+				}
+				continue
+			}
+			tried[id] = struct{}{}
+			c, err := g.dialViaInst(id, host, port)
+			if err == nil {
+				return c, fmt.Sprintf("inst%d", id), nil
+			}
+		}
+	}
+
+	c, err := g.dialViaHAProxy(host, port)
+	if err != nil {
+		if g.cfg.PassDirect {
+			return nil, "", fmt.Errorf("direct+haproxy failed: %w", err)
+		}
+		return nil, "", err
+	}
+	return c, "haproxy", nil
 }
 
 func (g *Gate) dialViaHAProxy(host string, port int) (net.Conn, error) {
@@ -78,6 +118,7 @@ func (g *Gate) dialViaHAProxy(host string, port int) (net.Conn, error) {
 		return nil, fmt.Errorf("socks via haproxy: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
+	tuneTCP(conn, g.cfg.SockBuf, g.cfg.SockBuf)
 	return conn, nil
 }
 
@@ -95,6 +136,7 @@ func (g *Gate) dialViaInst(instID int, host string, port int) (net.Conn, error) 
 		return nil, fmt.Errorf("socks inst%d: %w", instID, err)
 	}
 	_ = conn.SetDeadline(time.Time{})
+	tuneTCP(conn, g.cfg.SockBuf, g.cfg.SockBuf)
 	return conn, nil
 }
 
@@ -115,7 +157,7 @@ func (g *Gate) handleMITM(client net.Conn, host string, port int) error {
 	tlsClient := tls.Server(client, &tls.Config{
 		Certificates: []tls.Certificate{*leaf},
 		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"}, // MVP: H1 only for inspectable status/body
+		NextProtos:   []string{"http/1.1"},
 	})
 	if err := tlsClient.Handshake(); err != nil {
 		return fmt.Errorf("client tls: %w", err)
@@ -136,17 +178,14 @@ func (g *Gate) handleMITM(client net.Conn, host string, port int) error {
 		return fmt.Errorf("upstream tls: %w", err)
 	}
 
-	// Peek first HTTP response on the upstream side while bridging.
 	return g.bridgeHTTPInspect(tlsClient, tlsUp, host, instID)
 }
 
-// bridgeHTTPInspect copies client→up fully; up→client peeks first response status/body prefix.
 func (g *Gate) bridgeHTTPInspect(client, up net.Conn, host string, instID int) error {
 	errc := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(up, client)
-		errc <- err
+		errc <- copyBuffered(up, client)
 	}()
 
 	go func() {
@@ -154,7 +193,6 @@ func (g *Gate) bridgeHTTPInspect(client, up net.Conn, host string, instID int) e
 	}()
 
 	err := <-errc
-	// force close both sides to unblock the other copy
 	_ = client.Close()
 	_ = up.Close()
 	<-errc
@@ -165,8 +203,7 @@ func (g *Gate) bridgeHTTPInspect(client, up net.Conn, host string, instID int) e
 }
 
 func (g *Gate) copyUpstreamInspect(dst, src net.Conn, host string, instID int) error {
-	br := bufio.NewReader(src)
-	// Read status line
+	br := bufio.NewReaderSize(src, 64<<10)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
 		return err
@@ -176,7 +213,6 @@ func (g *Gate) copyUpstreamInspect(dst, src net.Conn, host string, instID int) e
 	}
 	code := parseHTTPStatus(statusLine)
 
-	// headers
 	var hdr bytes.Buffer
 	for {
 		line, err := br.ReadString('\n')
@@ -192,7 +228,6 @@ func (g *Gate) copyUpstreamInspect(dst, src net.Conn, host string, instID int) e
 		return err
 	}
 
-	// body prefix for text match
 	var bodyPrefix strings.Builder
 	limit := g.cfg.BodyLimit
 	if limit > 0 {
@@ -213,13 +248,13 @@ func (g *Gate) copyUpstreamInspect(dst, src net.Conn, host string, instID int) e
 		}
 	}
 
-	// rest of body / stream
-	_, err = io.Copy(dst, br)
+	bp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bp)
+	_, err = io.CopyBuffer(dst, br, *bp)
 	return err
 }
 
 func parseHTTPStatus(statusLine string) int {
-	// HTTP/1.1 429 Too Many Requests
 	parts := strings.Fields(statusLine)
 	if len(parts) < 2 {
 		return 0
@@ -229,24 +264,4 @@ func parseHTTPStatus(statusLine string) int {
 		return 0
 	}
 	return code
-}
-
-func splice(a, b net.Conn) error {
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(b, a)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(a, b)
-		errc <- err
-	}()
-	err := <-errc
-	_ = a.Close()
-	_ = b.Close()
-	<-errc
-	if err != nil && err != io.EOF {
-		return err
-	}
-	return nil
 }
