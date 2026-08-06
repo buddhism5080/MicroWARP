@@ -140,17 +140,26 @@ func statusMatches(ms []statusMatcher, code int) bool {
 	return false
 }
 
-// MatchPunish: host → status → optional text. All configured layers must pass.
+// MatchPunish evaluates rules in order.
+//
+// For each rule: host → status → optional text (all required layers on that rule).
+// Semantics (first host hit wins):
+//  1. Skip rules whose host pattern does not match.
+//  2. On the first rule whose host matches, decide only with that rule:
+//     - status (and text if set) match → punish
+//     - otherwise → allow (do NOT try later rules)
+//  3. If no rule host matches → allow.
 func MatchPunish(rules []Rule, host string, status int, bodyPrefix string) (Rule, bool) {
 	for _, r := range rules {
 		if !hostMatches(r.HostPat, host) {
 			continue
 		}
+		// First matching host: stop the rule list either way.
 		if !statusMatches(r.Statuses, status) {
-			continue
+			return Rule{}, false
 		}
 		if r.Text != "" && !strings.Contains(bodyPrefix, r.Text) {
-			continue
+			return Rule{}, false
 		}
 		return r, true
 	}

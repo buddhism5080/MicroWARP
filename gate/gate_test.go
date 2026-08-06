@@ -36,6 +36,25 @@ func TestParseAndMatchRules(t *testing.T) {
 	}
 }
 
+func TestFirstHostRuleWinsNoFallthrough(t *testing.T) {
+	// First rule host matches but status/text fail → allow, do NOT try second rule.
+	rules := parseRules("*.x.ai|429|rate limit;*.x.ai|403|;*.x.ai|429|")
+	if _, ok := MatchPunish(rules, "a.x.ai", 403, ""); ok {
+		t.Fatal("must not fall through to second rule after first host hit")
+	}
+	if _, ok := MatchPunish(rules, "a.x.ai", 429, "nope"); ok {
+		t.Fatal("text fail on first host rule must allow, not try third")
+	}
+	if _, ok := MatchPunish(rules, "a.x.ai", 429, "rate limit"); !ok {
+		t.Fatal("first rule full hit should punish")
+	}
+	// Different host skips first rules' host and can hit later.
+	rules2 := parseRules("grok.com|429|;*.x.ai|403|")
+	if _, ok := MatchPunish(rules2, "b.x.ai", 403, ""); !ok {
+		t.Fatal("later rule for other host pattern")
+	}
+}
+
 func TestHostMatchPatterns(t *testing.T) {
 	if !hostMatches("*.x.ai", "grok.x.ai") {
 		t.Fatal("*.x.ai")
