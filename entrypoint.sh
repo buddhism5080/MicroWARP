@@ -23,6 +23,7 @@ SOCKS_ONLINE_AT_EPOCH=""
 SOCKS_ONLINE_AT_TEXT=""
 HAPROXY_PID=""
 HAPROXY_CFG="/var/run/microwarp/haproxy.cfg"
+HAPROXY_SOCK="/var/run/microwarp/haproxy.sock"
 INSTANCE_STATE_DIR="/var/run/microwarp"
 MAX_WARP_INSTANCES=100
 INSTANCE_SUBNET_PREFIX="10.66"
@@ -400,17 +401,15 @@ wait_instance_drain() {
     done
 }
 
-# After soft-detach (drain): wait for idle (or timeout), then stop internal SOCKS,
-# then hard-remove from HAProxy config.
+# After runtime drain: wait for idle (or timeout), then stop internal SOCKS.
+# Servers stay in HAProxy config permanently; admin state goes to maint until revive.
 drain_and_stop_instance_socks() {
     local INST_ID="$1"
     wait_instance_drain "$INST_ID" || true
     stop_instance_socks "$INST_ID"
-    # Server was "draining/disabled"; now drop it fully so checks stop hitting a dead SOCKS.
-    if [ "$(get_instance_status "$INST_ID")" = "draining" ] || [ "$(get_instance_status "$INST_ID")" = "down" ]; then
-        set_instance_status "$INST_ID" "down"
-        reload_haproxy_from_status || true
-    fi
+    set_instance_status "$INST_ID" "down"
+    # maint: no new traffic + stop health-checks while we restart WARP/SOCKS (no reload).
+    haproxy_set_server_state "$INST_ID" "maint" || true
 }
 
 # True (0) when healthy instances are strictly less than half of WARP_INSTANCE_COUNT.
@@ -818,6 +817,10 @@ render_haproxy_config() {
     BIND_IP=$1
     BIND_P=$2
     STATUS_LIST=$3
+    # NOTE: every known instance stays in the config for its whole life.
+    # Availability is toggled at runtime via stats socket:
+    #   set server warp_pool/instK state {ready|drain|maint}
+    # — no add/remove server lines, no reload on drain/ready (saves reload churn).
 
     cat <<EOF
 global
@@ -828,6 +831,7 @@ global
     # (netns / bind). Silences HAProxy 3.x startup warnings that look like crashes.
     user root
     chroot /
+    stats socket ${HAPROXY_SOCK:-/var/run/microwarp/haproxy.sock} mode 600 level admin
 
 defaults
     mode tcp
@@ -850,24 +854,90 @@ EOF
     for ITEM in $STATUS_LIST; do
         [ -n "$ITEM" ] || continue
         _sid=${ITEM%%:*}
-        _sstatus=${ITEM#*:}
+        # status ignored for membership — always emit the server line
         ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-        case "$_sstatus" in
-            up)
-                # Accept new + existing connections.
-                printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
-                ;;
-            draining)
-                # Keep server in config but disabled: no NEW conns; existing TCP preserved
-                # across soft-reload (unlike deleting the server line, which kills sessions).
-                printf '    server inst%s %s check inter 3s fall 2 rise 1 disabled\n' "$_sid" "$ENDPOINT"
-                ;;
-            *)
-                # down / unknown: omit — fully out of pool
-                ;;
-        esac
+        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
     done
     IFS=$OLD_IFS
+}
+
+get_haproxy_sock() {
+    printf '%s\n' "${HAPROXY_SOCK:-$INSTANCE_STATE_DIR/haproxy.sock}"
+}
+
+# Send one CLI command to the master stats socket. No reload.
+# Returns 0 if the socket accepts the command (HAProxy replies).
+haproxy_runtime_cmd() {
+    local CMD="$1"
+    local SOCK OUT
+    SOCK=$(get_haproxy_sock)
+
+    if [ ! -S "$SOCK" ]; then
+        return 1
+    fi
+
+    if command -v socat >/dev/null 2>&1; then
+        OUT=$(printf '%s\n' "$CMD" | socat -T2 STDIO "UNIX-CONNECT:${SOCK}" 2>/dev/null) || return 1
+        # HAProxy returns empty or an error string; treat obvious failures.
+        case "$OUT" in
+            *'Unknown command'*|*'No such'*|*'failed'*)
+                return 1
+                ;;
+        esac
+        return 0
+    fi
+
+    # Minimal Python fallback (rarely present in the image).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$SOCK" "$CMD" <<'PY' 2>/dev/null
+import socket, sys
+sock_path, cmd = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2)
+s.connect(sock_path)
+s.sendall((cmd + "\n").encode())
+data = b""
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except Exception:
+    pass
+s.close()
+text = data.decode(errors="replace")
+if "Unknown command" in text or "No such" in text:
+    sys.exit(1)
+sys.exit(0)
+PY
+        return $?
+    fi
+
+    return 1
+}
+
+# Admin state: ready | drain | maint  (HAProxy official runtime API — no reload).
+haproxy_set_server_state() {
+    local INST_ID="$1"
+    local STATE="$2"
+    local CMD
+
+    case "$STATE" in
+        ready|drain|maint) ;;
+        *)
+            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] invalid HAProxy state '$STATE'"
+            return 1
+            ;;
+    esac
+
+    CMD="set server warp_pool/inst${INST_ID} state ${STATE}"
+    if haproxy_runtime_cmd "$CMD"; then
+        echo "==> [MicroWARP] [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
+        return 0
+    fi
+    echo "==> [MicroWARP] [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
+    return 1
 }
 
 get_haproxy_pid_file() {
@@ -2274,60 +2344,97 @@ mark_instance_up() {
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康并加入负载均衡池"
+    # Re-enable LB scheduling without rewriting haproxy.cfg / reload.
+    haproxy_set_server_state "$INST_ID" "ready" || true
+    echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康（SOCKS up + HAProxy ready）"
 }
 
-# Soft-detach: mark draining + reload with server "disabled".
-# New connections stop; existing TCP on this backend is preserved until drain/stop SOCKS.
-# Does NOT stop SOCKS. Safe/fast for monitor path.
+# Runtime drain only — no config rewrite, no reload.
+# New connections stop; existing TCP kept until drain timeout / natural end.
 detach_instance_from_lb() {
     local INST_ID="$1"
 
     set_instance_status "$INST_ID" "draining"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ⏸️ 进入 drain（HAProxy disabled）：停新连接，保留已有 TCP；排空/停 SOCKS 由后台进行"
-    reload_haproxy_from_status
+    echo "==> [MicroWARP] [inst${INST_ID}] ⏸️ HAProxy state=drain（官方 drain，无 reload）：停新连接，保已有 TCP"
+    if ! haproxy_set_server_state "$INST_ID" "drain"; then
+        # Socket unavailable (startup race): fall back to one reload so checks still work;
+        # servers stay in cfg either way.
+        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] runtime drain 失败，尝试确保 HAProxy 进程/配置存在"
+        reload_haproxy_from_status || true
+        haproxy_set_server_state "$INST_ID" "drain" || true
+    fi
 }
 
-# Hard-remove from pool (no server line). Prefer after drain+stop SOCKS.
+# While SOCKS/WARP is down: maint (no traffic, no checks). Still no server add/remove.
 hard_detach_instance_from_lb() {
     local INST_ID="$1"
 
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池彻底移除"
-    reload_haproxy_from_status
+    echo "==> [MicroWARP] [inst${INST_ID}] HAProxy state=maint（重启服务期间，无 reload）"
+    haproxy_set_server_state "$INST_ID" "maint" || true
 }
 
-# Back-compat name: soft-detach (drain) only.
-# Drain + stop SOCKS + hard remove happen in instance_recovery_worker.
+# Back-compat: soft-detach via runtime drain.
 mark_instance_down() {
     detach_instance_from_lb "$1"
 }
 
 _reload_haproxy_from_status_unlocked() {
-    local STATUS_LIST HEALTHY PID_FILE
+    local STATUS_LIST HEALTHY PID_FILE NEW_CFG
     mkdir -p "$INSTANCE_STATE_DIR"
     PID_FILE=$(get_haproxy_pid_file)
     STATUS_LIST=$(collect_instance_status_list)
     HEALTHY=$(count_healthy_instances)
+    NEW_CFG="${HAPROXY_CFG}.new"
 
-    render_haproxy_config "$LISTEN_ADDR" "$LISTEN_PORT" "$STATUS_LIST" > "$HAPROXY_CFG"
-    echo "==> [MicroWARP] 刷新 HAProxy 后端（健康实例: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
+    render_haproxy_config "$LISTEN_ADDR" "$LISTEN_PORT" "$STATUS_LIST" > "$NEW_CFG"
 
-    # CRITICAL: re-sync from pidfile every time. Do NOT trust the shell copy of
-    # HAPROXY_PID alone — recovery workers fork with a stale value; a dead-but
-    # non-empty HAPROXY_PID used to skip the pidfile path and cold-start every
-    # revive, printing "已上线" with a new PID on each backend change.
+    # Skip reload when the static server set is unchanged (normal drain/ready path).
+    if [ -f "$HAPROXY_CFG" ] && cmp -s "$NEW_CFG" "$HAPROXY_CFG" 2>/dev/null; then
+        rm -f "$NEW_CFG"
+        if refresh_haproxy_pid; then
+            echo "==> [MicroWARP] HAProxy 配置未变（健康标记 ${HEALTHY}/${WARP_INSTANCE_COUNT}），跳过 reload"
+            return 0
+        fi
+        echo "==> [MicroWARP] HAProxy 配置未变但进程不在，冷启动..."
+        if haproxy_cold_start "$HAPROXY_CFG"; then
+            echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+            # Re-apply ready for currently up instances after cold start.
+            for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+                if [ "$(get_instance_status "$_iid")" = "up" ]; then
+                    haproxy_set_server_state "$_iid" "ready" || true
+                elif [ "$(get_instance_status "$_iid")" = "draining" ]; then
+                    haproxy_set_server_state "$_iid" "drain" || true
+                else
+                    haproxy_set_server_state "$_iid" "maint" || true
+                fi
+            done
+            return 0
+        fi
+        return 1
+    fi
+
+    mv -f "$NEW_CFG" "$HAPROXY_CFG"
+    echo "==> [MicroWARP] 刷新 HAProxy 静态配置（server 列表/监听变化；健康实例标记: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
+
     if refresh_haproxy_pid; then
         if haproxy_try_soft_reload "$HAPROXY_CFG"; then
-            echo "==> [MicroWARP] HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}，健康: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
+            echo "==> [MicroWARP] HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}）"
+            # Admin states reset on full config replace — re-apply from status files.
+            for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+                case "$(get_instance_status "$_iid")" in
+                    up) haproxy_set_server_state "$_iid" "ready" || true ;;
+                    draining) haproxy_set_server_state "$_iid" "drain" || true ;;
+                    *) haproxy_set_server_state "$_iid" "maint" || true ;;
+                esac
+            done
             return 0
         fi
         echo "==> [MicroWARP] [WARN] HAProxy soft-reload 失败，尝试冷启动"
-        # Drop dead/broken master before cold start.
         if is_live_pid "$HAPROXY_PID"; then
             kill "$HAPROXY_PID" 2>/dev/null || true
             sleep 0.2 2>/dev/null || true
@@ -2339,6 +2446,13 @@ _reload_haproxy_from_status_unlocked() {
 
     if haproxy_cold_start "$HAPROXY_CFG"; then
         echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+        for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+            case "$(get_instance_status "$_iid")" in
+                up) haproxy_set_server_state "$_iid" "ready" || true ;;
+                draining) haproxy_set_server_state "$_iid" "drain" || true ;;
+                *) haproxy_set_server_state "$_iid" "maint" || true ;;
+            esac
+        done
         return 0
     fi
 

@@ -115,18 +115,19 @@ test_parse_endpoint_host_port() {
 
 test_haproxy_config_only_includes_healthy_servers() {
     local cfg
+    # All instances stay in cfg regardless of status; runtime drain/ready toggles traffic.
     cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:down 2:up 3:up 4:draining')
 
     assert_contains "$cfg" 'bind 0.0.0.0:1080' 'frontend bind'
     assert_contains "$cfg" 'mode tcp' 'tcp mode'
     assert_contains "$cfg" 'balance roundrobin' 'round robin'
+    assert_contains "$cfg" 'stats socket' 'runtime admin socket'
+    assert_contains "$cfg" 'server inst1 10.66.1.2:1080 check' 'down instance still listed'
     assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
     assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
-    assert_contains "$cfg" 'server inst4 10.66.4.2:1080 check' 'draining instance kept'
-    assert_contains "$cfg" 'inst4 10.66.4.2:1080 check inter 3s fall 2 rise 1 disabled' 'draining is disabled'
-
-    if [[ "$cfg" == *'server inst1 '* ]]; then
-        echo 'unhealthy instance 1 must not appear as an active server' >&2
+    assert_contains "$cfg" 'server inst4 10.66.4.2:1080 check' 'draining instance still listed'
+    if [[ "$cfg" == *' disabled'* ]]; then
+        echo 'config must not use disabled keyword anymore (use runtime drain)' >&2
         exit 1
     fi
 }
@@ -318,11 +319,12 @@ test_haproxy_config_only_includes_healthy_servers() {
     assert_contains "$cfg" 'master-worker' 'master-worker mode for stable soft-reload'
     assert_contains "$cfg" 'user root' 'explicit root to silence HAProxy 3 warn'
     assert_contains "$cfg" 'chroot /' 'explicit chroot to silence HAProxy 3 warn'
+    assert_contains "$cfg" 'stats socket' 'runtime admin socket for drain/ready'
+    assert_contains "$cfg" 'server inst1 10.66.1.2:1080 check' 'down instance stays in cfg'
     assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
     assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
-
-    if [[ "$cfg" == *'server inst1 '* ]]; then
-        echo 'unhealthy instance 1 must not appear as an active server' >&2
+    if [[ "$cfg" == *' disabled'* ]]; then
+        echo 'must not use config disabled; use runtime drain' >&2
         exit 1
     fi
 }
@@ -896,7 +898,7 @@ test_instance_drain_helpers() {
     assert_contains "$out" '排空超时' 'timeout forces stop path'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
 
-    # mark_instance_down / detach: soft drain only — must NOT wait/stop (non-blocking).
+    # mark_instance_down / detach: runtime drain only — must NOT wait/stop (non-blocking).
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR=$(mktemp -d)
     ORDER_LOG="$INSTANCE_STATE_DIR/order.log"
@@ -905,32 +907,40 @@ test_instance_drain_helpers() {
     record_instance_offline_since() { echo "offline" >> "$ORDER_LOG"; }
     clear_instance_online_since() { echo "clear_online" >> "$ORDER_LOG"; }
     reload_haproxy_from_status() { echo "reload" >> "$ORDER_LOG"; }
-    wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
+    haproxy_set_server_state() { echo "state:$2" >> "$ORDER_LOG"; return 0; }
+    wait_instance_drain() { echo "drain_wait" >> "$ORDER_LOG"; return 0; }
     stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
 
     mark_instance_down 7 >/dev/null 2>&1
     out=$(tr '\n' ' ' < "$ORDER_LOG")
-    assert_contains "$out" 'status:draining' 'soft-detach marks draining (keeps existing TCP)'
-    assert_contains "$out" 'reload' 'reloads LB'
-    # Note: "draining" contains the letters drain — check tokens, not bare substring.
-    if [[ "$out" == *' drain '* ]] || [[ "$out" == *stop_socks* ]]; then
-        echo "mark_instance_down must not drain/stop (would block callers): $out" >&2
+    assert_contains "$out" 'status:draining' 'marks draining'
+    assert_contains "$out" 'state:drain' 'runtime drain (no cfg rewrite)'
+    if [[ "$out" == *reload* ]]; then
+        echo "mark_instance_down must not reload when runtime drain works: $out" >&2
+        exit 1
+    fi
+    if [[ "$out" == *stop_socks* ]] || [[ "$out" == *drain_wait* ]]; then
+        echo "mark_instance_down must not drain-wait/stop: $out" >&2
         exit 1
     fi
 
-    # drain_and_stop (real): wait + stop socks + hard remove (down) + reload
+    # drain_and_stop (real): wait + stop socks + maint (no reload)
     : > "$ORDER_LOG"
     get_instance_status() { printf 'draining\n'; }
     drain_and_stop_instance_socks 7
     out=$(tr '\n' ' ' < "$ORDER_LOG")
-    assert_contains "$out" 'drain' 'background helper drains'
+    assert_contains "$out" 'drain_wait' 'background helper waits drain'
     assert_contains "$out" 'stop_socks' 'background helper stops socks'
-    assert_contains "$out" 'status:down' 'after drain, hard-remove from pool'
-    assert_contains "$out" 'reload' 'reloads after hard-remove'
+    assert_contains "$out" 'status:down' 'status down while restarting'
+    assert_contains "$out" 'state:maint' 'runtime maint while restarting'
+    if [[ "$out" == *reload* ]]; then
+        echo "drain_and_stop must not reload haproxy: $out" >&2
+        exit 1
+    fi
 
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
         reload_haproxy_from_status wait_instance_drain stop_instance_socks \
-        get_instance_status 2>/dev/null || true
+        get_instance_status haproxy_set_server_state 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
     INSTANCE_DRAIN_TIMEOUT=30

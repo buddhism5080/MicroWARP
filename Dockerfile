@@ -18,7 +18,7 @@ ENV TZ=Asia/Shanghai
 # 仅安装必要的内核级 WireGuard、网络控制与单容器多实例 LB 工具
 # haproxy: 统一 SOCKS 入口 + 仅转发健康实例
 # iproute2: netns / veth（多实例隔离）
-RUN apk add --no-cache wireguard-tools iptables iproute2 curl tzdata haproxy && \
+RUN apk add --no-cache wireguard-tools iptables iproute2 curl tzdata haproxy socat && \
     ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime && \
     echo "${TZ}" > /etc/timezone
 
