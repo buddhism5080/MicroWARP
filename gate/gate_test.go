@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestParseAndMatchRules(t *testing.T) {
@@ -102,4 +103,49 @@ func TestParseHTTPStatus(t *testing.T) {
 	if parseHTTPStatus("HTTP/2 200\r\n") != 200 {
 		t.Fatal()
 	}
+}
+
+func TestPickExcluding(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteHealthySnapshot(dir, []int{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	p := NewHealthPool(dir, time.Second)
+	ex := map[int]struct{}{1: {}, 2: {}}
+	id, ok := p.PickExcluding(ex)
+	if !ok || id != 3 {
+		t.Fatalf("got %d ok=%v", id, ok)
+	}
+	ex[3] = struct{}{}
+	if _, ok := p.PickExcluding(ex); ok {
+		t.Fatal("expected none")
+	}
+}
+
+func TestInotifyHealthRefresh(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteHealthySnapshot(dir, []int{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	p := NewHealthPool(dir, 5*time.Second) // slow poll — must not be what updates us
+	stop := make(chan struct{})
+	defer close(stop)
+	if !startInotify(p, stop) {
+		t.Skip("inotify not available")
+	}
+	// give watcher time to arm
+	time.Sleep(50 * time.Millisecond)
+
+	if err := WriteHealthySnapshot(dir, []int{7, 8, 9}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		list := p.List()
+		if len(list) == 3 && list[0] == 7 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("inotify did not refresh pool in time: %v", p.List())
 }

@@ -13,10 +13,11 @@ import (
 )
 
 // HealthPool keeps an in-memory snapshot of healthy instance IDs.
-// Hot path only reads memory; disk is polled on an interval or after gen bump.
+// Hot path only reads memory. Disk updates are observed via inotify (Linux)
+// with a slow poll fallback so a missed event cannot stick forever.
 type HealthPool struct {
 	dir      string
-	poll     time.Duration
+	poll     time.Duration // fallback poll; still used as safety net
 	mu       sync.RWMutex
 	healthy  []int
 	rr       uint64
@@ -25,12 +26,23 @@ type HealthPool struct {
 }
 
 func NewHealthPool(dir string, poll time.Duration) *HealthPool {
+	if poll < 50*time.Millisecond {
+		poll = 50 * time.Millisecond
+	}
+	// Fallback poll default was 500ms; keep caller's value but cap sanity.
 	p := &HealthPool{dir: dir, poll: poll}
 	p.refresh(true)
 	return p
 }
 
 func (p *HealthPool) Start(stop <-chan struct{}) {
+	// Prefer inotify; always keep a slow ticker as safety net.
+	if startInotify(p, stop) {
+		log.Printf("health pool: inotify watch on %s (fallback poll %s)", p.dir, p.poll)
+	} else {
+		log.Printf("health pool: inotify unavailable, poll every %s", p.poll)
+	}
+
 	t := time.NewTicker(p.poll)
 	defer t.Stop()
 	for {
@@ -90,7 +102,6 @@ func (p *HealthPool) loadIDs(gen string) []int {
 	var ids []int
 	for _, path := range matches {
 		base := filepath.Base(path)
-		// inst12.status
 		s := strings.TrimPrefix(base, "inst")
 		s = strings.TrimSuffix(s, ".status")
 		n, err := strconv.Atoi(s)
@@ -118,6 +129,28 @@ func (p *HealthPool) Pick() (int, bool) {
 	}
 	i := atomic.AddUint64(&p.rr, 1)
 	return p.healthy[int(i%uint64(n))], true
+}
+
+// PickExcluding RR-picks an id not in exclude. ok=false if none left.
+func (p *HealthPool) PickExcluding(exclude map[int]struct{}) (int, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := len(p.healthy)
+	if n == 0 {
+		return 0, false
+	}
+	// Try up to n distinct slots from RR cursor.
+	start := atomic.AddUint64(&p.rr, 1)
+	for k := 0; k < n; k++ {
+		id := p.healthy[int((start+uint64(k))%uint64(n))]
+		if exclude != nil {
+			if _, bad := exclude[id]; bad {
+				continue
+			}
+		}
+		return id, true
+	}
+	return 0, false
 }
 
 func (p *HealthPool) Len() int {
@@ -168,7 +201,6 @@ func RequestPunish(dir string, instID int, reason string) error {
 		return err
 	}
 	path := filepath.Join(qdir, strconv.Itoa(instID))
-	// Include reason for logs; content is free-form.
 	line := reason + "\n"
 	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
 		return err

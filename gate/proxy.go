@@ -73,20 +73,15 @@ func (g *Gate) handlePassthrough(client net.Conn, host string, port int) error {
 }
 
 // dialPassthroughUpstream prefers direct dial to a healthy inst (skip HAProxy hop).
-// Falls back to HAProxy RR SOCKS if direct is disabled or direct dials fail.
 func (g *Gate) dialPassthroughUpstream(host string, port int) (net.Conn, string, error) {
 	if g.cfg.PassDirect {
+		// Dial retries across distinct healthy insts. This is NOT copying HAProxy's
+		// connection redispatch 1:1; it covers stale-pool / dead SOCKS after kick.
 		tried := make(map[int]struct{}, 4)
 		for attempt := 0; attempt < 3; attempt++ {
-			id, ok := g.pool.Pick()
+			id, ok := g.pool.PickExcluding(tried)
 			if !ok {
 				break
-			}
-			if _, seen := tried[id]; seen {
-				if g.pool.Len() <= len(tried) {
-					break
-				}
-				continue
 			}
 			tried[id] = struct{}{}
 			c, err := g.dialViaInst(id, host, port)
@@ -141,11 +136,35 @@ func (g *Gate) dialViaInst(instID int, host string, port int) (net.Conn, error) 
 }
 
 func (g *Gate) handleMITM(client net.Conn, host string, port int) error {
-	instID, ok := g.pool.Pick()
-	if !ok {
+	// Pick + dial with short retries across distinct insts (dial failures only).
+	var (
+		instID int
+		rawUp  net.Conn
+		err    error
+	)
+	tried := make(map[int]struct{}, 4)
+	for attempt := 0; attempt < 3; attempt++ {
+		id, ok := g.pool.PickExcluding(tried)
+		if !ok {
+			break
+		}
+		tried[id] = struct{}{}
+		c, derr := g.dialViaInst(id, host, port)
+		if derr != nil {
+			continue
+		}
+		instID, rawUp, err = id, c, nil
+		break
+	}
+	if rawUp == nil {
 		_ = socksFail(client, socksRepFailure)
+		if err != nil {
+			return fmt.Errorf("no healthy instance dialable: %w", err)
+		}
 		return fmt.Errorf("no healthy instance")
 	}
+	defer rawUp.Close()
+
 	if err := socksOK(client); err != nil {
 		return err
 	}
@@ -162,12 +181,6 @@ func (g *Gate) handleMITM(client net.Conn, host string, port int) error {
 	if err := tlsClient.Handshake(); err != nil {
 		return fmt.Errorf("client tls: %w", err)
 	}
-
-	rawUp, err := g.dialViaInst(instID, host, port)
-	if err != nil {
-		return err
-	}
-	defer rawUp.Close()
 
 	tlsUp := tls.Client(rawUp, &tls.Config{
 		ServerName: host,
