@@ -423,30 +423,63 @@ print_instance_health_probe_start() {
 #   syn-sent / syn-recv — handshake in progress
 #   fin-wait-1/2, close-wait, last-ack, closing — teardown still holding a session
 # TIME-WAIT is intentionally excluded: pure post-close linger must not block rotation.
-# ss (iproute2) accepts comma-separated state lists.
-SS_BUSY_TCP_STATES='established,syn-sent,syn-recv,fin-wait-1,fin-wait-2,close-wait,last-ack,closing'
+#
+# CRITICAL: many ss builds (iproute2 on Alpine etc.) do NOT accept comma-separated
+# state lists — `ss state established,syn-sent` prints "wrong state name" yet still
+# exits 0 with empty output, which previously made every instance look idle and let
+# MAX_CONN_DURATION kill live sessions. Always query one state at a time.
+SS_BUSY_TCP_STATES='established syn-sent syn-recv fin-wait-1 fin-wait-2 close-wait last-ack closing'
 
 # Count non-idle TCP sockets matching an ss filter expression (e.g. "dst 10.66.1.2:1080").
+# Prints a non-negative integer. On ss unavailability / hard failure prints "unknown"
+# so callers can fail closed (do not treat as idle).
 count_busy_tcp_sockets() {
     local FILTER="$1"
-    local COUNT
+    local STATE TOTAL=0 N OUT RC ANY_OK=0
 
     if ! command -v ss >/dev/null 2>&1; then
-        printf '0\n'
+        printf 'unknown\n'
         return 0
     fi
 
-    COUNT=$(ss -Htn state "$SS_BUSY_TCP_STATES" "$FILTER" 2>/dev/null | wc -l | tr -d ' ')
-    case "$COUNT" in
-        ''|*[!0-9]*)
-            COUNT=0
-            ;;
-    esac
-    printf '%s\n' "$COUNT"
+    for STATE in $SS_BUSY_TCP_STATES; do
+        # Capture stderr: "wrong state name" must not be treated as zero busy.
+        OUT=$(ss -Htn state "$STATE" $FILTER 2>&1)
+        RC=$?
+        if [ "$RC" -ne 0 ]; then
+            # Some older ss reject individual states; skip unknown state names only.
+            case "$OUT" in
+                *'wrong state name'*|*'invalid'*|*'unknown'*)
+                    continue
+                    ;;
+            esac
+            printf 'unknown\n'
+            return 0
+        fi
+        case "$OUT" in
+            *'wrong state name'*)
+                # ss may exit 0 while rejecting the state — never count as idle.
+                continue
+                ;;
+        esac
+        ANY_OK=1
+        N=$(printf '%s\n' "$OUT" | sed '/^$/d' | wc -l | tr -d ' ')
+        case "$N" in
+            ''|*[!0-9]*) N=0 ;;
+        esac
+        TOTAL=$((TOTAL + N))
+    done
+
+    if [ "$ANY_OK" -eq 0 ]; then
+        printf 'unknown\n'
+        return 0
+    fi
+    printf '%s\n' "$TOTAL"
 }
 
 # True (0) if no busy TCP clients to this instance's backend SOCKS endpoint.
 # HAProxy talks to 10.66.<id>.2:1080 from the host netns; ss (iproute2) is available.
+# Fail CLOSED: unknown/error ⇒ not idle (refuse MAX_CONN rotation).
 is_instance_idle() {
     local INST_ID="$1"
     local COUNT
@@ -457,6 +490,12 @@ is_instance_idle() {
     fi
 
     COUNT=$(count_instance_busy_clients "$INST_ID")
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无法可靠统计 busy 连接（${COUNT:-?}），视为非空闲"
+            return 1
+            ;;
+    esac
     [ "$COUNT" -eq 0 ]
 }
 
@@ -477,6 +516,7 @@ count_instance_busy_clients() {
     local NS_IP
 
     NS_IP=$(get_instance_ns_ip "$INST_ID")
+    # FILTER must be separate ss tokens: dst host:port
     count_busy_tcp_sockets "dst ${NS_IP}:1080"
 }
 
@@ -498,17 +538,28 @@ wait_instance_drain() {
     fi
 
     COUNT=$(count_instance_busy_clients "$INST_ID")
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
+            COUNT=-1
+            ;;
+    esac
     if [ "$COUNT" -eq 0 ]; then
         echo "==> [MicroWARP] [inst${INST_ID}] 已无 busy 连接，可以停服务"
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 已踢出 LB，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+    if [ "$COUNT" -gt 0 ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+    fi
     SLEPT=0
     while true; do
         sleep 1
         SLEPT=$((SLEPT + 1))
         COUNT=$(count_instance_busy_clients "$INST_ID")
+        case "$COUNT" in
+            ''|*[!0-9]*) COUNT=-1 ;;
+        esac
         if [ "$COUNT" -eq 0 ]; then
             echo "==> [MicroWARP] [inst${INST_ID}] 连接已排空（等待 ${SLEPT}s），准备停服务"
             return 0
@@ -524,11 +575,17 @@ wait_instance_drain() {
     done
 }
 
-# After LB kick: wait for idle (or timeout), then stop internal SOCKS.
+# After soft-detach (drain): wait for idle (or timeout), then stop internal SOCKS,
+# then hard-remove from HAProxy config.
 drain_and_stop_instance_socks() {
     local INST_ID="$1"
     wait_instance_drain "$INST_ID" || true
     stop_instance_socks "$INST_ID"
+    # Server was "draining/disabled"; now drop it fully so checks stop hitting a dead SOCKS.
+    if [ "$(get_instance_status "$INST_ID")" = "draining" ] || [ "$(get_instance_status "$INST_ID")" = "down" ]; then
+        set_instance_status "$INST_ID" "down"
+        reload_haproxy_from_status || true
+    fi
 }
 
 # True (0) when healthy instances are strictly less than half of WARP_INSTANCE_COUNT.
@@ -605,7 +662,7 @@ instance_should_force_rotate_for_max_conn() {
         return 1
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，强制下线并重连以刷新连接"
+    echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且当前空闲，准备强制下线并重连以刷新连接"
     return 0
 }
 
@@ -969,9 +1026,21 @@ EOF
         [ -n "$ITEM" ] || continue
         _sid=${ITEM%%:*}
         _sstatus=${ITEM#*:}
-        [ "$_sstatus" = "up" ] || continue
         ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+        case "$_sstatus" in
+            up)
+                # Accept new + existing connections.
+                printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+                ;;
+            draining)
+                # Keep server in config but disabled: no NEW conns; existing TCP preserved
+                # across soft-reload (unlike deleting the server line, which kills sessions).
+                printf '    server inst%s %s check inter 3s fall 2 rise 1 disabled\n' "$_sid" "$ENDPOINT"
+                ;;
+            *)
+                # down / unknown: omit — fully out of pool
+                ;;
+        esac
     done
     IFS=$OLD_IFS
 }
@@ -2388,21 +2457,33 @@ mark_instance_up() {
     echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康并加入负载均衡池"
 }
 
-# Fast path only: mark down + soft-reload HAProxy. Does NOT drain or stop SOCKS.
-# Safe to call from the multi-instance monitor / request paths — must not block.
+# Soft-detach: mark draining + reload with server "disabled".
+# New connections stop; existing TCP on this backend is preserved until drain/stop SOCKS.
+# Does NOT stop SOCKS. Safe/fast for monitor path.
 detach_instance_from_lb() {
+    local INST_ID="$1"
+
+    set_instance_status "$INST_ID" "draining"
+    record_instance_offline_since "$INST_ID"
+    clear_instance_online_since "$INST_ID"
+    echo "==> [MicroWARP] [inst${INST_ID}] ⏸️ 进入 drain（HAProxy disabled）：停新连接，保留已有 TCP；排空/停 SOCKS 由后台进行"
+    reload_haproxy_from_status
+}
+
+# Hard-remove from pool (no server line). Prefer after drain+stop SOCKS.
+hard_detach_instance_from_lb() {
     local INST_ID="$1"
 
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
     refresh_healthy_snapshot
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池剔除（SOCKS 暂保留，排空由后台进行）"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 已从负载均衡池彻底移除"
     reload_haproxy_from_status
 }
 
-# Back-compat name: historically stopped SOCKS immediately. Now only detaches from LB.
-# Drain + stop SOCKS happen in instance_recovery_worker so other tasks are never blocked.
+# Back-compat name: soft-detach (drain) only.
+# Drain + stop SOCKS + hard remove happen in instance_recovery_worker.
 mark_instance_down() {
     detach_instance_from_lb "$1"
 }
@@ -2841,17 +2922,24 @@ probe_instance_and_schedule_recovery() {
                     ;;
             esac
         fi
-        # Max continuous uptime rotation: same recovery path as health-check failure
-        # (kick LB → drain → stop SOCKS → WG reconnect → re-register if needed).
+        # Max continuous uptime rotation: only when truly idle (per-state ss count).
+        # Soft-detach (disabled) first so any race connection is not hard-killed by
+        # deleting the server line; worker then drains → stop SOCKS → hard remove.
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then
-            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期且空闲 → 按巡检失败相同路径强制下线重连"
+            # Re-check idle immediately before detach (close the probe→detach race).
+            if ! is_instance_idle "$INST_ID"; then
+                echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN 二次确认：已出现 busy，取消本轮强制轮转"
+                return 0
+            fi
+            BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
+            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期且空闲(busy=${BUSY_NOW}) → soft-drain 后重连"
             request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → 立刻踢出 LB，并交给后台 worker 自行复活"
+    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → soft-drain 停新连接，后台排空后复活"
     request_instance_recovery "$INST_ID"
     return 0
 }

@@ -115,13 +115,15 @@ test_parse_endpoint_host_port() {
 
 test_haproxy_config_only_includes_healthy_servers() {
     local cfg
-    cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:down 2:up 3:up')
+    cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:down 2:up 3:up 4:draining')
 
     assert_contains "$cfg" 'bind 0.0.0.0:1080' 'frontend bind'
     assert_contains "$cfg" 'mode tcp' 'tcp mode'
     assert_contains "$cfg" 'balance roundrobin' 'round robin'
     assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
     assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
+    assert_contains "$cfg" 'server inst4 10.66.4.2:1080 check' 'draining instance kept'
+    assert_contains "$cfg" 'inst4 10.66.4.2:1080 check inter 3s fall 2 rise 1 disabled' 'draining is disabled'
 
     if [[ "$cfg" == *'server inst1 '* ]]; then
         echo 'unhealthy instance 1 must not appear as an active server' >&2
@@ -909,18 +911,25 @@ test_instance_drain_helpers() {
 
     mark_instance_down 7 >/dev/null 2>&1
     out=$(tr '\n' ' ' < "$ORDER_LOG")
-    assert_contains "$out" 'status:down' 'marks down'
+    assert_contains "$out" 'status:draining' 'soft-detach marks draining (keeps existing TCP)'
     assert_contains "$out" 'reload' 'reloads LB'
     if [[ "$out" == *drain* ]] || [[ "$out" == *stop_socks* ]]; then
         echo "mark_instance_down must not drain/stop (would block callers): $out" >&2
         exit 1
     fi
 
-    # drain_and_stop stays the blocking helper used only in background workers.
+    # drain_and_stop: wait + stop socks + hard remove (down) + reload
     : > "$ORDER_LOG"
+    unset -f drain_and_stop_instance_socks 2>/dev/null || true
+    # Use real drain_and_stop with mocked primitives
+    wait_instance_drain() { echo "drain" >> "$ORDER_LOG"; return 0; }
+    stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
     drain_and_stop_instance_socks 7
     out=$(tr '\n' ' ' < "$ORDER_LOG")
-    assert_contains "$out" 'drain_and_stop' 'background helper still drains'
+    assert_contains "$out" 'drain' 'background helper drains'
+    assert_contains "$out" 'stop_socks' 'background helper stops socks'
+    assert_contains "$out" 'status:down' 'after drain, hard-remove from pool'
+    assert_contains "$out" 'reload' 'reloads after hard-remove'
 
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
         reload_haproxy_from_status wait_instance_drain stop_instance_socks \
