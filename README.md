@@ -106,7 +106,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WARP_INSTANCES=1 # Number of in-container WARP tunnels (default 1, max 100). >1 enables single-port HAProxy LB over healthy instances only
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
       - MAX_CONN_DURATION=0 # Multi-instance only: max continuous healthy uptime (seconds) per backend; when exceeded AND ready/up pool ≥ half, force offline + reconnect even if busy (default 0=disable; single-instance never rotates; skips when ready < half)
-      - INSTANCE_DRAIN_TIMEOUT= # Multi-instance: after LB kick, max seconds to wait for busy sockets before stopping SOCKS (unset/empty=wait forever until idle; 0=stop immediately; N=force after N seconds)
+      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -228,7 +228,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WARP_INSTANCES=1 # 单容器内并行 WARP 隧道数量（默认 1，最大 100）。>1 时只暴露一个 SOCKS 端口，经 HAProxy 只负载到健康实例
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
       - MAX_CONN_DURATION=0 # 仅多实例：每个后端最长连续健康在线秒数；超时且 ready 实例不少于一半时进入 drain 后重连（可有 busy；默认 0=关闭；单实例永不因本策略下线；ready 不足一半则跳过）
-      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）
+      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
