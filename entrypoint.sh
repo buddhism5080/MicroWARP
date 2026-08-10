@@ -2112,10 +2112,22 @@ promote_primary() {
     return 0
 }
 
+# Publish rotate result for admin HTTP helper ASAP (atomic), independent of stdout pipes.
+publish_rotate_result_line() {
+    local LINE="$1"
+    local RES TMP
+    RES="${INSTANCE_STATE_DIR}/admin.rotate.res"
+    TMP="${RES}.pub.$$"
+    mkdir -p "$INSTANCE_STATE_DIR"
+    printf '%s\n' "$LINE" > "$TMP"
+    mv -f "$TMP" "$RES"
+}
+
 # Prints: OK to=N | ERR no_candidate | ERR in_progress
 request_primary_rotate() {
     local OLD NEW
     if ! acquire_rotate_lock; then
+        publish_rotate_result_line 'ERR in_progress'
         printf 'ERR in_progress\n'
         return 1
     fi
@@ -2123,25 +2135,26 @@ request_primary_rotate() {
     OLD=$(get_primary_id)
     NEW=$(find_latest_healthy_standby)
     if [ -z "$NEW" ]; then
-        release_rotate_lock
+        release_rotate_lock || true
+        publish_rotate_result_line 'ERR no_candidate'
         printf 'ERR no_candidate\n'
         return 1
     fi
 
     if ! promote_primary "$NEW"; then
-        release_rotate_lock
+        release_rotate_lock || true
+        publish_rotate_result_line 'ERR no_candidate'
         printf 'ERR no_candidate\n'
         return 1
     fi
 
-    # Publish API result BEFORE old-primary recovery.
-    # Recovery may sync-detach from LB and exceed helper's wait window if done first.
+    # Unlock + publish HTTP result IMMEDIATELY after promote (atomic file).
+    # Do not wait on recovery/detach; helper races the result file, not stdout.
     release_rotate_lock || true
+    publish_rotate_result_line "OK to=${NEW}"
     printf 'OK to=%s\n' "$NEW"
 
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        # force_rotate → WG reconnect in fully detached background (no API wait).
-        # Outer subshell: detach_instance_from_lb inside recovery must not block HTTP.
         ( request_instance_recovery "$OLD" "force_rotate" || true ) >/dev/null 2>&1 &
     fi
     return 0
@@ -2295,36 +2308,10 @@ admin_cmd_worker() {
             rm -f "$STATUS_FILE"
         fi
         if [ -f "$REQ_FILE" ]; then
-            # Publish the FIRST stdout line as soon as it appears (OK/ERR),
-            # without waiting for the rest of request_primary_rotate to finish.
-            # Previously: full-function redirect then mv → helper timed out while
-            # post-promote recovery/detach still ran.
-            TMP="${RES_FILE}.tmp.$$"
-            rm -f "$TMP" "$RES_FILE"
-            # Use a pipe so we can mv on first line; drain the rest so writer never blocks.
-            # shellcheck disable=SC2094
-            {
-                request_primary_rotate 2>/dev/null
-                printf '\n'
-            } | {
-                if IFS= read -r LINE; then
-                    # strip CR; ignore pure empty first read if any
-                    LINE=$(printf '%s' "$LINE" | tr -d '\r')
-                    if [ -z "$LINE" ]; then
-                        IFS= read -r LINE || true
-                        LINE=$(printf '%s' "$LINE" | tr -d '\r')
-                    fi
-                    if [ -n "$LINE" ]; then
-                        printf '%s\n' "$LINE" > "$TMP"
-                    else
-                        printf 'ERR rotate_failed\n' > "$TMP"
-                    fi
-                else
-                    printf 'ERR rotate_failed\n' > "$TMP"
-                fi
-                mv -f "$TMP" "$RES_FILE"
-                cat >/dev/null 2>&1 || true
-            }
+            # Result file is published atomically inside request_primary_rotate
+            # (publish_rotate_result_line) as soon as promote succeeds/fails.
+            # Do not gate HTTP on this process finishing recovery.
+            request_primary_rotate >/dev/null 2>&1 || true
             rm -f "$REQ_FILE"
         fi
         sleep 0.1
