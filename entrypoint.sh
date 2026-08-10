@@ -692,10 +692,13 @@ count_instances_with_status() {
     printf '%s\n' "$N"
 }
 
-# Best-effort sum of busy client sockets across all instances.
-sum_all_busy_clients() {
-    local _id C TOTAL=0
+# Busy sockets are only meaningful while draining (wait_instance_drain).
+# Do NOT ss-scan every instance on the monitor tick — wasteful for up/standby.
+sum_draining_busy_clients() {
+    local _id ST C TOTAL=0
     for _id in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
+        ST=$(get_instance_status "$_id")
+        [ "$ST" = "draining" ] || continue
         C=$(count_instance_busy_clients "$_id" 2>/dev/null || printf '0')
         case "$C" in
             ''|*[!0-9]*) continue ;;
@@ -705,16 +708,30 @@ sum_all_busy_clients() {
     printf '%s\n' "$TOTAL"
 }
 
+# Back-compat alias (callers that still say "all" only get draining busy).
+sum_all_busy_clients() {
+    sum_draining_busy_clients
+}
+
 # One-line fleet health: 健康 9/10，后台复活中 1
+# busy only reported when someone is draining (else omit / show -).
 print_health_summary() {
-    local TOTAL HEALTHY RECOVERING DRAINING DOWN BUSY
+    local TOTAL HEALTHY RECOVERING DRAINING DOWN BUSY EXTRA
     TOTAL=${WARP_INSTANCE_COUNT:-1}
     HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
     RECOVERING=$(count_instances_recovering 2>/dev/null || printf '0')
     DRAINING=$(count_instances_with_status draining 2>/dev/null || printf '0')
     DOWN=$(count_instances_with_status down 2>/dev/null || printf '0')
-    BUSY=$(sum_all_busy_clients 2>/dev/null || printf '0')
-    echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（draining ${DRAINING}，down ${DOWN}，busy总=${BUSY}）"
+    EXTRA="draining ${DRAINING}，down ${DOWN}"
+    case "$DRAINING" in
+        ''|0)
+            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}）"
+            ;;
+        *)
+            BUSY=$(sum_draining_busy_clients 2>/dev/null || printf '0')
+            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中busy=${BUSY}）"
+            ;;
+    esac
 }
 
 
@@ -3548,10 +3565,14 @@ probe_instance_and_schedule_recovery() {
 
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then
-        # Show recovery progress snapshot for this inst (busy + phase if draining).
+        # Only count busy while draining; other phases skip ss scan.
         _st=$(get_instance_status "$INST_ID")
-        _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-        echo "==> [inst${INST_ID}] 后台复活进行中（status=${_st}，busy=${_busy}），本轮巡检跳过重活"
+        if [ "$_st" = "draining" ]; then
+            _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
+            echo "==> [inst${INST_ID}] 后台复活进行中（排空中 busy=${_busy}），本轮巡检跳过重活"
+        else
+            echo "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
+        fi
         return 0
     fi
 
@@ -3622,20 +3643,20 @@ multi_periodic_monitor() {
 
             # Fleet one-liner after each probe (健康 N/M + 复活/排空/busy)
             print_health_summary
-            # Per recovering inst: phase + busy + waited if we can infer draining
+            # Per recovering inst: only ss-count busy while draining
             for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
                 if is_instance_recovering "$X"; then
                     _st=$(get_instance_status "$X")
-                    _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
                     case "$_st" in
                         draining)
+                            _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
                             echo "==> [inst${X}] 复活进度: 排空中 status=draining busy=${_busy}"
                             ;;
                         down)
-                            echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down busy=${_busy}"
+                            echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down"
                             ;;
                         *)
-                            echo "==> [inst${X}] 复活进度: 进行中 status=${_st} busy=${_busy}"
+                            echo "==> [inst${X}] 复活进度: 进行中 status=${_st}"
                             ;;
                     esac
                 fi
