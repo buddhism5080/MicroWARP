@@ -1172,4 +1172,54 @@ test_probe_disables_max_conn_on_this_branch() {
     fi
 }
 
+test_admin_hmac_timestamp_window() {
+    local SECRET='test-secret' TS SIG PAYLOAD NOW
+    ADMIN_HTTP_HMAC_SKEW_SECONDS=120
+    assert_eq "$(get_admin_hmac_skew_seconds)" '120' 'default skew 120s'
+
+    NOW=$(date +%s)
+    TS=$NOW
+    PAYLOAD=$(admin_hmac_sign_payload 'POST' '/rotate' "$TS")
+    SIG=$(admin_hmac_hex "$SECRET" "$PAYLOAD")
+    if ! admin_hmac_verify "$SECRET" 'POST' '/rotate' "$TS" "$SIG"; then
+        echo 'fresh timestamp+hmac must verify' >&2
+        exit 1
+    fi
+
+    # expired: 3 minutes ago
+    TS=$((NOW - 181))
+    PAYLOAD=$(admin_hmac_sign_payload 'POST' '/rotate' "$TS")
+    SIG=$(admin_hmac_hex "$SECRET" "$PAYLOAD")
+    if admin_hmac_verify "$SECRET" 'POST' '/rotate' "$TS" "$SIG"; then
+        echo 'timestamp older than ±120s must fail' >&2
+        exit 1
+    fi
+
+    # future beyond window
+    TS=$((NOW + 181))
+    PAYLOAD=$(admin_hmac_sign_payload 'GET' '/status' "$TS")
+    SIG=$(admin_hmac_hex "$SECRET" "$PAYLOAD")
+    if admin_hmac_verify "$SECRET" 'GET' '/status' "$TS" "$SIG"; then
+        echo 'future timestamp beyond ±120s must fail' >&2
+        exit 1
+    fi
+
+    # wrong signature
+    TS=$NOW
+    if admin_hmac_verify "$SECRET" 'POST' '/rotate' "$TS" 'deadbeef'; then
+        echo 'bad signature must fail' >&2
+        exit 1
+    fi
+
+    # within window boundary-ish (60s ago ok)
+    TS=$((NOW - 60))
+    PAYLOAD=$(admin_hmac_sign_payload 'GET' '/status' "$TS")
+    SIG=$(admin_hmac_hex "$SECRET" "$PAYLOAD")
+    if ! admin_hmac_verify "$SECRET" 'GET' '/status' "$TS" "$SIG"; then
+        echo '60s skew must still pass with default 120' >&2
+        exit 1
+    fi
+}
+
+test_admin_hmac_timestamp_window
 printf 'PASS test_multi_instance_helpers\n'

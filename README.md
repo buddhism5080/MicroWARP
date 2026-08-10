@@ -289,17 +289,35 @@ nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2
 | 选人 | `last_healthy_at` 最新 + 非 primary、非 recovering（并列更小 id） |
 | 旧主 | drain → 排空 → **至少 WG 重连**（禁止「只拉 SOCKS」）→ 回来仍 standby drain |
 | 实例数 | floor **N=2**（空/非法/`<2` → 2） |
-| Admin HTTP | **写死 `0.0.0.0:9180`**（宿主机 `-p 9180:9180`）；仅 `ADMIN_HTTP_TOKEN`（空=不启） |
+| Admin HTTP | **写死 `0.0.0.0:9180`**（宿主机 `-p 9180:9180`）；`ADMIN_HTTP_TOKEN`=HMAC secret（空=不启） |
+| Admin 鉴权 | **HTTP + HMAC-SHA256 + 时间戳**；`|now-ts| ≤ 120s`（`ADMIN_HTTP_HMAC_SKEW_SECONDS`，默认 120） |
 | API | `POST /rotate` 只回答是否切到新实例：`{"ok":true,"primary":N}` / `OK to=N`（不暴露旧主后续） |
+
+### Admin 鉴权约定
+
+- **Secret**：环境变量 `ADMIN_HTTP_TOKEN`（空则不启 admin HTTP）
+- **签名串**：`METHOD + "\n" + PATH + "\n" + TIMESTAMP`  
+  例：`POST\n/rotate\n1712345678`
+- **算法**：`HMAC-SHA256(secret, 签名串)` → 小写 hex
+- **Header**（推荐）：
+  - `X-Timestamp: <unix epoch 秒>`
+  - `X-Signature: <hex>`
+- 也支持：`Authorization: HMAC-SHA256 ts=<epoch>,sig=<hex>`，或 query `?ts=&sig=`
+- **时间窗**：默认前后 **2 分钟**（120s）；超时/签名错 → `401 invalid_signature_or_timestamp`
+- **说明**：明文 HTTP 上 HMAC+时间戳可防伪造与简单重放（过期后失效），**不能**防同窗内重放或窃听；需要更强请再加 TLS/反代。
 
 ### 部署后 curl 验证
 
 ```bash
-# 状态（运维）
-curl -s -H "Authorization: Bearer $ADMIN_HTTP_TOKEN" http://127.0.0.1:9180/status
+SECRET='your-hmac-secret'   # = ADMIN_HTTP_TOKEN
+TS=$(date +%s)
+SIG=$(printf 'GET\n/status\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -s -H "X-Timestamp: $TS" -H "X-Signature: $SIG" http://127.0.0.1:9180/status
 
-# 手动切主
-curl -s -X POST -H "Authorization: Bearer $ADMIN_HTTP_TOKEN" http://127.0.0.1:9180/rotate
+TS=$(date +%s)
+SIG=$(printf 'POST\n/rotate\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" http://127.0.0.1:9180/rotate
 # 成功示例: {"ok":true,"primary":2}
 # 无候选 / 进行中: {"ok":false,"error":"no_candidate"|"in_progress"}
+# 鉴权失败: {"ok":false,"error":"invalid_signature_or_timestamp"}
 ```

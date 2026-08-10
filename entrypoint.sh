@@ -41,8 +41,11 @@ MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # Unset/empty = wait indefinitely until idle (IM-friendly; no force-kill on timeout).
 # 0 = stop SOCKS immediately. Positive N = max wait seconds then force stop.
 INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
-# Admin HTTP: bind fixed 0.0.0.0:9180 (host maps port). Empty token disables server.
+# Admin HTTP: bind fixed 0.0.0.0:9180 (host maps port).
+# ADMIN_HTTP_TOKEN = HMAC secret (empty disables server).
+# Auth: HMAC-SHA256(secret, METHOD\nPATH\nts) + timestamp within ±120s (skew env).
 ADMIN_HTTP_TOKEN="${ADMIN_HTTP_TOKEN:-}"
+ADMIN_HTTP_HMAC_SKEW_SECONDS="${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -2146,6 +2149,65 @@ failover_primary_on_health_fail() {
     return 0
 }
 
+# ---- Admin HMAC helpers (HTTP + HMAC-SHA256 + timestamp, skew default ±120s) ----
+# Sign payload: METHOD + "\n" + PATH + "\n" + TIMESTAMP
+# Headers: X-Timestamp / X-Signature  (also Authorization: HMAC-SHA256 ts=..,sig=..)
+
+get_admin_hmac_skew_seconds() {
+    RAW=${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}
+    case "$RAW" in
+        ''|*[!0-9]*)
+            printf '120\n'
+            return 0
+            ;;
+    esac
+    printf '%s\n' "$RAW"
+}
+
+admin_hmac_sign_payload() {
+    # $1=METHOD $2=PATH $3=TIMESTAMP
+    printf '%s\n%s\n%s' "$1" "$2" "$3"
+}
+
+admin_hmac_hex() {
+    # $1=secret $2=payload  → lowercase hex digest
+    local SECRET="$1" PAYLOAD="$2" OUT
+    if ! command -v openssl >/dev/null 2>&1; then
+        printf ''
+        return 1
+    fi
+    OUT=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" 2>/dev/null | awk '{print $NF}')
+    printf '%s' "$OUT" | tr 'A-F' 'a-f'
+}
+
+admin_hmac_verify() {
+    # $1=secret $2=method $3=path $4=timestamp $5=signature
+    # return 0 if valid within skew window
+    local SECRET="$1" METHOD="$2" RPATH="$3" TS="$4" SIG="$5"
+    local NOW SKEW DELTA EXPECT PAYLOAD
+    case "$TS" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$SIG" in
+        '') return 1 ;;
+    esac
+    [ -n "$SECRET" ] || return 1
+    NOW=$(date +%s)
+    SKEW=$(get_admin_hmac_skew_seconds)
+    DELTA=$((NOW - TS))
+    if [ "$DELTA" -lt 0 ]; then
+        DELTA=$((0 - DELTA))
+    fi
+    if [ "$DELTA" -gt "$SKEW" ]; then
+        return 1
+    fi
+    PAYLOAD=$(admin_hmac_sign_payload "$METHOD" "$RPATH" "$TS")
+    EXPECT=$(admin_hmac_hex "$SECRET" "$PAYLOAD")
+    [ -n "$EXPECT" ] || return 1
+    SIG=$(printf '%s' "$SIG" | tr 'A-F' 'a-f' | tr -d ' \t\r\n')
+    [ "$SIG" = "$EXPECT" ]
+}
+
 stop_admin_http_server() {
     local PID_FILE PID WORKER
     PID_FILE=$(get_admin_http_pid_file)
@@ -2227,12 +2289,52 @@ admin_http_loop() {
     mkdir -p "$INSTANCE_STATE_DIR"
     cat > "$HELPER" <<'HELPER_EOF'
 #!/bin/sh
+# Admin HTTP auth: HMAC-SHA256 + timestamp (± skew seconds, default 120).
+# Payload: METHOD + "\n" + PATH + "\n" + TIMESTAMP
+# Headers: X-Timestamp, X-Signature
+# Or: Authorization: HMAC-SHA256 ts=<epoch>,sig=<hex>
 STATE_DIR="${INSTANCE_STATE_DIR:-/var/run/microwarp}"
-TOKEN_EXPECT="${ADMIN_HTTP_TOKEN:-}"
+SECRET="${ADMIN_HTTP_TOKEN:-}"
+SKEW="${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}"
 REQ_FILE="${STATE_DIR}/admin.rotate.req"
 RES_FILE="${STATE_DIR}/admin.rotate.res"
 STATUS_FILE="${STATE_DIR}/admin.status.req"
 STATUS_RES="${STATE_DIR}/admin.status.res"
+
+hmac_hex() {
+    printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f'
+}
+
+verify_hmac_ts() {
+    METHOD="$1"
+    RPATH="$2"
+    TS="$3"
+    SIG="$4"
+    case "$TS" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$SIG" in
+        '') return 1 ;;
+    esac
+    [ -n "$SECRET" ] || return 1
+    case "$SKEW" in
+        ''|*[!0-9]*) SKEW=120 ;;
+    esac
+    NOW=$(date +%s)
+    DELTA=$((NOW - TS))
+    if [ "$DELTA" -lt 0 ]; then
+        DELTA=$((0 - DELTA))
+    fi
+    if [ "$DELTA" -gt "$SKEW" ]; then
+        return 1
+    fi
+    # Keep payload formula inlined: helper process has no entrypoint functions.
+    PAYLOAD=$(printf '%s\n%s\n%s' "$METHOD" "$RPATH" "$TS")
+    EXPECT=$(hmac_hex "$SECRET" "$PAYLOAD")
+    [ -n "$EXPECT" ] || return 1
+    SIG=$(printf '%s' "$SIG" | tr 'A-F' 'a-f' | tr -d ' \t\r\n')
+    [ "$SIG" = "$EXPECT" ]
+}
 
 read_request() {
     LINE=""
@@ -2241,23 +2343,40 @@ read_request() {
     METHOD=$(printf '%s' "$LINE" | cut -d' ' -f1)
     PATHQ=$(printf '%s' "$LINE" | cut -d' ' -f2)
     PATH=$(printf '%s' "$PATHQ" | cut -d'?' -f1)
-    TOKEN=""
+    TS=""
+    SIG=""
     while IFS= read -r H; do
         H=$(printf '%s' "$H" | tr -d '\r')
         [ -z "$H" ] && break
         case "$H" in
-            [Aa]uthorization:*[Bb]earer*)
-                TOKEN=$(printf '%s' "$H" | sed -n 's/.*[Bb]earer  *//p' | tr -d ' \t')
+            [Xx]-[Tt]imestamp:*)
+                TS=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
                 ;;
-            [Xx]-[Aa]dmin-[Tt]oken:*)
-                TOKEN=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
+            [Xx]-[Ss]ignature:*)
+                SIG=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
+                ;;
+            [Aa]uthorization:*[Hh][Mm][Aa][Cc]*)
+                AUTH=$(printf '%s' "$H" | cut -d: -f2- | sed 's/^ *//')
+                case "$AUTH" in
+                    [Hh][Mm][Aa][Cc]*)
+                        TS=$(printf '%s' "$AUTH" | sed -n 's/.*[Tt][Ss]=\([^, ]*\).*/\1/p')
+                        SIG=$(printf '%s' "$AUTH" | sed -n 's/.*[Ss][Ii][Gg]=\([^, ]*\).*/\1/p')
+                        ;;
+                esac
                 ;;
         esac
     done
     case "$PATHQ" in
-        *token=*)
-            if [ -z "$TOKEN" ]; then
-                TOKEN=$(printf '%s' "$PATHQ" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')
+        *ts=*)
+            if [ -z "$TS" ]; then
+                TS=$(printf '%s' "$PATHQ" | sed -n 's/.*[?&]ts=\([^&]*\).*/\1/p')
+            fi
+            ;;
+    esac
+    case "$PATHQ" in
+        *sig=*)
+            if [ -z "$SIG" ]; then
+                SIG=$(printf '%s' "$PATHQ" | sed -n 's/.*[?&]sig=\([^&]*\).*/\1/p')
             fi
             ;;
     esac
@@ -2273,8 +2392,16 @@ respond() {
 
 read_request || { respond '400 Bad Request' '{"ok":false,"error":"bad_request"}'; exit 0; }
 
-if [ -z "$TOKEN_EXPECT" ] || [ -z "$TOKEN" ] || [ "$TOKEN" != "$TOKEN_EXPECT" ]; then
+if [ -z "$SECRET" ]; then
     respond '401 Unauthorized' '{"ok":false,"error":"unauthorized"}'
+    exit 0
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+    respond '500 Internal Server Error' '{"ok":false,"error":"openssl_missing"}'
+    exit 0
+fi
+if ! verify_hmac_ts "$METHOD" "$PATH" "$TS" "$SIG"; then
+    respond '401 Unauthorized' '{"ok":false,"error":"invalid_signature_or_timestamp"}'
     exit 0
 fi
 
@@ -2333,7 +2460,7 @@ case "$METHOD $PATH" in
 esac
 HELPER_EOF
     chmod +x "$HELPER"
-    export INSTANCE_STATE_DIR ADMIN_HTTP_TOKEN
+    export INSTANCE_STATE_DIR ADMIN_HTTP_TOKEN ADMIN_HTTP_HMAC_SKEW_SECONDS
     admin_cmd_worker &
     printf '%s\n' "$!" > "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid"
     # Fixed bind: 0.0.0.0:9180 — host does -p 9180:9180
@@ -2345,25 +2472,28 @@ HELPER_EOF
 }
 
 start_admin_http_server() {
-    local PID
+    local PID SKEW
     if [ -z "${ADMIN_HTTP_TOKEN:-}" ]; then
-        echo "==> [MicroWARP] admin HTTP 禁用（ADMIN_HTTP_TOKEN 为空；固定监听本应是 0.0.0.0:9180）"
+        echo "==> [MicroWARP] admin HTTP 禁用（ADMIN_HTTP_TOKEN/HMAC secret 为空；固定监听本应是 0.0.0.0:9180）"
         return 0
     fi
     if ! command -v socat >/dev/null 2>&1; then
         echo "==> [MicroWARP] [WARN] 无 socat，无法启动 admin HTTP"
         return 0
     fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "==> [MicroWARP] [WARN] 无 openssl，无法做 HMAC 鉴权，admin HTTP 不启动"
+        return 0
+    fi
     stop_admin_http_server || true
-    echo "==> [MicroWARP] 启动 admin HTTP: 0.0.0.0:9180 (token 鉴权；宿主机映射此端口)"
+    SKEW=$(get_admin_hmac_skew_seconds)
+    echo "==> [MicroWARP] 启动 admin HTTP: 0.0.0.0:9180 (HMAC-SHA256+时间戳，容差±${SKEW}s；宿主机映射此端口)"
     mkdir -p "$INSTANCE_STATE_DIR"
     admin_http_loop &
     PID=$!
     printf '%s\n' "$PID" > "$(get_admin_http_pid_file)"
     echo "==> [MicroWARP] admin HTTP PID ${PID}"
 }
-
-
 enable_host_forwarding() {
     if [ -w /proc/sys/net/ipv4/ip_forward ]; then
         echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
