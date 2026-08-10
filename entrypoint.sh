@@ -2081,15 +2081,16 @@ promote_primary() {
         return 1
     fi
     if [ "$(get_instance_status "$NEW")" != "up" ]; then
-        echo "==> [MicroWARP] promote_primary: inst${NEW} 不是 up，拒绝"
+        echo "==> [MicroWARP] promote_primary: inst${NEW} 不是 up，拒绝" >&2
         return 1
     fi
     set_primary_id "$NEW"
     haproxy_reapply_instance_states
+    # Logs on stderr so request_primary_rotate stdout stays machine-readable (OK to=N).
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        echo "==> [MicroWARP] primary: inst${OLD} → inst${NEW}"
+        echo "==> [MicroWARP] primary: inst${OLD} → inst${NEW}" >&2
     else
-        echo "==> [MicroWARP] primary 设为 inst${NEW}"
+        echo "==> [MicroWARP] primary 设为 inst${NEW}" >&2
     fi
     return 0
 }
@@ -2118,7 +2119,8 @@ request_primary_rotate() {
 
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         # force_rotate → worker must WG-reconnect (no SOCKS-only shortcut)
-        request_instance_recovery "$OLD" "force_rotate"
+        # Recovery logs must not pollute API stdout (only OK/ERR line belongs there).
+        request_instance_recovery "$OLD" "force_rotate" >&2
     fi
 
     release_rotate_lock
@@ -2141,9 +2143,9 @@ failover_primary_on_health_fail() {
     NEW=$(find_latest_healthy_standby)
     if [ -n "$NEW" ]; then
         promote_primary "$NEW" || true
-        echo "==> [MicroWARP] primary 巡检失败 failover: inst${FAILED} → inst${NEW}"
+        echo "==> [MicroWARP] primary 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
     else
-        echo "==> [MicroWARP] primary 巡检失败且无健康 standby；恢复后首个 up 抢主"
+        echo "==> [MicroWARP] primary 巡检失败且无健康 standby；恢复后首个 up 抢主" >&2
     fi
     request_instance_recovery "$FAILED"
     return 0

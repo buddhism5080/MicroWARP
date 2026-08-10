@@ -1006,6 +1006,28 @@ test_instance_online_duration_probe_log
 test_instance_drain_helpers
 
 # ---- Single-active rotate (feat/single-active-rotate) ----
+# Earlier tests (e.g. drain) mock then `unset -f set_instance_status/get_instance_status`,
+# which drops the real entrypoint helpers for the rest of this process. Restore minimal
+# real implementations so single-active tests can run after them.
+if ! type set_instance_status >/dev/null 2>&1; then
+    set_instance_status() {
+        local INST_ID="$1"
+        local STATUS="$2"
+        command mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
+        printf '%s\n' "$STATUS" > "$(get_instance_status_file "$INST_ID")"
+    }
+fi
+if ! type get_instance_status >/dev/null 2>&1; then
+    get_instance_status() {
+        local STATUS_FILE
+        STATUS_FILE=$(get_instance_status_file "$1")
+        if [ -f "$STATUS_FILE" ]; then
+            tr -d '\n' < "$STATUS_FILE"
+        else
+            printf 'down'
+        fi
+    }
+fi
 
 test_last_healthy_pick_latest_standby() {
     local SAVED="$INSTANCE_STATE_DIR"
