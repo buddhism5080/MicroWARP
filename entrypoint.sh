@@ -2281,23 +2281,36 @@ build_status_json() {
 }
 
 admin_cmd_worker() {
-    local REQ_FILE RES_FILE STATUS_FILE STATUS_RES
+    local REQ_FILE RES_FILE STATUS_FILE STATUS_RES TMP
     REQ_FILE="${INSTANCE_STATE_DIR}/admin.rotate.req"
     RES_FILE="${INSTANCE_STATE_DIR}/admin.rotate.res"
     STATUS_FILE="${INSTANCE_STATE_DIR}/admin.status.req"
     STATUS_RES="${INSTANCE_STATE_DIR}/admin.status.res"
     while true; do
         if [ -f "$STATUS_FILE" ]; then
-            build_status_json > "$STATUS_RES" 2>/dev/null || printf '{"ok":false}' > "$STATUS_RES"
+            # Atomic publish: avoid helper reading empty/truncated status file.
+            TMP="${STATUS_RES}.tmp.$$"
+            build_status_json > "$TMP" 2>/dev/null || printf '{"ok":false}' > "$TMP"
+            mv -f "$TMP" "$STATUS_RES"
             rm -f "$STATUS_FILE"
         fi
         if [ -f "$REQ_FILE" ]; then
-            request_primary_rotate > "$RES_FILE" 2>/dev/null || {
-                # request_primary_rotate prints ERR line even on failure; ensure file exists
-                if [ ! -f "$RES_FILE" ] || [ ! -s "$RES_FILE" ]; then
-                    printf 'ERR rotate_failed\n' > "$RES_FILE"
+            # Atomic publish: shell redirect creates RES_FILE immediately (empty).
+            # Helper used to race on that empty file and return rotate_failed.
+            TMP="${RES_FILE}.tmp.$$"
+            rm -f "$TMP"
+            if request_primary_rotate > "$TMP" 2>/dev/null; then
+                :
+            else
+                if [ ! -s "$TMP" ]; then
+                    printf 'ERR rotate_failed\n' > "$TMP"
                 fi
-            }
+            fi
+            # Ensure a final line exists even if stdout was empty after success path bugs.
+            if [ ! -s "$TMP" ]; then
+                printf 'ERR rotate_failed\n' > "$TMP"
+            fi
+            mv -f "$TMP" "$RES_FILE"
             rm -f "$REQ_FILE"
         fi
         sleep 0.1
@@ -2458,7 +2471,7 @@ case "$METHOD $REQ_PATH" in
         : > "$STATUS_FILE"
         I=0
         while [ "$I" -lt 50 ]; do
-            if [ -f "$STATUS_RES" ]; then
+            if [ -s "$STATUS_RES" ]; then
                 BODY=$(cat "$STATUS_RES")
                 respond '200 OK' "$BODY"
                 rm -f "$STATUS_FILE" "$STATUS_RES"
@@ -2471,29 +2484,36 @@ case "$METHOD $REQ_PATH" in
         rm -f "$STATUS_FILE"
         ;;
     "POST /rotate"|"POST /rotate/")
-        rm -f "$RES_FILE"
+        rm -f "$RES_FILE" "${RES_FILE}.tmp."*
         : > "$REQ_FILE"
         I=0
         while [ "$I" -lt 100 ]; do
-            if [ -f "$RES_FILE" ]; then
+            if [ -s "$RES_FILE" ]; then
                 RESP=$(tr -d '\r\n' < "$RES_FILE")
-                rm -f "$REQ_FILE" "$RES_FILE"
                 case "$RESP" in
-                    OK\ to=*)
-                        TO=$(printf '%s' "$RESP" | sed 's/^OK to=//')
-                        respond '200 OK' "$(printf '{"ok":true,"primary":%s}' "$TO")"
-                        ;;
-                    ERR\ in_progress)
-                        respond '409 Conflict' '{"ok":false,"error":"in_progress"}'
-                        ;;
-                    ERR\ no_candidate)
-                        respond '409 Conflict' '{"ok":false,"error":"no_candidate"}'
+                    OK\ to=*|ERR\ in_progress|ERR\ no_candidate|ERR\ rotate_failed)
+                        rm -f "$REQ_FILE" "$RES_FILE"
+                        case "$RESP" in
+                            OK\ to=*)
+                                TO=$(printf '%s' "$RESP" | sed 's/^OK to=//')
+                                respond '200 OK' "$(printf '{"ok":true,"primary":%s}' "$TO")"
+                                ;;
+                            ERR\ in_progress)
+                                respond '409 Conflict' '{"ok":false,"error":"in_progress"}'
+                                ;;
+                            ERR\ no_candidate)
+                                respond '409 Conflict' '{"ok":false,"error":"no_candidate"}'
+                                ;;
+                            *)
+                                respond '500 Internal Server Error' '{"ok":false,"error":"rotate_failed"}'
+                                ;;
+                        esac
+                        exit 0
                         ;;
                     *)
-                        respond '500 Internal Server Error' '{"ok":false,"error":"rotate_failed"}'
+                        # Incomplete/garbage write — keep waiting briefly.
                         ;;
                 esac
-                exit 0
             fi
             sleep 0.1
             I=$((I + 1))
