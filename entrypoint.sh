@@ -2312,8 +2312,21 @@ admin_http_loop() {
 # Payload: METHOD + "\n" + PATH + "\n" + TIMESTAMP
 # Headers: X-Timestamp, X-Signature
 # Or: Authorization: HMAC-SHA256 ts=<epoch>,sig=<hex>
+# socat EXEC may start with a minimal PATH — pin a sane one.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+if command -v openssl >/dev/null 2>&1; then
+    OPENSSL_BIN=$(command -v openssl)
+else
+    OPENSSL_BIN="/usr/bin/openssl"
+fi
 STATE_DIR="${INSTANCE_STATE_DIR:-/var/run/microwarp}"
-SECRET="${ADMIN_HTTP_TOKEN:-}"
+# Secret from file (not process argv); empty file => disabled/unauth
+if [ -f "${STATE_DIR}/admin_http.secret" ]; then
+    SECRET=$(tr -d '\r\n' < "${STATE_DIR}/admin_http.secret")
+else
+    SECRET="${ADMIN_HTTP_TOKEN:-}"
+fi
 SKEW="${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}"
 REQ_FILE="${STATE_DIR}/admin.rotate.req"
 RES_FILE="${STATE_DIR}/admin.rotate.res"
@@ -2321,7 +2334,7 @@ STATUS_FILE="${STATE_DIR}/admin.status.req"
 STATUS_RES="${STATE_DIR}/admin.status.res"
 
 hmac_hex() {
-    printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f'
+    printf '%s' "$2" | "$OPENSSL_BIN" dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f'
 }
 
 verify_hmac_ts() {
@@ -2404,7 +2417,16 @@ read_request() {
 respond() {
     CODE="$1"
     BODY="$2"
-    LEN=$(printf '%s' "$BODY" | wc -c | tr -d ' ')
+    # Portable length: prefer ${#var}; fall back to wc digits only.
+    LEN=${#BODY}
+    case "$LEN" in
+        ''|*[!0-9]*)
+            LEN=$(printf '%s' "$BODY" | wc -c 2>/dev/null | tr -cd '0-9')
+            ;;
+    esac
+    case "$LEN" in
+        ''|*[!0-9]*) LEN=0 ;;
+    esac
     printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
         "$CODE" "$LEN" "$BODY"
 }
@@ -2415,9 +2437,12 @@ if [ -z "$SECRET" ]; then
     respond '401 Unauthorized' '{"ok":false,"error":"unauthorized"}'
     exit 0
 fi
-if ! command -v openssl >/dev/null 2>&1; then
+if [ ! -x "$OPENSSL_BIN" ] && ! command -v openssl >/dev/null 2>&1; then
     respond '500 Internal Server Error' '{"ok":false,"error":"openssl_missing"}'
     exit 0
+fi
+if [ ! -x "$OPENSSL_BIN" ]; then
+    OPENSSL_BIN=$(command -v openssl)
 fi
 if ! verify_hmac_ts "$METHOD" "$PATH" "$TS" "$SIG"; then
     respond '401 Unauthorized' '{"ok":false,"error":"invalid_signature_or_timestamp"}'
@@ -2479,13 +2504,22 @@ case "$METHOD $PATH" in
 esac
 HELPER_EOF
     chmod +x "$HELPER"
-    export INSTANCE_STATE_DIR ADMIN_HTTP_TOKEN ADMIN_HTTP_HMAC_SKEW_SECONDS
+    # Secret file: avoid putting token on socat argv /proc cmdline.
+    printf '%s' "${ADMIN_HTTP_TOKEN}" > "${INSTANCE_STATE_DIR}/admin_http.secret"
+    chmod 600 "${INSTANCE_STATE_DIR}/admin_http.secret" 2>/dev/null || true
+    export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+    export INSTANCE_STATE_DIR ADMIN_HTTP_HMAC_SKEW_SECONDS
+    # Do not export ADMIN_HTTP_TOKEN into every child if avoidable; helper reads secret file.
     admin_cmd_worker &
     printf '%s\n' "$!" > "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid"
     # Fixed bind: 0.0.0.0:9180 — host does -p 9180:9180
     while true; do
-        socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr,fork EXEC:"$HELPER" 2>/dev/null || \
-            socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr EXEC:"$HELPER" 2>/dev/null || \
+        socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr,fork \
+            SYSTEM:"PATH='$PATH'; export PATH; INSTANCE_STATE_DIR='$INSTANCE_STATE_DIR'; export INSTANCE_STATE_DIR; ADMIN_HTTP_HMAC_SKEW_SECONDS='${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}'; export ADMIN_HTTP_HMAC_SKEW_SECONDS; exec '$HELPER'" \
+            2>/dev/null || \
+        socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr \
+            SYSTEM:"PATH='$PATH'; export PATH; INSTANCE_STATE_DIR='$INSTANCE_STATE_DIR'; export INSTANCE_STATE_DIR; ADMIN_HTTP_HMAC_SKEW_SECONDS='${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}'; export ADMIN_HTTP_HMAC_SKEW_SECONDS; exec '$HELPER'" \
+            2>/dev/null || \
             sleep 1
     done
 }
@@ -3529,6 +3563,7 @@ multi_cleanup_on_exit() {
         "${INSTANCE_STATE_DIR}/admin.status.req" \
         "${INSTANCE_STATE_DIR}/admin.status.res" \
         "${INSTANCE_STATE_DIR}/admin_http_handler.sh" \
+        "${INSTANCE_STATE_DIR}/admin_http.secret" \
         "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid" \
         "$(get_admin_http_pid_file)" 2>/dev/null || true
 
