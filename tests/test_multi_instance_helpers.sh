@@ -1004,13 +1004,6 @@ test_config_stale_offline_threshold
 test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
-test_last_healthy_pick_latest_standby
-test_haproxy_desired_state_single_active
-test_mark_instance_up_primary_then_standby_drain
-test_request_primary_rotate_thin_ok
-test_recovery_worker_has_no_socks_only_shortcut
-test_probe_disables_max_conn_on_this_branch
-
 
 # ---- Single-active rotate (feat/single-active-rotate) ----
 
@@ -1221,5 +1214,11 @@ test_admin_hmac_timestamp_window() {
     fi
 }
 
+test_last_healthy_pick_latest_standby
+test_haproxy_desired_state_single_active
+test_mark_instance_up_primary_then_standby_drain
+test_request_primary_rotate_thin_ok
+test_recovery_worker_has_no_socks_only_shortcut
+test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
 printf 'PASS test_multi_instance_helpers\n'
