@@ -2374,7 +2374,8 @@ read_request() {
     LINE=$(printf '%s' "$LINE" | tr -d '\r')
     METHOD=$(printf '%s' "$LINE" | cut -d' ' -f1)
     PATHQ=$(printf '%s' "$LINE" | cut -d' ' -f2)
-    PATH=$(printf '%s' "$PATHQ" | cut -d'?' -f1)
+    # IMPORTANT: never name this PATH — that clobbers $PATH and breaks awk/openssl lookups.
+    REQ_PATH=$(printf '%s' "$PATHQ" | cut -d'?' -f1)
     TS=""
     SIG=""
     while IFS= read -r H; do
@@ -2444,12 +2445,12 @@ fi
 if [ ! -x "$OPENSSL_BIN" ]; then
     OPENSSL_BIN=$(command -v openssl)
 fi
-if ! verify_hmac_ts "$METHOD" "$PATH" "$TS" "$SIG"; then
+if ! verify_hmac_ts "$METHOD" "$REQ_PATH" "$TS" "$SIG"; then
     respond '401 Unauthorized' '{"ok":false,"error":"invalid_signature_or_timestamp"}'
     exit 0
 fi
 
-case "$METHOD $PATH" in
+case "$METHOD $REQ_PATH" in
     "GET /status"|"GET /status/")
         rm -f "$STATUS_RES"
         : > "$STATUS_FILE"
