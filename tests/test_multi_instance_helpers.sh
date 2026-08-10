@@ -892,7 +892,7 @@ test_instance_drain_helpers() {
     }
     sleep() { :; }
     out=$(wait_instance_drain 4 2>&1)
-    assert_contains "$out" '连接已排空' 'drains after busy clears'
+    assert_contains "$out" '排空完成' 'drains after busy clears'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
     rm -f "$BUSY_STATE"
 
@@ -910,8 +910,8 @@ test_instance_drain_helpers() {
     }
     sleep() { :; }
     out=$(wait_instance_drain 9 2>&1)
-    assert_contains "$out" '无限期等待' 'unset timeout logs infinite wait'
-    assert_contains "$out" '连接已排空' 'infinite mode still ends when idle'
+    assert_contains "$out" '无超时上限' 'unset timeout logs infinite wait'
+    assert_contains "$out" '排空完成' 'infinite mode still ends when idle'
     if [[ "$out" == *排空超时* ]]; then
         echo "unset INSTANCE_DRAIN_TIMEOUT must not force-timeout: $out" >&2
         exit 1

@@ -252,7 +252,7 @@ print_instance_health_probe_start() {
     ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
     case "$ELAPSED" in
         ''|*[!0-9]*)
-            echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检..."
+            echo "==> [inst${INST_ID}] 执行健康巡检..."
             return 0
             ;;
     esac
@@ -261,9 +261,9 @@ print_instance_health_probe_start() {
     SINCE=$(get_instance_online_since_epoch "$INST_ID")
     ONLINE_AT=$(format_epoch_local_text "$SINCE")
     if [ -n "$ONLINE_AT" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检（上线时间: ${ONLINE_AT}，已在线: ${UPTIME_TEXT}）..."
+        echo "==> [inst${INST_ID}] 执行健康巡检（上线时间: ${ONLINE_AT}，已在线: ${UPTIME_TEXT}）..."
     else
-        echo "==> [MicroWARP] [inst${INST_ID}] 执行健康巡检（已在线: ${UPTIME_TEXT}）..."
+        echo "==> [inst${INST_ID}] 执行健康巡检（已在线: ${UPTIME_TEXT}）..."
     fi
 }
 
@@ -341,7 +341,7 @@ is_instance_idle() {
     COUNT=$(count_instance_busy_clients "$INST_ID")
     case "$COUNT" in
         ''|*[!0-9]*)
-            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无法可靠统计 busy 连接（${COUNT:-?}），视为非空闲"
+            echo "==> [inst${INST_ID}] [WARN] 无法可靠统计 busy 连接（${COUNT:-?}），视为非空闲"
             return 1
             ;;
     esac
@@ -389,12 +389,12 @@ wait_instance_drain() {
     TIMEOUT=$(get_instance_drain_timeout)
     # Explicit 0 only: empty TIMEOUT means infinite wait below.
     if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -le 0 ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] INSTANCE_DRAIN_TIMEOUT=0，跳过连接排空，立即停服务"
+        echo "==> [inst${INST_ID}] INSTANCE_DRAIN_TIMEOUT=0，跳过连接排空，立即停服务"
         return 1
     fi
 
     if ! command -v ss >/dev/null 2>&1; then
-        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无 ss，无法观察 busy 连接，跳过排空直接停服务"
+        echo "==> [inst${INST_ID}] [WARN] 无 ss，无法观察 busy 连接，跳过排空直接停服务"
         return 1
     fi
 
@@ -402,23 +402,23 @@ wait_instance_drain() {
     case "$COUNT" in
         ''|*[!0-9]*)
             if [ -n "$TIMEOUT" ]; then
-                echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
+                echo "==> [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
             else
-                echo "==> [MicroWARP] [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），无限期等待至可观测且空闲（未设 INSTANCE_DRAIN_TIMEOUT）"
+                echo "==> [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），无限期等待至可观测且空闲（未设 INSTANCE_DRAIN_TIMEOUT）"
             fi
             COUNT=-1
             ;;
     esac
     if [ "$COUNT" -eq 0 ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已无 busy 连接，可以停服务"
+        echo "==> [inst${INST_ID}] 已无 busy 连接，可以停服务"
         return 0
     fi
 
     if [ "$COUNT" -gt 0 ] || [ "$COUNT" -lt 0 ]; then
         if [ -n "$TIMEOUT" ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，等待最多 ${TIMEOUT}s 排空 busy 连接（当前 ${COUNT}）..."
+            echo "==> [inst${INST_ID}] 复活进度: 开始排空 busy=${COUNT}，最长等待 ${TIMEOUT}s"
         else
-            echo "==> [MicroWARP] [inst${INST_ID}] 已停止调度新连接，无限期等待 busy 排空（当前 ${COUNT}；未设 INSTANCE_DRAIN_TIMEOUT，不强制打断长连接）..."
+            echo "==> [inst${INST_ID}] 复活进度: 开始排空 busy=${COUNT}，无超时上限（等到空闲）"
         fi
     fi
     SLEPT=0
@@ -430,19 +430,23 @@ wait_instance_drain() {
             ''|*[!0-9]*) COUNT=-1 ;;
         esac
         if [ "$COUNT" -eq 0 ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 连接已排空（等待 ${SLEPT}s），准备停服务"
+            echo "==> [inst${INST_ID}] 复活进度: 排空完成 busy=0，已等待 ${SLEPT}s → 停 SOCKS"
             return 0
         fi
         if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 排空超时 ${TIMEOUT}s，仍有 busy=${COUNT}，强制停服务"
+            echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 busy=${COUNT} → 强制停 SOCKS"
             return 1
         fi
         # Keep log noise low: every 5s.
         if [ $((SLEPT % 5)) -eq 0 ]; then
             if [ -n "$TIMEOUT" ]; then
-                echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s/${TIMEOUT}s"
+                echo "==> [inst${INST_ID}] 复活进度: 排空中 busy=${COUNT}，已等待 ${SLEPT}s/${TIMEOUT}s"
             else
-                echo "==> [MicroWARP] [inst${INST_ID}] 排空中... busy=${COUNT}，已等 ${SLEPT}s（无超时上限，等到空闲）"
+                echo "==> [inst${INST_ID}] 复活进度: 排空中 busy=${COUNT}，已等待 ${SLEPT}s（无上限，等到空闲）"
+            fi
+            # fleet snapshot every 30s while this inst drains
+            if [ $((SLEPT % 30)) -eq 0 ]; then
+                print_health_summary 2>/dev/null || true
             fi
         fi
     done
@@ -526,7 +530,7 @@ instance_should_force_rotate_for_max_conn() {
     # Capacity guard: never MAX_CONN-drain when ready(up) pool is already < half.
     if healthy_instances_below_half; then
         HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但 ready 实例 ${HEALTHY}/${TOTAL} 少于一半，跳过 MAX_CONN drain"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s，但 ready 实例 ${HEALTHY}/${TOTAL} 少于一半，跳过 MAX_CONN drain"
         return 1
     fi
 
@@ -536,11 +540,11 @@ instance_should_force_rotate_for_max_conn() {
     esac
     DRAIN_TO=$(get_instance_drain_timeout)
     if [ "$BUSY" = "0" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(busy=0)，准备 drain 后强制重连"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(busy=0)，准备 drain 后强制重连"
     elif [ -n "$DRAIN_TO" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
     else
-        echo "==> [MicroWARP] [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，无限期等到空闲后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，无限期等到空闲后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
     fi
     return 0
 }
@@ -575,7 +579,7 @@ record_instance_offline_since() {
     mkdir -p "$(dirname "$FILE")"
     if [ ! -f "$FILE" ]; then
         date +%s > "$FILE"
-        echo "==> [MicroWARP] [inst${_oid}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
+        echo "==> [inst${_oid}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
     fi
 }
 
@@ -605,7 +609,7 @@ record_single_offline_since() {
     mkdir -p "$(dirname "$FILE")"
     if [ ! -f "$FILE" ]; then
         date +%s > "$FILE"
-        echo "==> [MicroWARP] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
+        echo "==> 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
     fi
 }
 
@@ -664,6 +668,55 @@ is_instance_recovering() {
     rm -f "$PID_FILE"
     return 1
 }
+
+# Count instances currently in background recovery (live recover pid).
+count_instances_recovering() {
+    local _id N=0
+    for _id in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
+        if is_instance_recovering "$_id"; then
+            N=$((N + 1))
+        fi
+    done
+    printf '%s\n' "$N"
+}
+
+count_instances_with_status() {
+    local WANT="$1"
+    local _id ST N=0
+    for _id in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
+        ST=$(get_instance_status "$_id")
+        if [ "$ST" = "$WANT" ]; then
+            N=$((N + 1))
+        fi
+    done
+    printf '%s\n' "$N"
+}
+
+# Best-effort sum of busy client sockets across all instances.
+sum_all_busy_clients() {
+    local _id C TOTAL=0
+    for _id in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
+        C=$(count_instance_busy_clients "$_id" 2>/dev/null || printf '0')
+        case "$C" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        TOTAL=$((TOTAL + C))
+    done
+    printf '%s\n' "$TOTAL"
+}
+
+# One-line fleet health: 健康 9/10，后台复活中 1
+print_health_summary() {
+    local TOTAL HEALTHY RECOVERING DRAINING DOWN BUSY
+    TOTAL=${WARP_INSTANCE_COUNT:-1}
+    HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
+    RECOVERING=$(count_instances_recovering 2>/dev/null || printf '0')
+    DRAINING=$(count_instances_with_status draining 2>/dev/null || printf '0')
+    DOWN=$(count_instances_with_status down 2>/dev/null || printf '0')
+    BUSY=$(sum_all_busy_clients 2>/dev/null || printf '0')
+    echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（draining ${DRAINING}，down ${DOWN}，busy总=${BUSY}）"
+}
+
 
 stop_instance_recovery() {
     local INST_ID="$1"
@@ -757,11 +810,11 @@ enqueue_instance_config_retry() {
     mkdir -p "$QDIR" "$INSTANCE_STATE_DIR"
     MARK="${QDIR}/${INST_ID}"
     if [ -f "$MARK" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已在配置重试队列中，跳过重复入队"
+        echo "==> [inst${INST_ID}] 已在配置重试队列中，跳过重复入队"
     else
         # Record enqueue time for FIFO / observability.
         date +%s > "$MARK" 2>/dev/null || printf '1\n' > "$MARK"
-        echo "==> [MicroWARP] [inst${INST_ID}] 配置获取失败 → 已加入后台串行重试队列"
+        echo "==> [inst${INST_ID}] 配置获取失败 → 已加入后台串行重试队列"
     fi
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
@@ -775,7 +828,7 @@ bring_up_instance_after_config() {
     CONF_PATH=$(get_instance_conf_path "$INST_ID")
 
     if [ ! -f "$CONF_PATH" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] bring_up_instance_after_config: 配置仍不存在"
+        echo "==> [inst${INST_ID}] [WARN] bring_up_instance_after_config: 配置仍不存在"
         return 1
     fi
 
@@ -786,11 +839,11 @@ bring_up_instance_after_config() {
     if run_instance_health_checks "$INST_ID"; then
         mark_instance_up "$INST_ID"
         reload_haproxy_from_status
-        echo "==> [MicroWARP] [inst${INST_ID}] 🎉 队列重试注册后已上线并加入 LB"
+        echo "==> [inst${INST_ID}] 🎉 队列重试注册后已上线并加入 LB"
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 配置已生成但连通性未过，交给常规后台复活 worker"
+    echo "==> [inst${INST_ID}] 配置已生成但连通性未过，交给常规后台复活 worker"
     request_instance_recovery "$INST_ID"
     return 1
 }
@@ -807,7 +860,7 @@ config_retry_worker() {
     BACKOFF=5
     MAX_BACKOFF=60
     EMPTY_ROUNDS=0
-    echo "==> [MicroWARP] 配置串行重试 worker 启动"
+    echo "==> 配置串行重试 worker 启动"
 
     while true; do
         INST_ID=$(list_config_retry_queue_ids | head -n1 || true)
@@ -815,7 +868,7 @@ config_retry_worker() {
             EMPTY_ROUNDS=$((EMPTY_ROUNDS + 1))
             # Stay alive briefly in case bootstrap enqueues more; then exit cleanly.
             if [ "$EMPTY_ROUNDS" -ge 3 ]; then
-                echo "==> [MicroWARP] 配置重试队列已空，worker 退出"
+                echo "==> 配置重试队列已空，worker 退出"
                 rm -f "$PID_FILE"
                 trap - EXIT INT TERM
                 exit 0
@@ -826,10 +879,10 @@ config_retry_worker() {
         EMPTY_ROUNDS=0
 
         CONF_PATH=$(get_instance_conf_path "$INST_ID")
-        echo "==> [MicroWARP] [inst${INST_ID}] 队列串行重试：获取/注册 WARP 配置..."
+        echo "==> [inst${INST_ID}] 队列串行重试：获取/注册 WARP 配置..."
 
         if [ -f "$CONF_PATH" ] && ! is_enabled "$ROTATE_IP_ON_START"; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 队列中发现配置已存在，直接拉起"
+            echo "==> [inst${INST_ID}] 队列中发现配置已存在，直接拉起"
             rm -f "${QDIR}/${INST_ID}"
             bring_up_instance_after_config "$INST_ID" || true
             BACKOFF=5
@@ -845,7 +898,7 @@ config_retry_worker() {
 
         # Keep marker; move to end of FIFO by refreshing mtime after siblings.
         date +%s > "${QDIR}/${INST_ID}" 2>/dev/null || true
-        echo "==> [MicroWARP] [inst${INST_ID}] 队列本轮注册仍失败，${BACKOFF}s 后继续串行重试（不退出容器）"
+        echo "==> [inst${INST_ID}] 队列本轮注册仍失败，${BACKOFF}s 后继续串行重试（不退出容器）"
         sleep "$BACKOFF"
         BACKOFF=$((BACKOFF * 2))
         if [ "$BACKOFF" -gt "$MAX_BACKOFF" ]; then
@@ -861,11 +914,11 @@ ensure_config_retry_worker() {
         return 0
     fi
     _pid_file=$(get_config_retry_worker_pid_file)
-    echo "==> [MicroWARP] 拉起配置串行重试 worker..."
+    echo "==> 拉起配置串行重试 worker..."
     config_retry_worker &
     _pid=$!
     echo "$_pid" > "$_pid_file"
-    echo "==> [MicroWARP] 配置串行重试 worker 已记录 PID ${_pid}"
+    echo "==> 配置串行重试 worker 已记录 PID ${_pid}"
 }
 
 render_haproxy_config() {
@@ -981,17 +1034,17 @@ haproxy_set_server_state() {
     case "$STATE" in
         ready|drain|maint) ;;
         *)
-            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] invalid HAProxy state '$STATE'"
+            echo "==> [inst${INST_ID}] [WARN] invalid HAProxy state '$STATE'"
             return 1
             ;;
     esac
 
     CMD="set server warp_pool/inst${INST_ID} state ${STATE}"
     if haproxy_runtime_cmd "$CMD"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
+        echo "==> [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
         return 0
     fi
-    echo "==> [MicroWARP] [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
+    echo "==> [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
     return 1
 }
 
@@ -1101,14 +1154,14 @@ print_warp_identity_summary() {
     PRIVATE_KEY_FINGERPRINT=$(printf '%s' "$PRIVATE_KEY" | sha256sum | awk '{print substr($1,1,16)}')
 
     if [ -n "$LABEL" ]; then
-        echo "==> [MicroWARP] WARP 设备身份摘要 [${LABEL}]:"
+        echo "==> WARP 设备身份摘要 [${LABEL}]:"
     else
-        echo "==> [MicroWARP] WARP 设备身份摘要:"
+        echo "==> WARP 设备身份摘要:"
     fi
-    echo "==> [MicroWARP]   PrivateKey SHA256/16: ${PRIVATE_KEY_FINGERPRINT}"
-    [ -n "$IPV4_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv4: ${IPV4_ADDRESS}"
-    [ -n "$IPV6_ADDRESS" ] && echo "==> [MicroWARP]   Interface IPv6: ${IPV6_ADDRESS}"
-    [ -n "$ENDPOINT" ] && echo "==> [MicroWARP]   Peer Endpoint: ${ENDPOINT}"
+    echo "==>   PrivateKey SHA256/16: ${PRIVATE_KEY_FINGERPRINT}"
+    [ -n "$IPV4_ADDRESS" ] && echo "==>   Interface IPv4: ${IPV4_ADDRESS}"
+    [ -n "$IPV6_ADDRESS" ] && echo "==>   Interface IPv6: ${IPV6_ADDRESS}"
+    [ -n "$ENDPOINT" ] && echo "==>   Peer Endpoint: ${ENDPOINT}"
 }
 
 pick_endpoint_ip() {
@@ -1179,13 +1232,13 @@ fetch_warp_config() {
 '
     for API_URL in $API_URLS; do
         [ -n "$API_URL" ] || continue
-        echo "==> [MicroWARP] API 地址: ${API_URL}"
+        echo "==> API 地址: ${API_URL}"
 
         if [ -n "$EFFECTIVE_PROXY" ]; then
             if [ -n "$WARP_API_PROXY" ]; then
-                echo "==> [MicroWARP] API 请求将通过已配置代理发起 (${EFFECTIVE_PROXY})"
+                echo "==> API 请求将通过已配置代理发起 (${EFFECTIVE_PROXY})"
             else
-                echo "==> [MicroWARP] API 请求经本机 HAProxy SOCKS 发起（健康实例>1，${EFFECTIVE_PROXY}）"
+                echo "==> API 请求经本机 HAProxy SOCKS 发起（健康实例>1，${EFFECTIVE_PROXY}）"
             fi
             curl --proxy "$EFFECTIVE_PROXY" --retry 3 --retry-delay 2 --max-time 15 --silent --location --fail \
                 "$API_URL" > "$raw_conf" && {
@@ -1200,7 +1253,7 @@ fetch_warp_config() {
             }
         fi
 
-        echo "==> [MicroWARP] [WARN] API 请求失败，尝试下一个地址..."
+        echo "==> [WARN] API 请求失败，尝试下一个地址..."
     done
 
     IFS=$OLD_IFS
@@ -1218,7 +1271,7 @@ generate_warp_config() {
     mkdir -p "$target_dir"
 
     while [ "$attempt" -le "$max_retries" ]; do
-        echo "==> [MicroWARP] 正在向 API 注册新设备 (第${attempt}次尝试)... -> ${target_conf}"
+        echo "==> 正在向 API 注册新设备 (第${attempt}次尝试)... -> ${target_conf}"
 
         if fetch_warp_config; then
 
@@ -1249,10 +1302,10 @@ generate_warp_config() {
 
                 if [ -n "$ENDPOINT_IP" ]; then
                     if pick_endpoint_ip; then
-                        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
+                        echo "==> 🔀 检测到自定义 Endpoint 候选，已随机选中节点: $ENDPOINT_IP_SELECTED"
                         ENDPOINT="$ENDPOINT_IP_SELECTED"
                     else
-                        echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
+                        echo "==> 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
                         ENDPOINT="$ENDPOINT_IP"
                     fi
                 fi
@@ -1303,19 +1356,19 @@ generate_warp_config() {
                 } > "$target_conf"
 
                 rm -f "$raw_conf"
-                echo "==> [MicroWARP] 节点配置生成成功！(${target_conf})"
+                echo "==> 节点配置生成成功！(${target_conf})"
                 return 0
             fi
         fi
 
-        echo "==> [MicroWARP] [WARN] 第${attempt}次返回无效配置，原始内容预览："
+        echo "==> [WARN] 第${attempt}次返回无效配置，原始内容预览："
         head -30 "$raw_conf" 2>/dev/null || true
         rm -f "$raw_conf"
         attempt=$((attempt + 1))
         [ "$attempt" -le "$max_retries" ] && sleep 5
     done
 
-    echo "==> [MicroWARP] [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
+    echo "==> [ERROR] API 连续 ${max_retries} 次失败，无法生成有效配置！"
     # Never exit the container here: multi-instance bootstrap/recovery must
     # keep running and hand the failed inst to a serial background retry queue.
     # Callers that need hard-fail (single-instance first boot) check the return code.
@@ -1331,28 +1384,28 @@ start_warp_interface() {
     PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
     PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
 
-    echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
+    echo "==> 正在启动 Linux 内核级 wg0 网卡..."
     if ! wg-quick up wg0 > /dev/null 2>&1; then
-        echo "==> [MicroWARP] [WARN] wg0 启动失败"
+        echo "==> [WARN] wg0 启动失败"
         return 1
     fi
 
     TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
     if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
         if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
-            echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由"
+            echo "==> 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由"
         fi
     fi
 
     sleep 3
-    echo "==> [MicroWARP] 隧道已启动"
+    echo "==> 隧道已启动"
     return 0
 }
 
 restart_warp_with_new_identity() {
     wg-quick down wg0 > /dev/null 2>&1 || true
     if ! generate_warp_config; then
-        echo "==> [MicroWARP] [WARN] 重新注册失败，保留旧配置并交由上层重试"
+        echo "==> [WARN] 重新注册失败，保留旧配置并交由上层重试"
         return 1
     fi
     print_warp_identity_summary
@@ -1393,7 +1446,7 @@ record_socks_online_started_at() {
 
 print_socks_health_check_success() {
     if [ -z "$SOCKS_ONLINE_AT_EPOCH" ] || [ -z "$SOCKS_ONLINE_AT_TEXT" ]; then
-        echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线"
+        echo "==> 巡检通过，SOCKS 服务继续保持在线"
         return 0
     fi
 
@@ -1402,12 +1455,12 @@ print_socks_health_check_success() {
     [ "$UPTIME_SECONDS" -lt 0 ] && UPTIME_SECONDS=0
     UPTIME_TEXT=$(format_uptime_duration "$UPTIME_SECONDS")
 
-    echo "==> [MicroWARP] 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
+    echo "==> 巡检通过，SOCKS 服务继续保持在线（上线时间: ${SOCKS_ONLINE_AT_TEXT}，已上线: ${UPTIME_TEXT}）"
 }
 
 start_socks() {
     if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
-        echo "==> [MicroWARP] 🟢 节点状态健康，正在启动 SOCKS 服务..."
+        echo "==> 🟢 节点状态健康，正在启动 SOCKS 服务..."
         if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
             microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
         else
@@ -1415,16 +1468,16 @@ start_socks() {
         fi
         SOCKS_PID=$!
         record_socks_online_started_at
-        echo "==> [MicroWARP] 🚀 MicroSOCKS 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
+        echo "==> 🚀 MicroSOCKS 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
     fi
 }
 
 stop_socks() {
     if [ -n "$SOCKS_PID" ] && kill -0 "$SOCKS_PID" 2>/dev/null; then
-        echo "==> [MicroWARP] 🛑 切断 SOCKS 服务，避免请求黑洞..."
+        echo "==> 🛑 切断 SOCKS 服务，避免请求黑洞..."
         kill "$SOCKS_PID" 2>/dev/null || true
         wait "$SOCKS_PID" 2>/dev/null || true
-        echo "==> [MicroWARP] 🔻 SOCKS 服务已下线"
+        echo "==> 🔻 SOCKS 服务已下线"
     fi
 
     SOCKS_PID=""
@@ -1591,8 +1644,8 @@ probe_egress_ips() {
     TRACE_IP_V4=''
     TRACE_IP_V6=''
     EGRESS_IP_URLS_TRIED=0
-    PREFIX='==> [MicroWARP]'
-    [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
+    PREFIX='==> '
+    [ -n "$LABEL" ] && PREFIX="==> [${LABEL}]"
 
     PROBED_IP=''
     PROBED_IP_SOURCE=''
@@ -1640,8 +1693,8 @@ ensure_trace_ip() {
     fi
 
     THRESH=$(get_egress_ip_fail_threshold)
-    PREFIX='==> [MicroWARP]'
-    [ -n "$LABEL" ] && PREFIX="==> [MicroWARP] [${LABEL}]"
+    PREFIX='==> '
+    [ -n "$LABEL" ] && PREFIX="==> [${LABEL}]"
 
     if [ "$THRESH" -eq 0 ]; then
         echo "${PREFIX} 出口 IP 本轮未取到（EGRESS_IP_FAIL_THRESHOLD=0，不据此判死）"
@@ -1693,11 +1746,11 @@ check_single_test_url() {
         fi
 
         [ -n "$TEST_HTTP_CODE" ] || TEST_HTTP_CODE="000"
-        echo "==> [MicroWARP] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        echo "==> 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
         if is_retryable_test_url_curl_exit "$CURL_EXIT" && [ "$ATTEMPT" -le "$RETRYABLE_FAILURE_RETRIES" ]; then
             RETRY_REASON=$(get_test_url_retry_reason "$CURL_EXIT")
-            echo "==> [MicroWARP] ${TARGET_URL} ${RETRY_REASON}，5 秒后重试 (${ATTEMPT}/${RETRYABLE_FAILURE_RETRIES})..."
+            echo "==> ${TARGET_URL} ${RETRY_REASON}，5 秒后重试 (${ATTEMPT}/${RETRYABLE_FAILURE_RETRIES})..."
             ATTEMPT=$((ATTEMPT + 1))
             sleep 5
             continue
@@ -1786,13 +1839,13 @@ run_health_checks() {
 }
 
 restart_wg_interface() {
-    echo "==> [MicroWARP] 正在断开并重连 wg0..."
+    echo "==> 正在断开并重连 wg0..."
     wg-quick down wg0 > /dev/null 2>&1 || true
     if start_warp_interface; then
         return 0
     fi
 
-    echo "==> [MicroWARP] [WARN] WG 接口重连失败"
+    echo "==> [WARN] WG 接口重连失败"
     return 1
 }
 
@@ -1800,15 +1853,15 @@ try_wg_reconnect_recovery() {
     RECONNECT_RETRIES=$(get_wg_reconnect_retries)
 
     if [ "$RECONNECT_RETRIES" -le 0 ]; then
-        echo "==> [MicroWARP] 已禁用 WG 重连重试，跳过接口重连阶段"
+        echo "==> 已禁用 WG 重连重试，跳过接口重连阶段"
         return 1
     fi
 
     ATTEMPT=1
     while [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ]; do
-        echo "==> [MicroWARP] 正在执行 WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
+        echo "==> 正在执行 WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
         if restart_wg_interface && run_health_checks; then
-            echo "==> [MicroWARP] WG 重连后健康检查已恢复"
+            echo "==> WG 重连后健康检查已恢复"
             return 0
         fi
 
@@ -1816,7 +1869,7 @@ try_wg_reconnect_recovery() {
         [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ] && sleep 3
     done
 
-    echo "==> [MicroWARP] [WARN] WG 重连重试全部失败"
+    echo "==> [WARN] WG 重连重试全部失败"
     return 1
 }
 
@@ -1831,7 +1884,7 @@ ensure_network_ready() {
             return 0
         fi
 
-        echo "==> [MicroWARP] 连通性测试未通过！"
+        echo "==> 连通性测试未通过！"
         stop_socks
         record_single_offline_since
 
@@ -1842,7 +1895,7 @@ ensure_network_ready() {
             SINCE=$(tr -d '\n' < "$FILE")
             NOW_EPOCH=$(date +%s)
             ELAPSED=$((NOW_EPOCH - SINCE))
-            echo "==> [MicroWARP] 已连续离线 ${ELAPSED}s ≥ $(get_config_stale_offline_seconds)s，判定配置失效，跳过重连并强制换新配置"
+            echo "==> 已连续离线 ${ELAPSED}s ≥ $(get_config_stale_offline_seconds)s，判定配置失效，跳过重连并强制换新配置"
         fi
 
         if [ "$FORCE_NEW" -eq 0 ]; then
@@ -1851,23 +1904,23 @@ ensure_network_ready() {
                 clear_single_offline_since
                 return 0
             fi
-            echo "==> [MicroWARP] WG 重连重试后仍未恢复，正在重新注册并重置节点..."
+            echo "==> WG 重连重试后仍未恢复，正在重新注册并重置节点..."
         fi
 
         if ! restart_warp_with_new_identity; then
-            echo "==> [MicroWARP] 重新注册本轮失败，5s 后继续重试（不退出容器）"
+            echo "==> 重新注册本轮失败，5s 后继续重试（不退出容器）"
             sleep 5
         fi
     done
 }
 
 periodic_test_url_monitor() {
-    echo "==> [MicroWARP] 已启动守护模式，每 ${TEST_URLS_CHECK_INTERVAL} 秒进行一次健康巡检..."
+    echo "==> 已启动守护模式，每 ${TEST_URLS_CHECK_INTERVAL} 秒进行一次健康巡检..."
     while true; do
         # 睡眠等待期间能随时响应容器的停止信号
         sleep "$TEST_URLS_CHECK_INTERVAL" & wait $!
 
-        echo "==> [MicroWARP] 正在执行 TEST_URLS 巡检（间隔 ${TEST_URLS_CHECK_INTERVAL} 秒）..."
+        echo "==> 正在执行 TEST_URLS 巡检（间隔 ${TEST_URLS_CHECK_INTERVAL} 秒）..."
 
         # 巡检时直接发起检测，不干扰正常运行的 SOCKS
         if check_test_urls; then
@@ -1877,7 +1930,7 @@ periodic_test_url_monitor() {
         fi
 
         # 只有在确诊不通返回了非零状态，才触发保护机制并切断网络
-        echo "==> [MicroWARP] ❌ 巡检未通过！触发节点重选保护机制..."
+        echo "==> ❌ 巡检未通过！触发节点重选保护机制..."
         stop_socks
         record_single_offline_since
 
@@ -1887,7 +1940,7 @@ periodic_test_url_monitor() {
 }
 
 cleanup_on_exit() {
-    echo "==> [MicroWARP] 收到退出信号，正在清理进程和网卡..."
+    echo "==> 收到退出信号，正在清理进程和网卡..."
     stop_socks
     wg-quick down wg0 >/dev/null 2>&1 || true
     exit 0
@@ -2098,16 +2151,16 @@ promote_primary() {
         return 1
     fi
     if [ "$(get_instance_status "$NEW")" != "up" ]; then
-        echo "==> [MicroWARP] promote_primary: inst${NEW} 不是 up，拒绝" >&2
+        echo "==> promote_primary: inst${NEW} 不是 up，拒绝" >&2
         return 1
     fi
     set_primary_id "$NEW"
     haproxy_reapply_instance_states
     # Logs on stderr so request_primary_rotate stdout stays machine-readable (OK to=N).
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        echo "==> [MicroWARP] primary: inst${OLD} → inst${NEW}" >&2
+        echo "==> primary: inst${OLD} → inst${NEW}" >&2
     else
-        echo "==> [MicroWARP] primary 设为 inst${NEW}" >&2
+        echo "==> primary 设为 inst${NEW}" >&2
     fi
     return 0
 }
@@ -2175,9 +2228,9 @@ failover_primary_on_health_fail() {
     NEW=$(find_latest_healthy_standby)
     if [ -n "$NEW" ]; then
         promote_primary "$NEW" || true
-        echo "==> [MicroWARP] primary 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
+        echo "==> primary 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
     else
-        echo "==> [MicroWARP] primary 巡检失败且无健康 standby；恢复后首个 up 抢主" >&2
+        echo "==> primary 巡检失败且无健康 standby；恢复后首个 up 抢主" >&2
     fi
     request_instance_recovery "$FAILED"
     return 0
@@ -2551,25 +2604,25 @@ HELPER_EOF
 start_admin_http_server() {
     local PID SKEW
     if [ -z "${ADMIN_HTTP_TOKEN:-}" ]; then
-        echo "==> [MicroWARP] admin HTTP 禁用（ADMIN_HTTP_TOKEN/HMAC secret 为空；固定监听本应是 0.0.0.0:9180）"
+        echo "==> admin HTTP 禁用（ADMIN_HTTP_TOKEN/HMAC secret 为空；固定监听本应是 0.0.0.0:9180）"
         return 0
     fi
     if ! command -v socat >/dev/null 2>&1; then
-        echo "==> [MicroWARP] [WARN] 无 socat，无法启动 admin HTTP"
+        echo "==> [WARN] 无 socat，无法启动 admin HTTP"
         return 0
     fi
     if ! command -v openssl >/dev/null 2>&1; then
-        echo "==> [MicroWARP] [WARN] 无 openssl，无法做 HMAC 鉴权，admin HTTP 不启动"
+        echo "==> [WARN] 无 openssl，无法做 HMAC 鉴权，admin HTTP 不启动"
         return 0
     fi
     stop_admin_http_server || true
     SKEW=$(get_admin_hmac_skew_seconds)
-    echo "==> [MicroWARP] 启动 admin HTTP: 0.0.0.0:9180 (HMAC-SHA256+时间戳，容差±${SKEW}s；宿主机映射此端口)"
+    echo "==> 启动 admin HTTP: 0.0.0.0:9180 (HMAC-SHA256+时间戳，容差±${SKEW}s；宿主机映射此端口)"
     mkdir -p "$INSTANCE_STATE_DIR"
     admin_http_loop &
     PID=$!
     printf '%s\n' "$PID" > "$(get_admin_http_pid_file)"
-    echo "==> [MicroWARP] admin HTTP PID ${PID}"
+    echo "==> admin HTTP PID ${PID}"
 }
 enable_host_forwarding() {
     if [ -w /proc/sys/net/ipv4/ip_forward ]; then
@@ -2606,7 +2659,7 @@ setup_instance_netns() {
 
     destroy_instance_netns "$INST_ID"
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 创建 netns ${NS_NAME} 与 veth 对"
+    echo "==> [inst${INST_ID}] 创建 netns ${NS_NAME} 与 veth 对"
     ip netns add "$NS_NAME"
     ip link add "$HOST_VETH" type veth peer name "$NS_VETH"
     ip link set "$NS_VETH" netns "$NS_NAME"
@@ -2766,7 +2819,7 @@ prepare_instance_wg_conf() {
     mkdir -p /etc/wireguard
 
     if [ ! -f "$CONF_PATH" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] [ERROR] 缺少配置文件: ${CONF_PATH}"
+        echo "==> [inst${INST_ID}] [ERROR] 缺少配置文件: ${CONF_PATH}"
         return 1
     fi
 
@@ -2778,12 +2831,12 @@ prepare_instance_wg_conf() {
         if RESOLVED_IP=$(resolve_host_to_ip "$ENDPOINT_HOST"); then
             NEW_ENDPOINT=$(format_endpoint_ip_port "$RESOLVED_IP" "$ENDPOINT_PORT")
             if [ "$NEW_ENDPOINT" != "$RAW_ENDPOINT" ]; then
-                echo "==> [MicroWARP] [inst${INST_ID}] Endpoint 预解析: ${RAW_ENDPOINT} -> ${NEW_ENDPOINT}"
+                echo "==> [inst${INST_ID}] Endpoint 预解析: ${RAW_ENDPOINT} -> ${NEW_ENDPOINT}"
             fi
             # Replace only the Endpoint line; keep the on-disk identity conf unchanged.
             sed -i "s|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = ${NEW_ENDPOINT}|" "$RUNTIME_CONF"
         else
-            echo "==> [MicroWARP] [inst${INST_ID}] [WARN] 无法在默认 netns 解析 Endpoint 主机名: ${ENDPOINT_HOST}（仍尝试原值）"
+            echo "==> [inst${INST_ID}] [WARN] 无法在默认 netns 解析 Endpoint 主机名: ${ENDPOINT_HOST}（仍尝试原值）"
         fi
     fi
 
@@ -2809,7 +2862,7 @@ start_instance_warp() {
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     ip netns exec "$NS_NAME" ip link delete "$WG_NAME" >/dev/null 2>&1 || true
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 正在 netns 内启动 WireGuard (${WG_NAME})..."
+    echo "==> [inst${INST_ID}] 正在 netns 内启动 WireGuard (${WG_NAME})..."
     # Bound the up attempt: DNS/UDP stalls must not freeze serial multi-instance boot.
     # Do NOT use eval with nested quotes — call timeout/wg-quick directly.
     if command -v timeout >/dev/null 2>&1; then
@@ -2821,9 +2874,9 @@ start_instance_warp() {
     fi
 
     if [ "$UP_OK" -ne 1 ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] WireGuard 启动失败"
+        echo "==> [inst${INST_ID}] [WARN] WireGuard 启动失败"
         if [ -s "$WG_LOG" ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] wg-quick 输出:"
+            echo "==> [inst${INST_ID}] wg-quick 输出:"
             tail -n 20 "$WG_LOG" | sed 's/^/    /'
         fi
         return 1
@@ -2845,7 +2898,7 @@ start_instance_warp() {
     fi
 
     sleep 2
-    echo "==> [MicroWARP] [inst${INST_ID}] 隧道已启动"
+    echo "==> [inst${INST_ID}] 隧道已启动"
     return 0
 }
 
@@ -2857,7 +2910,7 @@ stop_instance_socks() {
     if [ -f "$PID_FILE" ]; then
         PID=$(tr -d '\n' < "$PID_FILE")
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 停止内部 SOCKS (PID: ${PID})"
+            echo "==> [inst${INST_ID}] 停止内部 SOCKS (PID: ${PID})"
             kill "$PID" 2>/dev/null || true
             wait "$PID" 2>/dev/null || true
         fi
@@ -2879,7 +2932,7 @@ start_instance_socks() {
         fi
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 启动内部 MicroSOCKS (${NS_IP}:1080)"
+    echo "==> [inst${INST_ID}] 启动内部 MicroSOCKS (${NS_IP}:1080)"
     if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
         ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
     else
@@ -2910,11 +2963,11 @@ ns_check_single_test_url() {
         fi
 
         [ -n "$TEST_HTTP_CODE" ] || TEST_HTTP_CODE="000"
-        echo "==> [MicroWARP] [inst${INST_ID}] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        echo "==> [inst${INST_ID}] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
 
         if is_retryable_test_url_curl_exit "$CURL_EXIT" && [ "$ATTEMPT" -le "$RETRYABLE_FAILURE_RETRIES" ]; then
             RETRY_REASON=$(get_test_url_retry_reason "$CURL_EXIT")
-            echo "==> [MicroWARP] [inst${INST_ID}] ${TARGET_URL} ${RETRY_REASON}，5 秒后重试 (${ATTEMPT}/${RETRYABLE_FAILURE_RETRIES})..."
+            echo "==> [inst${INST_ID}] ${TARGET_URL} ${RETRY_REASON}，5 秒后重试 (${ATTEMPT}/${RETRYABLE_FAILURE_RETRIES})..."
             ATTEMPT=$((ATTEMPT + 1))
             sleep 5
             continue
@@ -2980,7 +3033,7 @@ restart_instance_wg() {
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
 
-    echo "==> [MicroWARP] [inst${INST_ID}] 正在断开并重连 WireGuard..."
+    echo "==> [inst${INST_ID}] 正在断开并重连 WireGuard..."
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     start_instance_warp "$INST_ID"
 }
@@ -2991,22 +3044,22 @@ try_instance_wg_reconnect_recovery() {
     RECONNECT_RETRIES=$(get_wg_reconnect_retries)
 
     if [ "$RECONNECT_RETRIES" -le 0 ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 已禁用 WG 重连重试"
+        echo "==> [inst${INST_ID}] 已禁用 WG 重连重试"
         return 1
     fi
 
     ATTEMPT=1
     while [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ]; do
-        echo "==> [MicroWARP] [inst${INST_ID}] WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
+        echo "==> [inst${INST_ID}] WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
         if restart_instance_wg "$INST_ID" && run_instance_health_checks "$INST_ID"; then
-            echo "==> [MicroWARP] [inst${INST_ID}] WG 重连后健康检查已恢复"
+            echo "==> [inst${INST_ID}] WG 重连后健康检查已恢复"
             return 0
         fi
         ATTEMPT=$((ATTEMPT + 1))
         [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ] && sleep 3
     done
 
-    echo "==> [MicroWARP] [inst${INST_ID}] [WARN] WG 重连重试全部失败"
+    echo "==> [inst${INST_ID}] [WARN] WG 重连重试全部失败"
     return 1
 }
 
@@ -3020,7 +3073,7 @@ restart_instance_with_new_identity() {
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     # Serialize API registration so many background revivers don't stampede the API.
     if ! with_dir_lock "$(get_register_lock_dir)" generate_warp_config "$CONF_PATH"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 重注册失败，交由配置串行重试队列继续"
+        echo "==> [inst${INST_ID}] 重注册失败，交由配置串行重试队列继续"
         enqueue_instance_config_retry "$INST_ID"
         return 1
     fi
@@ -3041,14 +3094,14 @@ mark_instance_up() {
         # First healthy instance claims primary.
         set_primary_id "$INST_ID"
         haproxy_set_server_state "$INST_ID" "ready" || true
-        echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记健康并抢到 primary（HAProxy ready）"
+        echo "==> [inst${INST_ID}] ✅ 已标记健康并抢到 primary（HAProxy ready）"
     elif [ "$INST_ID" = "$PRIMARY" ]; then
         haproxy_set_server_state "$INST_ID" "ready" || true
-        echo "==> [MicroWARP] [inst${INST_ID}] ✅ primary 健康（HAProxy ready）"
+        echo "==> [inst${INST_ID}] ✅ primary 健康（HAProxy ready）"
     else
         # Standby hot spare: WARP+SOCKS up, no new client traffic.
         haproxy_set_server_state "$INST_ID" "drain" || true
-        echo "==> [MicroWARP] [inst${INST_ID}] ✅ standby 健康（HAProxy drain 热备）"
+        echo "==> [inst${INST_ID}] ✅ standby 健康（HAProxy drain 热备）"
     fi
 }
 
@@ -3060,11 +3113,11 @@ detach_instance_from_lb() {
     set_instance_status "$INST_ID" "draining"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] ⏸️ HAProxy state=drain（官方 drain，无 reload）：停新连接，保已有 TCP"
+    echo "==> [inst${INST_ID}] ⏸️ HAProxy state=drain（官方 drain，无 reload）：停新连接，保已有 TCP"
     if ! haproxy_set_server_state "$INST_ID" "drain"; then
         # Socket unavailable (startup race): fall back to one reload so checks still work;
         # servers stay in cfg either way.
-        echo "==> [MicroWARP] [inst${INST_ID}] [WARN] runtime drain 失败，尝试确保 HAProxy 进程/配置存在"
+        echo "==> [inst${INST_ID}] [WARN] runtime drain 失败，尝试确保 HAProxy 进程/配置存在"
         reload_haproxy_from_status || true
         haproxy_set_server_state "$INST_ID" "drain" || true
     fi
@@ -3077,7 +3130,7 @@ hard_detach_instance_from_lb() {
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] HAProxy state=maint（重启服务期间，无 reload）"
+    echo "==> [inst${INST_ID}] HAProxy state=maint（重启服务期间，无 reload）"
     haproxy_set_server_state "$INST_ID" "maint" || true
 }
 
@@ -3100,12 +3153,12 @@ _reload_haproxy_from_status_unlocked() {
     if [ -f "$HAPROXY_CFG" ] && cmp -s "$NEW_CFG" "$HAPROXY_CFG" 2>/dev/null; then
         rm -f "$NEW_CFG"
         if refresh_haproxy_pid; then
-            echo "==> [MicroWARP] HAProxy 配置未变（健康标记 ${HEALTHY}/${WARP_INSTANCE_COUNT}），跳过 reload"
+            echo "==> HAProxy 配置未变（健康标记 ${HEALTHY}/${WARP_INSTANCE_COUNT}），跳过 reload"
             return 0
         fi
-        echo "==> [MicroWARP] HAProxy 配置未变但进程不在，冷启动..."
+        echo "==> HAProxy 配置未变但进程不在，冷启动..."
         if haproxy_cold_start "$HAPROXY_CFG"; then
-            echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+            echo "==> 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
             # Single-active: re-apply ready/drain/maint from primary mapping.
             haproxy_reapply_instance_states
             return 0
@@ -3114,16 +3167,16 @@ _reload_haproxy_from_status_unlocked() {
     fi
 
     mv -f "$NEW_CFG" "$HAPROXY_CFG"
-    echo "==> [MicroWARP] 刷新 HAProxy 静态配置（server 列表/监听变化；健康实例标记: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
+    echo "==> 刷新 HAProxy 静态配置（server 列表/监听变化；健康实例标记: ${HEALTHY}/${WARP_INSTANCE_COUNT}）"
 
     if refresh_haproxy_pid; then
         if haproxy_try_soft_reload "$HAPROXY_CFG"; then
-            echo "==> [MicroWARP] HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}）"
+            echo "==> HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}）"
             # Admin states reset on full config replace — single-active reapply.
             haproxy_reapply_instance_states
             return 0
         fi
-        echo "==> [MicroWARP] [WARN] HAProxy soft-reload 失败，尝试冷启动"
+        echo "==> [WARN] HAProxy soft-reload 失败，尝试冷启动"
         if is_live_pid "$HAPROXY_PID"; then
             kill "$HAPROXY_PID" 2>/dev/null || true
             sleep 0.2 2>/dev/null || true
@@ -3134,12 +3187,12 @@ _reload_haproxy_from_status_unlocked() {
     fi
 
     if haproxy_cold_start "$HAPROXY_CFG"; then
-        echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
+        echo "==> 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
         haproxy_reapply_instance_states
         return 0
     fi
 
-    echo "==> [MicroWARP] [ERROR] HAProxy 启动失败"
+    echo "==> [ERROR] HAProxy 启动失败"
     HAPROXY_PID=""
     return 1
 }
@@ -3172,21 +3225,23 @@ instance_recovery_worker() {
     BACKOFF=5
     MAX_BACKOFF=60
     if [ -n "$REASON" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}；强制 WG 重连/重注册，不保留旧隧道)"
+        echo "==> [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}；强制 WG 重连/重注册，不保留旧隧道)"
+        print_health_summary
     else
-        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (强制 WG 重连/重注册，不保留旧隧道)"
+        echo "==> [inst${INST_ID}] 后台复活 worker 启动 (强制 WG 重连/重注册，不保留旧隧道)"
+        print_health_summary
     fi
 
     # Parent already kicked this backend out of HAProxy. Finish offline gracefully:
     # wait until not busy (or drain timeout), then stop internal SOCKS before we
     # touch the tunnel / re-register.
     drain_and_stop_instance_socks "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止，开始复活流程（不走「只拉 SOCKS」捷径）"
+    echo "==> [inst${INST_ID}] 复活进度: 排空结束，SOCKS 已停 → 开始 WG 重连/重注册"
 
     while true; do
         CONF_PATH=$(get_instance_conf_path "$INST_ID")
         if [ ! -f "$CONF_PATH" ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 无配置文件，交给配置串行重试队列（本 worker 退出）"
+            echo "==> [inst${INST_ID}] 无配置文件，交给配置串行重试队列（本 worker 退出）"
             enqueue_instance_config_retry "$INST_ID"
             rm -f "$PID_FILE"
             trap - EXIT INT TERM
@@ -3194,7 +3249,7 @@ instance_recovery_worker() {
         fi
 
         if is_instance_queued_for_config_retry "$INST_ID"; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 已在配置重试队列，本 worker 让出"
+            echo "==> [inst${INST_ID}] 已在配置重试队列，本 worker 让出"
             rm -f "$PID_FILE"
             trap - EXIT INT TERM
             exit 0
@@ -3209,25 +3264,26 @@ instance_recovery_worker() {
             SINCE=$(get_instance_offline_since_epoch "$INST_ID")
             NOW_EPOCH=$(date +%s)
             ELAPSED=$((NOW_EPOCH - SINCE))
-            echo "==> [MicroWARP] [inst${INST_ID}] 已连续离线 ${ELAPSED}s ≥ $(get_config_stale_offline_seconds)s，判定配置失效，跳过重连并强制换新配置"
+            echo "==> [inst${INST_ID}] 已连续离线 ${ELAPSED}s ≥ $(get_config_stale_offline_seconds)s，判定配置失效，跳过重连并强制换新配置"
         fi
 
         if [ "$FORCE_NEW" -eq 0 ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活：健康检查未过，尝试 WG 重连..."
+            echo "==> [inst${INST_ID}] 复活进度: WG 重连中..."
             if try_instance_wg_reconnect_recovery "$INST_ID"; then
                 mark_instance_up "$INST_ID"
                 reload_haproxy_from_status
-                echo "==> [MicroWARP] [inst${INST_ID}] 🎉 WG 重连后后台复活成功"
+                echo "==> [inst${INST_ID}] 🎉 WG 重连后后台复活成功"
+                print_health_summary
                 rm -f "$PID_FILE"
                 trap - EXIT INT TERM
                 exit 0
             fi
-            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活：重连无效，重新注册 WARP 身份..."
+            echo "==> [inst${INST_ID}] 复活进度: 重连失败 → 重注册 WARP 身份..."
         fi
 
         if ! restart_instance_with_new_identity "$INST_ID"; then
             # restart_instance_with_new_identity already enqueued config retry on register fail.
-            echo "==> [MicroWARP] [inst${INST_ID}] 重注册未完成，已交配置队列；本 worker 退出避免双通道重试"
+            echo "==> [inst${INST_ID}] 重注册未完成，已交配置队列；本 worker 退出避免双通道重试"
             rm -f "$PID_FILE"
             trap - EXIT INT TERM
             exit 0
@@ -3236,7 +3292,8 @@ instance_recovery_worker() {
         if run_instance_health_checks "$INST_ID"; then
             mark_instance_up "$INST_ID"
             reload_haproxy_from_status
-            echo "==> [MicroWARP] [inst${INST_ID}] 🎉 重注册后后台复活成功"
+            echo "==> [inst${INST_ID}] 🎉 重注册后后台复活成功"
+                print_health_summary
             rm -f "$PID_FILE"
             trap - EXIT INT TERM
             exit 0
@@ -3246,7 +3303,7 @@ instance_recovery_worker() {
         # (would only delay this worker's next retry; LB kick is already done).
         set_instance_status "$INST_ID" "down"
         stop_instance_socks "$INST_ID"
-        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活本轮失败，${BACKOFF}s 后继续（永不放弃）"
+        echo "==> [inst${INST_ID}] 后台复活本轮失败，${BACKOFF}s 后继续（永不放弃）"
         sleep "$BACKOFF"
         BACKOFF=$((BACKOFF * 2))
         if [ "$BACKOFF" -gt "$MAX_BACKOFF" ]; then
@@ -3276,7 +3333,7 @@ request_instance_recovery() {
     fi
 
     if is_instance_recovering "$INST_ID"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活已在进行中，跳过重复拉起"
+        echo "==> [inst${INST_ID}] 后台复活已在进行中，跳过重复拉起"
         return 0
     fi
 
@@ -3285,15 +3342,15 @@ request_instance_recovery() {
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
     if [ -n "$REASON" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（reason=${REASON}；排空/停 SOCKS/重连均在后台）..."
+        echo "==> [inst${INST_ID}] 拉起后台复活 worker（reason=${REASON}；排空/停 SOCKS/重连均在后台）..."
     else
-        echo "==> [MicroWARP] [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
+        echo "==> [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
     fi
     # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
     instance_recovery_worker "$INST_ID" "$REASON" &
     _rec_pid=$!
     echo "$_rec_pid" > "$_pid_file"
-    echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
+    echo "==> [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
 }
 
 # Foreground bounded attempt (startup path only). Returns quickly-ish.
@@ -3310,7 +3367,7 @@ ensure_instance_ready() {
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
+    echo "==> [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
     request_instance_recovery "$_eid"
     return 1
 }
@@ -3323,15 +3380,15 @@ stagger_next_instance_start() {
     [ "$CURRENT_ID" -lt "$TOTAL_COUNT" ] || return 0
     [ "$INSTANCE_START_STAGGER_SECONDS" -gt 0 ] 2>/dev/null || return 0
 
-    echo "==> [MicroWARP] 启动错峰：inst${CURRENT_ID} 完成，等待 ${INSTANCE_START_STAGGER_SECONDS}s 后再启动下一个实例"
+    echo "==> 启动错峰：inst${CURRENT_ID} 完成，等待 ${INSTANCE_START_STAGGER_SECONDS}s 后再启动下一个实例"
     sleep "$INSTANCE_START_STAGGER_SECONDS"
 }
 
 bootstrap_multi_instances() {
     enable_host_forwarding
     mkdir -p "$INSTANCE_STATE_DIR" /etc/wireguard/instances
-    echo "==> [MicroWARP] 多实例串行启动（实例间错开 ${INSTANCE_START_STAGGER_SECONDS}s，避免并发注册/建隧）"
-    echo "==> [MicroWARP] 首个实例就绪后即开放服务并开始测活；配置失败的实例进入后台串行重试队列"
+    echo "==> 多实例串行启动（实例间错开 ${INSTANCE_START_STAGGER_SECONDS}s，避免并发注册/建隧）"
+    echo "==> 首个实例就绪后即开放服务并开始测活；配置失败的实例进入后台串行重试队列"
 
     # Open frontend immediately (may have zero backends). Clients get refuse/reset
     # rather than waiting for all N instances to finish register+tunnel.
@@ -3353,17 +3410,17 @@ bootstrap_multi_instances() {
             if [ "$_bid" = "1" ] && [ -f "$WG_CONF" ] && ! is_enabled "$ROTATE_IP_ON_START"; then
                 mkdir -p "$(dirname "$CONF_PATH")"
                 cp "$WG_CONF" "$CONF_PATH"
-                echo "==> [MicroWARP] [inst1] 复用已有 ${WG_CONF}"
+                echo "==> [inst1] 复用已有 ${WG_CONF}"
                 _config_ok=1
             else
-                echo "==> [MicroWARP] [inst${_bid}] 未检测到配置，自动注册..."
+                echo "==> [inst${_bid}] 未检测到配置，自动注册..."
                 _need_register=1
             fi
         elif is_enabled "$ROTATE_IP_ON_START"; then
-            echo "==> [MicroWARP] [inst${_bid}] ROTATE_IP_ON_START 生效，重新注册..."
+            echo "==> [inst${_bid}] ROTATE_IP_ON_START 生效，重新注册..."
             _need_register=1
         else
-            echo "==> [MicroWARP] [inst${_bid}] 检测到已有配置，跳过注册"
+            echo "==> [inst${_bid}] 检测到已有配置，跳过注册"
             _config_ok=1
         fi
 
@@ -3371,7 +3428,7 @@ bootstrap_multi_instances() {
             if generate_warp_config "$CONF_PATH"; then
                 _config_ok=1
             else
-                echo "==> [MicroWARP] [inst${_bid}] 启动期配置获取失败（不退出容器），加入后台串行重试队列"
+                echo "==> [inst${_bid}] 启动期配置获取失败（不退出容器），加入后台串行重试队列"
                 enqueue_instance_config_retry "$_bid"
                 reload_haproxy_from_status
                 stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
@@ -3400,7 +3457,7 @@ bootstrap_multi_instances() {
 
     HEALTHY=$(count_healthy_instances)
     if [ "$HEALTHY" -le 0 ]; then
-        echo "==> [MicroWARP] [WARN] 启动期尚无健康实例；配置队列/复活 worker 继续后台工作，主流程进入守护"
+        echo "==> [WARN] 启动期尚无健康实例；配置队列/复活 worker 继续后台工作，主流程进入守护"
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
             if [ ! -f "$(get_instance_conf_path "$INST_ID")" ]; then
                 enqueue_instance_config_retry "$INST_ID"
@@ -3413,7 +3470,7 @@ bootstrap_multi_instances() {
         WAIT_ROUNDS=0
         while [ "$(count_healthy_instances)" -le 0 ]; do
             WAIT_ROUNDS=$((WAIT_ROUNDS + 1))
-            echo "==> [MicroWARP] 等待至少一个实例就绪... (${WAIT_ROUNDS})"
+            echo "==> 等待至少一个实例就绪... (${WAIT_ROUNDS})"
             sleep 5
             for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
                 if [ "$(get_instance_status "$INST_ID")" = "up" ]; then
@@ -3429,8 +3486,9 @@ bootstrap_multi_instances() {
     fi
 
     HEALTHY=$(count_healthy_instances)
-    echo "==> [MicroWARP] 多实例就绪：${HEALTHY}/${WARP_INSTANCE_COUNT} 健康，统一入口 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    echo "==> [MicroWARP] down 实例由配置队列/后台 worker 独立复活，不阻塞主巡检"
+    echo "==> 多实例就绪：${HEALTHY}/${WARP_INSTANCE_COUNT} 健康，统一入口 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    print_health_summary
+    echo "==> down 实例由配置队列/后台 worker 独立复活，不阻塞主巡检"
     return 0
 }
 
@@ -3477,20 +3535,23 @@ probe_instance_and_schedule_recovery() {
 
     # Config retry queue owns registration for conf-less / register-failed insts.
     if is_instance_queued_for_config_retry "$INST_ID"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 配置串行重试队列处理中，本轮巡检跳过"
+        echo "==> [inst${INST_ID}] 配置串行重试队列处理中，本轮巡检跳过"
         ensure_config_retry_worker
         return 0
     fi
 
     if [ ! -f "$(get_instance_conf_path "$INST_ID")" ]; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 无配置 → 入配置串行重试队列"
+        echo "==> [inst${INST_ID}] 无配置 → 入配置串行重试队列"
         enqueue_instance_config_retry "$INST_ID"
         return 0
     fi
 
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then
-        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活进行中，本轮巡检跳过重活"
+        # Show recovery progress snapshot for this inst (busy + phase if draining).
+        _st=$(get_instance_status "$INST_ID")
+        _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
+        echo "==> [inst${INST_ID}] 后台复活进行中（status=${_st}，busy=${_busy}），本轮巡检跳过重活"
         return 0
     fi
 
@@ -3500,9 +3561,9 @@ probe_instance_and_schedule_recovery() {
         case "$OLD_STATUS" in
             draining)
                 # Never cancel an in-progress drain with ready — recovery worker owns this inst.
-                echo "==> [MicroWARP] [inst${INST_ID}] 出口仍通但状态=draining，不覆盖为 ready（等排空/复活）"
+                echo "==> [inst${INST_ID}] 出口仍通但状态=draining，不覆盖为 ready（等排空/复活）"
                 if ! is_instance_recovering "$INST_ID"; then
-                    echo "==> [MicroWARP] [inst${INST_ID}] draining 但无 worker → 补拉后台复活"
+                    echo "==> [inst${INST_ID}] draining 但无 worker → 补拉后台复活"
                     request_instance_recovery "$INST_ID"
                 fi
                 return 0
@@ -3513,11 +3574,11 @@ probe_instance_and_schedule_recovery() {
                 ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
                 case "$ELAPSED" in
                     ''|*[!0-9]*)
-                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已刷新 last_healthy）"
+                        echo "==> [inst${INST_ID}] 巡检通过，继续保持在线（已刷新 last_healthy）"
                         ;;
                     *)
                         UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
-                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}；已刷新 last_healthy）"
+                        echo "==> [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}；已刷新 last_healthy）"
                         ;;
                 esac
                 ;;
@@ -3525,14 +3586,14 @@ probe_instance_and_schedule_recovery() {
                 # down / unknown → bring back into pool (standby drain or primary ready via mark_up)
                 mark_instance_up "$INST_ID"
                 reload_haproxy_from_status || true
-                echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并按单活规则加入池"
+                echo "==> [inst${INST_ID}] 已恢复并按单活规则加入池"
                 ;;
         esac
         # Single-active branch: MAX_CONN auto-rotate disabled (env may remain; must not rotate).
         return 0
     fi
 
-    echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
+    echo "==> [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
     # Primary fail → failover to latest healthy standby (if any), then recover failed.
     failover_primary_on_health_fail "$INST_ID"
     return 0
@@ -3552,30 +3613,42 @@ recover_unhealthy_instances_once() {
 
 multi_periodic_monitor() {
     HEALTH_STAGGER=$(get_health_check_stagger_seconds "$WARP_INSTANCE_COUNT")
-    echo "==> [MicroWARP] 多实例守护模式：巡检总间隔 ${TEST_URLS_CHECK_INTERVAL}s / ${WARP_INSTANCE_COUNT} 实例 → 错峰 ${HEALTH_STAGGER}s"
-    echo "==> [MicroWARP] 主循环只做轻量探活；失败实例在后台独立重连/重注册直到复活"
+    echo "==> 多实例守护模式：巡检总间隔 ${TEST_URLS_CHECK_INTERVAL}s / ${WARP_INSTANCE_COUNT} 实例 → 错峰 ${HEALTH_STAGGER}s"
+    echo "==> 主循环只做轻量探活；失败实例在后台独立重连/重注册直到复活"
 
     while true; do
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
             probe_instance_and_schedule_recovery "$INST_ID"
 
-            HEALTHY=$(count_healthy_instances)
-            RECOVERING=0
+            # Fleet one-liner after each probe (健康 N/M + 复活/排空/busy)
+            print_health_summary
+            # Per recovering inst: phase + busy + waited if we can infer draining
             for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
                 if is_instance_recovering "$X"; then
-                    RECOVERING=$((RECOVERING + 1))
+                    _st=$(get_instance_status "$X")
+                    _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
+                    case "$_st" in
+                        draining)
+                            echo "==> [inst${X}] 复活进度: 排空中 status=draining busy=${_busy}"
+                            ;;
+                        down)
+                            echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down busy=${_busy}"
+                            ;;
+                        *)
+                            echo "==> [inst${X}] 复活进度: 进行中 status=${_st} busy=${_busy}"
+                            ;;
+                    esac
                 fi
             done
-            echo "==> [MicroWARP] 健康 ${HEALTHY}/${WARP_INSTANCE_COUNT}，后台复活中 ${RECOVERING}"
 
-            echo "==> [MicroWARP] 健康巡检错峰：等待 ${HEALTH_STAGGER}s 后检查下一个实例"
+            echo "==> 健康巡检错峰：等待 ${HEALTH_STAGGER}s 后检查下一个实例"
             sleep "$HEALTH_STAGGER" & wait $!
         done
     done
 }
 
 multi_cleanup_on_exit() {
-    echo "==> [MicroWARP] 收到退出信号，正在清理多实例资源..."
+    echo "==> 收到退出信号，正在清理多实例资源..."
 
     stop_admin_http_server || true
     stop_all_instance_recoveries
@@ -3612,11 +3685,11 @@ multi_cleanup_on_exit() {
 # 1. 初始化
 # ==========================================
 WARP_INSTANCE_COUNT=$(get_warp_instance_count)
-echo "==> [MicroWARP] WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-2}；单活分支下限 2)"
+echo "==> WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-2}；单活分支下限 2)"
 
 if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
-    echo "==> [MicroWARP] 已启用 IPv6 优先地址选择策略"
+    echo "==> 已启用 IPv6 优先地址选择策略"
 fi
 
 prepare_wg_quick_compat
@@ -3624,19 +3697,19 @@ prepare_wg_quick_compat
 if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
     # 单实例：保持原有路径与 volume 兼容
     if [ ! -f "$WG_CONF" ]; then
-        echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
+        echo "==> 未检测到配置，正在全自动初始化 Cloudflare WARP..."
         if ! generate_warp_config; then
-            echo "==> [MicroWARP] [FATAL] 单实例首次注册连续失败，无法启动"
+            echo "==> [FATAL] 单实例首次注册连续失败，无法启动"
             exit 1
         fi
     elif is_enabled "$ROTATE_IP_ON_START"; then
-        echo "==> [MicroWARP] 检测到 ROTATE_IP_ON_START=${ROTATE_IP_ON_START}，正在重新注册 WARP 设备以刷新出口 IP..."
+        echo "==> 检测到 ROTATE_IP_ON_START=${ROTATE_IP_ON_START}，正在重新注册 WARP 设备以刷新出口 IP..."
         if ! generate_warp_config; then
-            echo "==> [MicroWARP] [FATAL] ROTATE_IP_ON_START 注册失败，无法启动"
+            echo "==> [FATAL] ROTATE_IP_ON_START 注册失败，无法启动"
             exit 1
         fi
     else
-        echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
+        echo "==> 检测到已有持久化配置，跳过注册。"
     fi
 
     print_warp_identity_summary
@@ -3646,8 +3719,8 @@ if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
     periodic_test_url_monitor
 else
     # 多实例：单容器内多条 WARP 隧道 + 统一 SOCKS 入口 + 健康 LB
-    echo "==> [MicroWARP] 多实例模式：容器内并行 ${WARP_INSTANCE_COUNT} 条 WARP，仅暴露 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    echo "==> [MicroWARP] 提示：多实例需要 netns，建议 cap_add: [NET_ADMIN, SYS_ADMIN, SYS_MODULE]"
+    echo "==> 多实例模式：容器内并行 ${WARP_INSTANCE_COUNT} 条 WARP，仅暴露 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    echo "==> 提示：多实例需要 netns，建议 cap_add: [NET_ADMIN, SYS_ADMIN, SYS_MODULE]"
     trap multi_cleanup_on_exit INT TERM
     bootstrap_multi_instances
     multi_periodic_monitor
