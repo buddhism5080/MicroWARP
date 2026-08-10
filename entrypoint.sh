@@ -2134,16 +2134,16 @@ request_primary_rotate() {
         return 1
     fi
 
-    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        # force_rotate → worker must WG-reconnect (no SOCKS-only shortcut)
-        # Recovery logs must not pollute API stdout (only OK/ERR line belongs there).
-        # Never fail the API on recovery kickoff: promote already succeeded.
-        # (entrypoint uses set -e; recovery non-zero must not abort before OK line.)
-        request_instance_recovery "$OLD" "force_rotate" >&2 || true
-    fi
-
+    # Publish API result BEFORE old-primary recovery.
+    # Recovery may sync-detach from LB and exceed helper's wait window if done first.
     release_rotate_lock || true
     printf 'OK to=%s\n' "$NEW"
+
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        # force_rotate → WG reconnect in fully detached background (no API wait).
+        # Outer subshell: detach_instance_from_lb inside recovery must not block HTTP.
+        ( request_instance_recovery "$OLD" "force_rotate" || true ) >/dev/null 2>&1 &
+    fi
     return 0
 }
 
@@ -2295,22 +2295,36 @@ admin_cmd_worker() {
             rm -f "$STATUS_FILE"
         fi
         if [ -f "$REQ_FILE" ]; then
-            # Atomic publish: shell redirect creates RES_FILE immediately (empty).
-            # Helper used to race on that empty file and return rotate_failed.
+            # Publish the FIRST stdout line as soon as it appears (OK/ERR),
+            # without waiting for the rest of request_primary_rotate to finish.
+            # Previously: full-function redirect then mv → helper timed out while
+            # post-promote recovery/detach still ran.
             TMP="${RES_FILE}.tmp.$$"
-            rm -f "$TMP"
-            if request_primary_rotate > "$TMP" 2>/dev/null; then
-                :
-            else
-                if [ ! -s "$TMP" ]; then
+            rm -f "$TMP" "$RES_FILE"
+            # Use a pipe so we can mv on first line; drain the rest so writer never blocks.
+            # shellcheck disable=SC2094
+            {
+                request_primary_rotate 2>/dev/null
+                printf '\n'
+            } | {
+                if IFS= read -r LINE; then
+                    # strip CR; ignore pure empty first read if any
+                    LINE=$(printf '%s' "$LINE" | tr -d '\r')
+                    if [ -z "$LINE" ]; then
+                        IFS= read -r LINE || true
+                        LINE=$(printf '%s' "$LINE" | tr -d '\r')
+                    fi
+                    if [ -n "$LINE" ]; then
+                        printf '%s\n' "$LINE" > "$TMP"
+                    else
+                        printf 'ERR rotate_failed\n' > "$TMP"
+                    fi
+                else
                     printf 'ERR rotate_failed\n' > "$TMP"
                 fi
-            fi
-            # Ensure a final line exists even if stdout was empty after success path bugs.
-            if [ ! -s "$TMP" ]; then
-                printf 'ERR rotate_failed\n' > "$TMP"
-            fi
-            mv -f "$TMP" "$RES_FILE"
+                mv -f "$TMP" "$RES_FILE"
+                cat >/dev/null 2>&1 || true
+            }
             rm -f "$REQ_FILE"
         fi
         sleep 0.1
@@ -2487,7 +2501,7 @@ case "$METHOD $REQ_PATH" in
         rm -f "$RES_FILE" "${RES_FILE}.tmp."*
         : > "$REQ_FILE"
         I=0
-        while [ "$I" -lt 100 ]; do
+        while [ "$I" -lt 200 ]; do
             if [ -s "$RES_FILE" ]; then
                 RESP=$(tr -d '\r\n' < "$RES_FILE")
                 case "$RESP" in
