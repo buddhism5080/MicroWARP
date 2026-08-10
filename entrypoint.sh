@@ -2137,10 +2137,12 @@ request_primary_rotate() {
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         # force_rotate → worker must WG-reconnect (no SOCKS-only shortcut)
         # Recovery logs must not pollute API stdout (only OK/ERR line belongs there).
-        request_instance_recovery "$OLD" "force_rotate" >&2
+        # Never fail the API on recovery kickoff: promote already succeeded.
+        # (entrypoint uses set -e; recovery non-zero must not abort before OK line.)
+        request_instance_recovery "$OLD" "force_rotate" >&2 || true
     fi
 
-    release_rotate_lock
+    release_rotate_lock || true
     printf 'OK to=%s\n' "$NEW"
     return 0
 }
