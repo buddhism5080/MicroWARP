@@ -272,3 +272,34 @@ nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2
 ---
 
 *特别鸣谢: __LinuxDo__ ❤️
+
+---
+
+## Single-active rotate（`feat/single-active-rotate`）
+
+本分支实现**常驻单活**：任意时刻最多 1 个 HAProxy `ready`（primary）；其余健康实例为 `drain` 热备。
+
+### 产品锁
+
+| 项 | 结论 |
+|---|---|
+| 模式 | **常驻单活**（multi 即一主多备） |
+| 触发 | Web API 手动 rotate + primary 巡检失败自动 failover |
+| MAX_CONN | **本分支关闭**（不因 MAX_CONN 轮转） |
+| 选人 | `last_healthy_at` 最新 + 非 primary、非 recovering（并列更小 id） |
+| 旧主 | drain → 排空 → **至少 WG 重连**（禁止「只拉 SOCKS」）→ 回来仍 standby drain |
+| 实例数 | floor **N=2**（空/非法/`<2` → 2） |
+| Admin HTTP | **写死 `0.0.0.0:9180`**（宿主机 `-p 9180:9180`）；仅 `ADMIN_HTTP_TOKEN`（空=不启） |
+| API | `POST /rotate` 只回答是否切到新实例：`{"ok":true,"primary":N}` / `OK to=N`（不暴露旧主后续） |
+
+### 部署后 curl 验证
+
+```bash
+# 状态（运维）
+curl -s -H "Authorization: Bearer $ADMIN_HTTP_TOKEN" http://127.0.0.1:9180/status
+
+# 手动切主
+curl -s -X POST -H "Authorization: Bearer $ADMIN_HTTP_TOKEN" http://127.0.0.1:9180/rotate
+# 成功示例: {"ok":true,"primary":2}
+# 无候选 / 进行中: {"ok":false,"error":"no_candidate"|"in_progress"}
+```

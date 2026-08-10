@@ -41,6 +41,8 @@ MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # Unset/empty = wait indefinitely until idle (IM-friendly; no force-kill on timeout).
 # 0 = stop SOCKS immediately. Positive N = max wait seconds then force stop.
 INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
+# Admin HTTP: bind fixed 0.0.0.0:9180 (host maps port). Empty token disables server.
+ADMIN_HTTP_TOKEN="${ADMIN_HTTP_TOKEN:-}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -51,17 +53,18 @@ is_enabled() {
 }
 
 get_warp_instance_count() {
-    RAW_COUNT=${WARP_INSTANCES:-1}
+    # Single-active branch: floor 2 (need primary + at least one standby).
+    RAW_COUNT=${WARP_INSTANCES:-2}
 
     case "$RAW_COUNT" in
         ''|*[!0-9]*)
-            printf '1\n'
+            printf '2\n'
             return 0
             ;;
     esac
 
-    if [ "$RAW_COUNT" -lt 1 ]; then
-        printf '1\n'
+    if [ "$RAW_COUNT" -lt 2 ]; then
+        printf '2\n'
         return 0
     fi
 
@@ -130,6 +133,22 @@ get_instance_pid_file() {
 
 get_instance_recover_pid_file() {
     printf '%s/inst%s.recover.pid\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+get_admin_http_pid_file() {
+    printf '%s/admin_http.pid\n' "$INSTANCE_STATE_DIR"
+}
+
+get_primary_id_file() {
+    printf '%s/primary.id\n' "$INSTANCE_STATE_DIR"
+}
+
+get_rotate_lock_file() {
+    printf '%s/rotate.lock\n' "$INSTANCE_STATE_DIR"
+}
+
+get_instance_last_healthy_file() {
+    printf '%s/inst%s.last_healthy\n' "$INSTANCE_STATE_DIR" "$1"
 }
 
 get_instance_offline_since_file() {
@@ -1914,6 +1933,437 @@ count_healthy_instances() {
     printf '%s\n' "$COUNT"
 }
 
+# ---- Single-active rotate: primary + last_healthy + admin HTTP ----
+
+get_primary_id() {
+    local F
+    F=$(get_primary_id_file)
+    if [ -f "$F" ]; then
+        tr -d ' \n\r\t' < "$F"
+    else
+        printf ''
+    fi
+}
+
+set_primary_id() {
+    local ID="$1"
+    mkdir -p "$INSTANCE_STATE_DIR"
+    printf '%s\n' "$ID" > "$(get_primary_id_file)"
+}
+
+clear_primary_id() {
+    rm -f "$(get_primary_id_file)"
+}
+
+record_instance_last_healthy() {
+    local INST_ID="$1"
+    local F
+    F=$(get_instance_last_healthy_file "$INST_ID")
+    mkdir -p "$(dirname "$F")"
+    date +%s > "$F"
+}
+
+get_instance_last_healthy_at() {
+    local F VAL
+    F=$(get_instance_last_healthy_file "$1")
+    if [ -f "$F" ]; then
+        VAL=$(tr -d ' \n\r\t' < "$F")
+        case "$VAL" in
+            ''|*[!0-9]*) printf '0' ;;
+            *) printf '%s' "$VAL" ;;
+        esac
+    else
+        printf '0'
+    fi
+}
+
+clear_instance_last_healthy() {
+    rm -f "$(get_instance_last_healthy_file "$1")"
+}
+
+# Candidate = status=up, not primary, not recovering.
+# Pick max(last_healthy_at); tie-break = smaller inst id.
+find_latest_healthy_standby() {
+    local PRIMARY BEST_ID="" BEST_TS=-1 CAND TS
+    PRIMARY=$(get_primary_id)
+    for CAND in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        if [ -n "$PRIMARY" ] && [ "$CAND" = "$PRIMARY" ]; then
+            continue
+        fi
+        if [ "$(get_instance_status "$CAND")" != "up" ]; then
+            continue
+        fi
+        if is_instance_recovering "$CAND"; then
+            continue
+        fi
+        TS=$(get_instance_last_healthy_at "$CAND")
+        case "$TS" in
+            ''|*[!0-9]*) TS=0 ;;
+        esac
+        if [ -z "$BEST_ID" ] || [ "$TS" -gt "$BEST_TS" ]; then
+            BEST_ID=$CAND
+            BEST_TS=$TS
+        elif [ "$TS" -eq "$BEST_TS" ] && [ "$CAND" -lt "$BEST_ID" ] 2>/dev/null; then
+            BEST_ID=$CAND
+        fi
+    done
+    printf '%s\n' "$BEST_ID"
+}
+
+is_rotate_in_progress() {
+    local F PID
+    F=$(get_rotate_lock_file)
+    if [ ! -f "$F" ]; then
+        return 1
+    fi
+    PID=$(tr -d ' \n\r\t' < "$F" 2>/dev/null || true)
+    if is_live_pid "$PID"; then
+        return 0
+    fi
+    rm -f "$F"
+    return 1
+}
+
+acquire_rotate_lock() {
+    local F
+    F=$(get_rotate_lock_file)
+    mkdir -p "$INSTANCE_STATE_DIR"
+    if is_rotate_in_progress; then
+        return 1
+    fi
+    printf '%s\n' "$$" > "$F"
+    return 0
+}
+
+release_rotate_lock() {
+    rm -f "$(get_rotate_lock_file)"
+}
+
+haproxy_desired_state_for_instance() {
+    local INST_ID="$1"
+    local STATUS PRIMARY
+    STATUS=$(get_instance_status "$INST_ID")
+    PRIMARY=$(get_primary_id)
+    case "$STATUS" in
+        up)
+            if [ -n "$PRIMARY" ] && [ "$INST_ID" = "$PRIMARY" ]; then
+                printf 'ready\n'
+            else
+                # No primary yet, or standby: drain (hot standby / wait for promote)
+                printf 'drain\n'
+            fi
+            ;;
+        draining)
+            printf 'drain\n'
+            ;;
+        *)
+            printf 'maint\n'
+            ;;
+    esac
+}
+
+haproxy_reapply_instance_states() {
+    local _iid DESIRED
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        DESIRED=$(haproxy_desired_state_for_instance "$_iid")
+        haproxy_set_server_state "$_iid" "$DESIRED" || true
+    done
+}
+
+promote_primary() {
+    local NEW="$1"
+    local OLD
+    OLD=$(get_primary_id)
+    if [ -z "$NEW" ]; then
+        return 1
+    fi
+    if [ "$(get_instance_status "$NEW")" != "up" ]; then
+        echo "==> [MicroWARP] promote_primary: inst${NEW} 不是 up，拒绝"
+        return 1
+    fi
+    set_primary_id "$NEW"
+    haproxy_reapply_instance_states
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        echo "==> [MicroWARP] primary: inst${OLD} → inst${NEW}"
+    else
+        echo "==> [MicroWARP] primary 设为 inst${NEW}"
+    fi
+    return 0
+}
+
+# Prints: OK to=N | ERR no_candidate | ERR in_progress
+request_primary_rotate() {
+    local OLD NEW
+    if ! acquire_rotate_lock; then
+        printf 'ERR in_progress\n'
+        return 1
+    fi
+
+    OLD=$(get_primary_id)
+    NEW=$(find_latest_healthy_standby)
+    if [ -z "$NEW" ]; then
+        release_rotate_lock
+        printf 'ERR no_candidate\n'
+        return 1
+    fi
+
+    if ! promote_primary "$NEW"; then
+        release_rotate_lock
+        printf 'ERR no_candidate\n'
+        return 1
+    fi
+
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        # force_rotate → worker must WG-reconnect (no SOCKS-only shortcut)
+        request_instance_recovery "$OLD" "force_rotate"
+    fi
+
+    release_rotate_lock
+    printf 'OK to=%s\n' "$NEW"
+    return 0
+}
+
+failover_primary_on_health_fail() {
+    local FAILED="$1"
+    local PRIMARY NEW
+    PRIMARY=$(get_primary_id)
+    if [ -z "$PRIMARY" ] || [ "$FAILED" != "$PRIMARY" ]; then
+        request_instance_recovery "$FAILED"
+        return 0
+    fi
+
+    # Temporarily clear primary so FAILED is not treated as primary during selection;
+    # candidates require status=up and not primary. FAILED will be detached by recovery.
+    clear_primary_id
+    NEW=$(find_latest_healthy_standby)
+    if [ -n "$NEW" ]; then
+        promote_primary "$NEW" || true
+        echo "==> [MicroWARP] primary 巡检失败 failover: inst${FAILED} → inst${NEW}"
+    else
+        echo "==> [MicroWARP] primary 巡检失败且无健康 standby；恢复后首个 up 抢主"
+    fi
+    request_instance_recovery "$FAILED"
+    return 0
+}
+
+stop_admin_http_server() {
+    local PID_FILE PID WORKER
+    PID_FILE=$(get_admin_http_pid_file)
+    WORKER="${INSTANCE_STATE_DIR}/admin_cmd.worker.pid"
+    if [ -f "$WORKER" ]; then
+        PID=$(tr -d ' \n\r\t' < "$WORKER" 2>/dev/null || true)
+        if is_live_pid "$PID"; then
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+        fi
+        rm -f "$WORKER"
+    fi
+    if [ -f "$PID_FILE" ]; then
+        PID=$(tr -d ' \n\r\t' < "$PID_FILE" 2>/dev/null || true)
+        if is_live_pid "$PID"; then
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+}
+
+build_status_json() {
+    local _iid STATUS ROLE PRIMARY LH FIRST=1 PJSON
+    PRIMARY=$(get_primary_id)
+    if [ -n "$PRIMARY" ]; then
+        PJSON=$PRIMARY
+    else
+        PJSON=null
+    fi
+    printf '{"ok":true,"primary":%s,"warp_instances":%s,"instances":[' "$PJSON" "$WARP_INSTANCE_COUNT"
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        STATUS=$(get_instance_status "$_iid")
+        LH=$(get_instance_last_healthy_at "$_iid")
+        if [ -n "$PRIMARY" ] && [ "$_iid" = "$PRIMARY" ]; then
+            ROLE=primary
+        elif [ "$STATUS" = "up" ]; then
+            ROLE=standby
+        else
+            ROLE=other
+        fi
+        if [ "$FIRST" -eq 1 ]; then
+            FIRST=0
+        else
+            printf ','
+        fi
+        printf '{"id":%s,"status":"%s","role":"%s","last_healthy":%s}' "$_iid" "$STATUS" "$ROLE" "$LH"
+    done
+    printf ']}'
+}
+
+admin_cmd_worker() {
+    local REQ_FILE RES_FILE STATUS_FILE STATUS_RES
+    REQ_FILE="${INSTANCE_STATE_DIR}/admin.rotate.req"
+    RES_FILE="${INSTANCE_STATE_DIR}/admin.rotate.res"
+    STATUS_FILE="${INSTANCE_STATE_DIR}/admin.status.req"
+    STATUS_RES="${INSTANCE_STATE_DIR}/admin.status.res"
+    while true; do
+        if [ -f "$STATUS_FILE" ]; then
+            build_status_json > "$STATUS_RES" 2>/dev/null || printf '{"ok":false}' > "$STATUS_RES"
+            rm -f "$STATUS_FILE"
+        fi
+        if [ -f "$REQ_FILE" ]; then
+            request_primary_rotate > "$RES_FILE" 2>/dev/null || {
+                # request_primary_rotate prints ERR line even on failure; ensure file exists
+                if [ ! -f "$RES_FILE" ] || [ ! -s "$RES_FILE" ]; then
+                    printf 'ERR rotate_failed\n' > "$RES_FILE"
+                fi
+            }
+            rm -f "$REQ_FILE"
+        fi
+        sleep 0.1
+    done
+}
+
+admin_http_loop() {
+    local HELPER
+    HELPER="${INSTANCE_STATE_DIR}/admin_http_handler.sh"
+    mkdir -p "$INSTANCE_STATE_DIR"
+    cat > "$HELPER" <<'HELPER_EOF'
+#!/bin/sh
+STATE_DIR="${INSTANCE_STATE_DIR:-/var/run/microwarp}"
+TOKEN_EXPECT="${ADMIN_HTTP_TOKEN:-}"
+REQ_FILE="${STATE_DIR}/admin.rotate.req"
+RES_FILE="${STATE_DIR}/admin.rotate.res"
+STATUS_FILE="${STATE_DIR}/admin.status.req"
+STATUS_RES="${STATE_DIR}/admin.status.res"
+
+read_request() {
+    LINE=""
+    IFS= read -r LINE || return 1
+    LINE=$(printf '%s' "$LINE" | tr -d '\r')
+    METHOD=$(printf '%s' "$LINE" | cut -d' ' -f1)
+    PATHQ=$(printf '%s' "$LINE" | cut -d' ' -f2)
+    PATH=$(printf '%s' "$PATHQ" | cut -d'?' -f1)
+    TOKEN=""
+    while IFS= read -r H; do
+        H=$(printf '%s' "$H" | tr -d '\r')
+        [ -z "$H" ] && break
+        case "$H" in
+            [Aa]uthorization:*[Bb]earer*)
+                TOKEN=$(printf '%s' "$H" | sed -n 's/.*[Bb]earer  *//p' | tr -d ' \t')
+                ;;
+            [Xx]-[Aa]dmin-[Tt]oken:*)
+                TOKEN=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
+                ;;
+        esac
+    done
+    case "$PATHQ" in
+        *token=*)
+            if [ -z "$TOKEN" ]; then
+                TOKEN=$(printf '%s' "$PATHQ" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')
+            fi
+            ;;
+    esac
+}
+
+respond() {
+    CODE="$1"
+    BODY="$2"
+    LEN=$(printf '%s' "$BODY" | wc -c | tr -d ' ')
+    printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+        "$CODE" "$LEN" "$BODY"
+}
+
+read_request || { respond '400 Bad Request' '{"ok":false,"error":"bad_request"}'; exit 0; }
+
+if [ -z "$TOKEN_EXPECT" ] || [ -z "$TOKEN" ] || [ "$TOKEN" != "$TOKEN_EXPECT" ]; then
+    respond '401 Unauthorized' '{"ok":false,"error":"unauthorized"}'
+    exit 0
+fi
+
+case "$METHOD $PATH" in
+    "GET /status"|"GET /status/")
+        rm -f "$STATUS_RES"
+        : > "$STATUS_FILE"
+        I=0
+        while [ "$I" -lt 50 ]; do
+            if [ -f "$STATUS_RES" ]; then
+                BODY=$(cat "$STATUS_RES")
+                respond '200 OK' "$BODY"
+                rm -f "$STATUS_FILE" "$STATUS_RES"
+                exit 0
+            fi
+            sleep 0.1
+            I=$((I + 1))
+        done
+        respond '504 Gateway Timeout' '{"ok":false,"error":"status_timeout"}'
+        rm -f "$STATUS_FILE"
+        ;;
+    "POST /rotate"|"POST /rotate/")
+        rm -f "$RES_FILE"
+        : > "$REQ_FILE"
+        I=0
+        while [ "$I" -lt 100 ]; do
+            if [ -f "$RES_FILE" ]; then
+                RESP=$(tr -d '\r\n' < "$RES_FILE")
+                rm -f "$REQ_FILE" "$RES_FILE"
+                case "$RESP" in
+                    OK\ to=*)
+                        TO=$(printf '%s' "$RESP" | sed 's/^OK to=//')
+                        respond '200 OK' "$(printf '{"ok":true,"primary":%s}' "$TO")"
+                        ;;
+                    ERR\ in_progress)
+                        respond '409 Conflict' '{"ok":false,"error":"in_progress"}'
+                        ;;
+                    ERR\ no_candidate)
+                        respond '409 Conflict' '{"ok":false,"error":"no_candidate"}'
+                        ;;
+                    *)
+                        respond '500 Internal Server Error' '{"ok":false,"error":"rotate_failed"}'
+                        ;;
+                esac
+                exit 0
+            fi
+            sleep 0.1
+            I=$((I + 1))
+        done
+        respond '504 Gateway Timeout' '{"ok":false,"error":"rotate_timeout"}'
+        rm -f "$REQ_FILE"
+        ;;
+    *)
+        respond '404 Not Found' '{"ok":false,"error":"not_found"}'
+        ;;
+esac
+HELPER_EOF
+    chmod +x "$HELPER"
+    export INSTANCE_STATE_DIR ADMIN_HTTP_TOKEN
+    admin_cmd_worker &
+    printf '%s\n' "$!" > "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid"
+    # Fixed bind: 0.0.0.0:9180 — host does -p 9180:9180
+    while true; do
+        socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr,fork EXEC:"$HELPER" 2>/dev/null || \
+            socat -T30 TCP-LISTEN:9180,bind=0.0.0.0,reuseaddr EXEC:"$HELPER" 2>/dev/null || \
+            sleep 1
+    done
+}
+
+start_admin_http_server() {
+    local PID
+    if [ -z "${ADMIN_HTTP_TOKEN:-}" ]; then
+        echo "==> [MicroWARP] admin HTTP 禁用（ADMIN_HTTP_TOKEN 为空；固定监听本应是 0.0.0.0:9180）"
+        return 0
+    fi
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "==> [MicroWARP] [WARN] 无 socat，无法启动 admin HTTP"
+        return 0
+    fi
+    stop_admin_http_server || true
+    echo "==> [MicroWARP] 启动 admin HTTP: 0.0.0.0:9180 (token 鉴权；宿主机映射此端口)"
+    mkdir -p "$INSTANCE_STATE_DIR"
+    admin_http_loop &
+    PID=$!
+    printf '%s\n' "$PID" > "$(get_admin_http_pid_file)"
+    echo "==> [MicroWARP] admin HTTP PID ${PID}"
+}
+
+
 enable_host_forwarding() {
     if [ -w /proc/sys/net/ipv4/ip_forward ]; then
         echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -2373,13 +2823,26 @@ restart_instance_with_new_identity() {
 
 mark_instance_up() {
     local INST_ID="$1"
+    local PRIMARY
     start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
-    # Re-enable LB scheduling without rewriting haproxy.cfg / reload.
-    haproxy_set_server_state "$INST_ID" "ready" || true
-    echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记为健康（SOCKS up + HAProxy ready）"
+    record_instance_last_healthy "$INST_ID"
+    PRIMARY=$(get_primary_id)
+    if [ -z "$PRIMARY" ]; then
+        # First healthy instance claims primary.
+        set_primary_id "$INST_ID"
+        haproxy_set_server_state "$INST_ID" "ready" || true
+        echo "==> [MicroWARP] [inst${INST_ID}] ✅ 已标记健康并抢到 primary（HAProxy ready）"
+    elif [ "$INST_ID" = "$PRIMARY" ]; then
+        haproxy_set_server_state "$INST_ID" "ready" || true
+        echo "==> [MicroWARP] [inst${INST_ID}] ✅ primary 健康（HAProxy ready）"
+    else
+        # Standby hot spare: WARP+SOCKS up, no new client traffic.
+        haproxy_set_server_state "$INST_ID" "drain" || true
+        echo "==> [MicroWARP] [inst${INST_ID}] ✅ standby 健康（HAProxy drain 热备）"
+    fi
 }
 
 # Runtime drain only — no config rewrite, no reload.
@@ -2436,16 +2899,8 @@ _reload_haproxy_from_status_unlocked() {
         echo "==> [MicroWARP] HAProxy 配置未变但进程不在，冷启动..."
         if haproxy_cold_start "$HAPROXY_CFG"; then
             echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
-            # Re-apply ready for currently up instances after cold start.
-            for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-                if [ "$(get_instance_status "$_iid")" = "up" ]; then
-                    haproxy_set_server_state "$_iid" "ready" || true
-                elif [ "$(get_instance_status "$_iid")" = "draining" ]; then
-                    haproxy_set_server_state "$_iid" "drain" || true
-                else
-                    haproxy_set_server_state "$_iid" "maint" || true
-                fi
-            done
+            # Single-active: re-apply ready/drain/maint from primary mapping.
+            haproxy_reapply_instance_states
             return 0
         fi
         return 1
@@ -2457,14 +2912,8 @@ _reload_haproxy_from_status_unlocked() {
     if refresh_haproxy_pid; then
         if haproxy_try_soft_reload "$HAPROXY_CFG"; then
             echo "==> [MicroWARP] HAProxy soft-reload 完成（master PID: ${HAPROXY_PID}）"
-            # Admin states reset on full config replace — re-apply from status files.
-            for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-                case "$(get_instance_status "$_iid")" in
-                    up) haproxy_set_server_state "$_iid" "ready" || true ;;
-                    draining) haproxy_set_server_state "$_iid" "drain" || true ;;
-                    *) haproxy_set_server_state "$_iid" "maint" || true ;;
-                esac
-            done
+            # Admin states reset on full config replace — single-active reapply.
+            haproxy_reapply_instance_states
             return 0
         fi
         echo "==> [MicroWARP] [WARN] HAProxy soft-reload 失败，尝试冷启动"
@@ -2479,13 +2928,7 @@ _reload_haproxy_from_status_unlocked() {
 
     if haproxy_cold_start "$HAPROXY_CFG"; then
         echo "==> [MicroWARP] 🚀 HAProxy 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, master PID: ${HAPROXY_PID})"
-        for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-            case "$(get_instance_status "$_iid")" in
-                up) haproxy_set_server_state "$_iid" "ready" || true ;;
-                draining) haproxy_set_server_state "$_iid" "drain" || true ;;
-                *) haproxy_set_server_state "$_iid" "maint" || true ;;
-            esac
-        done
+        haproxy_reapply_instance_states
         return 0
     fi
 
@@ -2508,11 +2951,10 @@ instance_recovery_worker() {
     # IMPORTANT: use local INST_ID. Nested helpers (reload_haproxy, status loops)
     # also assign INST_ID; without local, a recovery for inst12 becomes inst20.
     local INST_ID="$1"
-    # Optional reason: "max_conn" forces full reconnect/re-register path (same
-    # effort as health-check failure), skipping "WARP still OK → only restart SOCKS".
+    # reason is logged only. Single-active branch NEVER keeps the old WG tunnel via
+    # "SOCKS-only shortcut" — every recovery must WG reconnect (or re-register).
     local REASON="${2:-}"
     local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED CONF_PATH
-    local SKIP_HEALTHY_SHORTCUT=0
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     # Parent (request_instance_recovery) records the real job PID via $!.
     # Do NOT write $$ here: in BusyBox ash a backgrounded function often keeps
@@ -2522,21 +2964,17 @@ instance_recovery_worker() {
 
     BACKOFF=5
     MAX_BACKOFF=60
-    case "$REASON" in
-        max_conn|force_rotate|force)
-            SKIP_HEALTHY_SHORTCUT=1
-            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}，与巡检失败同等：强制重连/重注册)"
-            ;;
-        *)
-            echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile${REASON:+, reason=$REASON})"
-            ;;
-    esac
+    if [ -n "$REASON" ]; then
+        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}；强制 WG 重连/重注册，不保留旧隧道)"
+    else
+        echo "==> [MicroWARP] [inst${INST_ID}] 后台复活 worker 启动 (强制 WG 重连/重注册，不保留旧隧道)"
+    fi
 
     # Parent already kicked this backend out of HAProxy. Finish offline gracefully:
     # wait until not busy (or drain timeout), then stop internal SOCKS before we
     # touch the tunnel / re-register.
     drain_and_stop_instance_socks "$INST_ID"
-    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止，开始复活流程"
+    echo "==> [MicroWARP] [inst${INST_ID}] 内部 SOCKS 已停止，开始复活流程（不走「只拉 SOCKS」捷径）"
 
     while true; do
         CONF_PATH=$(get_instance_conf_path "$INST_ID")
@@ -2555,23 +2993,8 @@ instance_recovery_worker() {
             exit 0
         fi
 
-        # Normal recovery (e.g. probe fail): if tunnel is already fine after SOCKS
-        # stop, just bring SOCKS back. MAX_CONN rotation must NOT take this shortcut
-        # — user wants the same treatment as health-check failure (reconnect/re-reg).
-        if [ "$SKIP_HEALTHY_SHORTCUT" -eq 0 ] && run_instance_health_checks "$INST_ID"; then
-            mark_instance_up "$INST_ID"
-            reload_haproxy_from_status
-            echo "==> [MicroWARP] [inst${INST_ID}] 🎉 后台复活成功，已重新加入 LB"
-            rm -f "$PID_FILE"
-            trap - EXIT INT TERM
-            exit 0
-        fi
-        if [ "$SKIP_HEALTHY_SHORTCUT" -eq 1 ]; then
-            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN/强制轮转：跳过「仍健康只拉 SOCKS」，执行 WG 重连/重注册"
-            # Only force the first cycle; after a full reconnect attempt, allow
-            # normal healthy success so we don't loop reconnect forever while up.
-            SKIP_HEALTHY_SHORTCUT=0
-        fi
+        # No SOCKS-only shortcut: old WG tunnel is never "kept as-is".
+        # Always proceed to WG reconnect / re-register below.
 
         FORCE_NEW=0
         if instance_should_force_new_config "$INST_ID"; then
@@ -2709,7 +3132,9 @@ bootstrap_multi_instances() {
         set_instance_status "$_bid" "down"
         record_instance_offline_since "$_bid"
     done
+    clear_primary_id
     reload_haproxy_from_status
+    start_admin_http_server
 
     for _bid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
         CONF_PATH=$(get_instance_conf_path "$_bid")
@@ -2876,37 +3301,33 @@ probe_instance_and_schedule_recovery() {
                 return 0
                 ;;
             up)
-                # Already serving: do NOT mark_instance_up (avoids ready spam / accidental drain cancel).
+                # Already serving: refresh last_healthy for rotate selection; do NOT mark_up.
+                record_instance_last_healthy "$INST_ID"
                 ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
                 case "$ELAPSED" in
                     ''|*[!0-9]*)
-                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线"
+                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已刷新 last_healthy）"
                         ;;
                     *)
                         UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
-                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
+                        echo "==> [MicroWARP] [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}；已刷新 last_healthy）"
                         ;;
                 esac
                 ;;
             *)
-                # down / unknown → bring back into pool
+                # down / unknown → bring back into pool (standby drain or primary ready via mark_up)
                 mark_instance_up "$INST_ID"
                 reload_haproxy_from_status || true
-                echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并重新加入 LB"
+                echo "==> [MicroWARP] [inst${INST_ID}] 已恢复并按单活规则加入池"
                 ;;
         esac
-        # MAX_CONN: enter drain even if busy; worker waits until idle (or INSTANCE_DRAIN_TIMEOUT if set).
-        if instance_should_force_rotate_for_max_conn "$INST_ID"; then
-            BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [MicroWARP] [inst${INST_ID}] MAX_CONN_DURATION 到期(busy=${BUSY_NOW}) → runtime drain，空闲后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
-            request_instance_recovery "$INST_ID" "max_conn"
-            return 0
-        fi
+        # Single-active branch: MAX_CONN auto-rotate disabled (env may remain; must not rotate).
         return 0
     fi
 
     echo "==> [MicroWARP] [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
-    request_instance_recovery "$INST_ID"
+    # Primary fail → failover to latest healthy standby (if any), then recover failed.
+    failover_primary_on_health_fail "$INST_ID"
     return 0
 }
 
@@ -2949,6 +3370,7 @@ multi_periodic_monitor() {
 multi_cleanup_on_exit() {
     echo "==> [MicroWARP] 收到退出信号，正在清理多实例资源..."
 
+    stop_admin_http_server || true
     stop_all_instance_recoveries
 
     refresh_haproxy_pid || true
@@ -2972,7 +3394,7 @@ multi_cleanup_on_exit() {
 # 1. 初始化
 # ==========================================
 WARP_INSTANCE_COUNT=$(get_warp_instance_count)
-echo "==> [MicroWARP] WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-1})"
+echo "==> [MicroWARP] WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-2}；单活分支下限 2)"
 
 if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf

@@ -46,25 +46,29 @@ assert_contains() {
     fi
 }
 
-test_default_instance_count_is_one() {
+test_default_instance_count_floor_two() {
+    # Single-active branch: floor 2 (primary + standby).
     WARP_INSTANCES=''
-    assert_eq "$(get_warp_instance_count)" '1' 'blank WARP_INSTANCES should default to 1'
+    assert_eq "$(get_warp_instance_count)" '2' 'blank WARP_INSTANCES should floor to 2'
 }
 
 test_explicit_instance_count() {
     WARP_INSTANCES='3'
     assert_eq "$(get_warp_instance_count)" '3' 'explicit positive count should be honored'
+
+    WARP_INSTANCES='1'
+    assert_eq "$(get_warp_instance_count)" '2' '1 should floor to 2 on single-active branch'
 }
 
 test_invalid_instance_count_falls_back() {
     WARP_INSTANCES='abc'
-    assert_eq "$(get_warp_instance_count)" '1' 'non-numeric should fall back to 1'
+    assert_eq "$(get_warp_instance_count)" '2' 'non-numeric should fall back to 2'
 
     WARP_INSTANCES='0'
-    assert_eq "$(get_warp_instance_count)" '1' 'zero should fall back to 1'
+    assert_eq "$(get_warp_instance_count)" '2' 'zero should fall back to 2'
 
     WARP_INSTANCES='-2'
-    assert_eq "$(get_warp_instance_count)" '1' 'negative should fall back to 1'
+    assert_eq "$(get_warp_instance_count)" '2' 'negative should fall back to 2'
 }
 
 test_instance_count_is_capped() {
@@ -971,7 +975,7 @@ test_instance_drain_helpers() {
     INSTANCE_DRAIN_TIMEOUT=30
 }
 
-test_default_instance_count_is_one
+test_default_instance_count_floor_two
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
 test_instance_count_is_capped
@@ -1000,5 +1004,172 @@ test_config_stale_offline_threshold
 test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
+test_last_healthy_pick_latest_standby
+test_haproxy_desired_state_single_active
+test_mark_instance_up_primary_then_standby_drain
+test_request_primary_rotate_thin_ok
+test_recovery_worker_has_no_socks_only_shortcut
+test_probe_disables_max_conn_on_this_branch
+
+
+# ---- Single-active rotate (feat/single-active-rotate) ----
+
+test_last_healthy_pick_latest_standby() {
+    local SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    WARP_INSTANCE_COUNT=3
+    clear_primary_id
+    set_primary_id 1
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    # Stamp last_healthy: 2 newest, 3 middle, 1 oldest (primary excluded anyway)
+    printf '100\n' > "$(get_instance_last_healthy_file 1)"
+    printf '300\n' > "$(get_instance_last_healthy_file 2)"
+    printf '200\n' > "$(get_instance_last_healthy_file 3)"
+    is_instance_recovering() { return 1; }
+    assert_eq "$(find_latest_healthy_standby)" '2' 'should pick highest last_healthy non-primary'
+
+    # Tie-break: equal stamps → smaller id
+    printf '300\n' > "$(get_instance_last_healthy_file 3)"
+    assert_eq "$(find_latest_healthy_standby)" '2' 'tie-break prefers smaller id among equal stamps'
+
+    # No other up → empty
+    set_instance_status 2 down
+    set_instance_status 3 down
+    assert_eq "$(find_latest_healthy_standby)" '' 'no candidate when only primary up'
+
+    unset -f is_instance_recovering mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_haproxy_desired_state_single_active() {
+    local SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    WARP_INSTANCE_COUNT=3
+    set_primary_id 2
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 draining
+    assert_eq "$(haproxy_desired_state_for_instance 2)" 'ready' 'primary up → ready'
+    assert_eq "$(haproxy_desired_state_for_instance 1)" 'drain' 'standby up → drain'
+    assert_eq "$(haproxy_desired_state_for_instance 3)" 'drain' 'draining → drain'
+    set_instance_status 1 down
+    assert_eq "$(haproxy_desired_state_for_instance 1)" 'maint' 'down → maint'
+    unset -f mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_mark_instance_up_primary_then_standby_drain() {
+    local SAVED="$INSTANCE_STATE_DIR" LOG
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/states.log"
+    : > "$LOG"
+    WARP_INSTANCE_COUNT=3
+    clear_primary_id
+    start_instance_socks() { :; }
+    clear_instance_offline_since() { :; }
+    record_instance_online_since() { :; }
+    haproxy_set_server_state() { echo "$1:$2" >> "$LOG"; return 0; }
+
+    mark_instance_up 1 >/dev/null
+    assert_eq "$(get_primary_id)" '1' 'first up claims primary'
+    assert_eq "$(get_instance_status 1)" 'up' 'status up'
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '1:ready' 'primary ready'
+
+    mark_instance_up 2 >/dev/null
+    assert_eq "$(get_primary_id)" '1' 'primary unchanged'
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '2:drain' 'second up is standby drain'
+    # last_healthy stamped
+    [ -f "$(get_instance_last_healthy_file 1)" ] || { echo 'missing last_healthy 1' >&2; exit 1; }
+    [ -f "$(get_instance_last_healthy_file 2)" ] || { echo 'missing last_healthy 2' >&2; exit 1; }
+
+    unset -f start_instance_socks clear_instance_offline_since record_instance_online_since \
+        haproxy_set_server_state mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_request_primary_rotate_thin_ok() {
+    local SAVED="$INSTANCE_STATE_DIR" OUT RECS
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    WARP_INSTANCE_COUNT=3
+    clear_primary_id
+    set_primary_id 1
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    printf '10\n' > "$(get_instance_last_healthy_file 1)"
+    printf '50\n' > "$(get_instance_last_healthy_file 2)"
+    printf '40\n' > "$(get_instance_last_healthy_file 3)"
+    is_instance_recovering() { return 1; }
+    is_live_pid() { return 1; }  # no stale rotate lock
+    haproxy_set_server_state() { return 0; }
+    RECS="$INSTANCE_STATE_DIR/rec.log"
+    : > "$RECS"
+    request_instance_recovery() { echo "rec:$1:$2" >> "$RECS"; }
+
+    OUT=$(request_primary_rotate)
+    assert_eq "$OUT" 'OK to=2' 'thin OK line to latest healthy standby'
+    assert_eq "$(get_primary_id)" '2' 'primary switched'
+    assert_contains "$(tr '\n' ' ' < "$RECS")" 'rec:1:force_rotate' 'old primary force_rotate recovery'
+    # no drain/busy fields in response
+    case "$OUT" in
+        *from=*|*busy=*|*drain=*) echo "thin API leaked extra fields: $OUT" >&2; exit 1 ;;
+    esac
+
+    # no candidate
+    set_instance_status 1 down
+    set_instance_status 3 down
+    # primary is 2, only self up
+    OUT=$(request_primary_rotate || true)
+    assert_eq "$OUT" 'ERR no_candidate' 'refuse when no standby up'
+
+    unset -f is_instance_recovering is_live_pid haproxy_set_server_state \
+        request_instance_recovery mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_recovery_worker_has_no_socks_only_shortcut() {
+    # Static contract: worker must not contain SKIP_HEALTHY_SHORTCUT success path.
+    if grep -q 'SKIP_HEALTHY_SHORTCUT' entrypoint.sh; then
+        echo 'single-active branch must not keep SKIP_HEALTHY_SHORTCUT SOCKS-only path' >&2
+        exit 1
+    fi
+    if ! grep -q '强制 WG 重连/重注册，不保留旧隧道' entrypoint.sh; then
+        echo 'recovery worker must log force WG reconnect' >&2
+        exit 1
+    fi
+    if ! grep -q 'TCP-LISTEN:9180,bind=0.0.0.0' entrypoint.sh; then
+        echo 'admin HTTP must hard-bind 0.0.0.0:9180' >&2
+        exit 1
+    fi
+    if grep -q 'ADMIN_HTTP_ADDR\|ADMIN_HTTP_PORT' entrypoint.sh; then
+        echo 'must not introduce ADMIN_HTTP_ADDR/PORT config' >&2
+        exit 1
+    fi
+}
+
+test_probe_disables_max_conn_on_this_branch() {
+    # probe body must not call request_instance_recovery ... max_conn
+    if grep -n 'request_instance_recovery.*"max_conn"' entrypoint.sh | grep -v '^[^:]*:.*#'; then
+        # allow comments only; fail if active call remains in probe path
+        if grep -A80 'probe_instance_and_schedule_recovery()' entrypoint.sh | grep -q 'max_conn'; then
+            echo 'probe must not trigger max_conn recovery on single-active branch' >&2
+            exit 1
+        fi
+    fi
+}
 
 printf 'PASS test_multi_instance_helpers\n'
