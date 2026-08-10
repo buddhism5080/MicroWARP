@@ -321,3 +321,33 @@ curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" http://127.0.0.1:91
 # 无候选 / 进行中: {"ok":false,"error":"no_candidate"|"in_progress"}
 # 鉴权失败: {"ok":false,"error":"invalid_signature_or_timestamp"}
 ```
+
+### 客户端如何调用（简版）
+
+容器映射：宿主机 `-p 9180:9180`，环境变量设置 `ADMIN_HTTP_TOKEN=<secret>`。
+
+**1. 查状态**
+
+```bash
+SECRET=your-secret
+TS=$(date +%s)
+SIG=$(printf 'GET\n/status\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -s -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
+  http://<host>:9180/status
+```
+
+**2. 手动切主**
+
+```bash
+TS=$(date +%s)
+SIG=$(printf 'POST\n/rotate\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
+  http://<host>:9180/rotate
+# 成功: {"ok":true,"primary":2}
+# 失败: {"ok":false,"error":"no_candidate"|"in_progress"|"invalid_signature_or_timestamp"}
+```
+
+**注意**：
+- 签名串固定为 `METHOD\nPATH\nTIMESTAMP`（PATH 不含 query）。
+- 时间戳与服务器相差超过 **120 秒** 会被拒。
+- 客户端只需要关心 rotate 是否成功切到新实例，不必轮询旧主状态。

@@ -2014,32 +2014,49 @@ find_latest_healthy_standby() {
 }
 
 is_rotate_in_progress() {
-    local F PID
-    F=$(get_rotate_lock_file)
-    if [ ! -f "$F" ]; then
+    local D PID
+    D="${INSTANCE_STATE_DIR}/rotate.lock.d"
+    if [ ! -d "$D" ]; then
         return 1
     fi
-    PID=$(tr -d ' \n\r\t' < "$F" 2>/dev/null || true)
+    PID=""
+    if [ -f "${D}/pid" ]; then
+        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+    fi
     if is_live_pid "$PID"; then
         return 0
     fi
-    rm -f "$F"
+    # Stale lock dir from crashed process
+    rm -rf "$D"
     return 1
 }
 
+# Atomic-ish lock via mkdir (portable; better than plain pid file race).
 acquire_rotate_lock() {
-    local F
-    F=$(get_rotate_lock_file)
+    local D
+    D="${INSTANCE_STATE_DIR}/rotate.lock.d"
     mkdir -p "$INSTANCE_STATE_DIR"
     if is_rotate_in_progress; then
         return 1
     fi
-    printf '%s\n' "$$" > "$F"
-    return 0
+    if mkdir "$D" 2>/dev/null; then
+        printf '%s\n' "$$" > "${D}/pid"
+        return 0
+    fi
+    # Lost race or leftover empty dir
+    if is_rotate_in_progress; then
+        return 1
+    fi
+    rm -rf "$D" 2>/dev/null || true
+    if mkdir "$D" 2>/dev/null; then
+        printf '%s\n' "$$" > "${D}/pid"
+        return 0
+    fi
+    return 1
 }
 
 release_rotate_lock() {
-    rm -f "$(get_rotate_lock_file)"
+    rm -rf "${INSTANCE_STATE_DIR}/rotate.lock.d"
 }
 
 haproxy_desired_state_for_instance() {
@@ -3504,6 +3521,16 @@ multi_cleanup_on_exit() {
 
     stop_admin_http_server || true
     stop_all_instance_recoveries
+    release_rotate_lock || true
+    # Admin IPC leftovers (req/res/handler) so next boot starts clean
+    rm -f \
+        "${INSTANCE_STATE_DIR}/admin.rotate.req" \
+        "${INSTANCE_STATE_DIR}/admin.rotate.res" \
+        "${INSTANCE_STATE_DIR}/admin.status.req" \
+        "${INSTANCE_STATE_DIR}/admin.status.res" \
+        "${INSTANCE_STATE_DIR}/admin_http_handler.sh" \
+        "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid" \
+        "$(get_admin_http_pid_file)" 2>/dev/null || true
 
     refresh_haproxy_pid || true
     if is_live_pid "$HAPROXY_PID"; then
