@@ -2219,13 +2219,20 @@ request_primary_rotate() {
     fi
 
     # Unlock + publish HTTP result IMMEDIATELY after promote (atomic file).
-    # Do not wait on recovery/detach; helper races the result file, not stdout.
+    # Helper races the result file — must not wait on old-primary reconnect.
     release_rotate_lock || true
     publish_rotate_result_line "OK to=${NEW}"
     printf 'OK to=%s\n' "$NEW"
 
+    # Old primary MUST leave the pool and do full WG reconnect (product lock).
+    # request_instance_recovery itself is fast: runtime drain kick + spawn worker.
+    # Long drain/WG work runs inside the worker — do NOT wrap in a silenced
+    # background subshell (that hid all recovery logs and made "下线重连" look
+    # like it never happened after a successful primary switch).
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        ( request_instance_recovery "$OLD" "force_rotate" || true ) >/dev/null 2>&1 &
+        echo "==> rotate: 旧 primary inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
+        # Never let recovery abort the thin OK path (set -e); promote already done.
+        request_instance_recovery "$OLD" "force_rotate" || true
     fi
     return 0
 }
@@ -2239,16 +2246,20 @@ failover_primary_on_health_fail() {
         return 0
     fi
 
-    # Temporarily clear primary so FAILED is not treated as primary during selection;
-    # candidates require status=up and not primary. FAILED will be detached by recovery.
+    # CRITICAL: detach FAILED before selection. clear_primary_id alone is not
+    # enough — FAILED is still status=up with the freshest last_healthy, so
+    # find_latest_healthy_standby would re-pick it as the new primary.
+    detach_instance_from_lb "$FAILED" || true
     clear_primary_id
     NEW=$(find_latest_healthy_standby)
-    if [ -n "$NEW" ]; then
+    if [ -n "$NEW" ] && [ "$NEW" != "$FAILED" ]; then
         promote_primary "$NEW" || true
         echo "==> primary 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
     else
         echo "==> primary 巡检失败且无健康 standby；恢复后首个 up 抢主" >&2
     fi
+    # Already draining; request_instance_recovery re-detach is idempotent and
+    # spawns the force WG reconnect worker.
     request_instance_recovery "$FAILED"
     return 0
 }
@@ -2380,8 +2391,11 @@ admin_cmd_worker() {
         if [ -f "$REQ_FILE" ]; then
             # Result file is published atomically inside request_primary_rotate
             # (publish_rotate_result_line) as soon as promote succeeds/fails.
-            # Do not gate HTTP on this process finishing recovery.
-            request_primary_rotate >/dev/null 2>&1 || true
+            # Do NOT redirect stdout/stderr of this call: background recovery
+            # workers inherit the caller's fds — >/dev/null would silence all
+            # "下线重连" progress logs for the old primary after a successful switch.
+            # HTTP body stays thin via the res file; container logs stay verbose.
+            request_primary_rotate || true
             rm -f "$REQ_FILE"
         fi
         sleep 0.1

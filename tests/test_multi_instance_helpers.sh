@@ -1131,12 +1131,14 @@ test_request_primary_rotate_thin_ok() {
     haproxy_set_server_state() { return 0; }
     RECS="$INSTANCE_STATE_DIR/rec.log"
     : > "$RECS"
+    # Sync mock: must run before request_primary_rotate returns (no bg race).
     request_instance_recovery() { echo "rec:$1:$2" >> "$RECS"; }
 
-    OUT=$(request_primary_rotate)
+    OUT=$(request_primary_rotate 2>/dev/null)
     assert_eq "$OUT" 'OK to=2' 'thin OK line to latest healthy standby'
     assert_eq "$(get_primary_id)" '2' 'primary switched'
-    assert_contains "$(tr '\n' ' ' < "$RECS")" 'rec:1:force_rotate' 'old primary force_rotate recovery'
+    # force_rotate must be kicked synchronously so RECS is complete before return
+    assert_eq "$(cat "$RECS")" 'rec:1:force_rotate' 'old primary force_rotate recovery (sync, exact)'
     # no drain/busy fields in response
     case "$OUT" in
         *from=*|*busy=*|*drain=*) echo "thin API leaked extra fields: $OUT" >&2; exit 1 ;;
@@ -1146,14 +1148,89 @@ test_request_primary_rotate_thin_ok() {
     set_instance_status 1 down
     set_instance_status 3 down
     # primary is 2, only self up
-    OUT=$(request_primary_rotate || true)
+    : > "$RECS"
+    OUT=$(request_primary_rotate 2>/dev/null || true)
     assert_eq "$OUT" 'ERR no_candidate' 'refuse when no standby up'
+    assert_eq "$(cat "$RECS")" '' 'no recovery when rotate refused'
 
     unset -f is_instance_recovering is_live_pid haproxy_set_server_state \
         request_instance_recovery mkdir 2>/dev/null || true
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_failover_primary_excludes_failed() {
+    local SAVED="$INSTANCE_STATE_DIR" RECS DETACHES
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    WARP_INSTANCE_COUNT=3
+    clear_primary_id
+    set_primary_id 1
+    # Failed primary has newest last_healthy — classic trap if not detached first.
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    printf '999\n' > "$(get_instance_last_healthy_file 1)"
+    printf '50\n' > "$(get_instance_last_healthy_file 2)"
+    printf '40\n' > "$(get_instance_last_healthy_file 3)"
+    is_instance_recovering() { return 1; }
+    RECS="$INSTANCE_STATE_DIR/rec.log"
+    DETACHES="$INSTANCE_STATE_DIR/detach.log"
+    : > "$RECS"
+    : > "$DETACHES"
+    detach_instance_from_lb() {
+        echo "detach:$1" >> "$DETACHES"
+        set_instance_status "$1" draining
+    }
+    request_instance_recovery() { echo "rec:$1:${2:-}" >> "$RECS"; }
+    haproxy_set_server_state() { return 0; }
+
+    failover_primary_on_health_fail 1 2>/dev/null
+
+    assert_eq "$(get_primary_id)" '2' 'failover promotes next standby, not failed'
+    assert_contains "$(tr '\n' ' ' < "$DETACHES")" 'detach:1' 'failed primary detached before pick'
+    assert_contains "$(tr '\n' ' ' < "$RECS")" 'rec:1:' 'failed primary recovery requested'
+    # Must never have promoted failed back
+    if [ "$(get_primary_id)" = '1' ]; then
+        echo 'failover re-picked failed primary' >&2
+        exit 1
+    fi
+
+    unset -f is_instance_recovering detach_instance_from_lb request_instance_recovery \
+        haproxy_set_server_state mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_rotate_recovery_not_silenced() {
+    # Regression: admin_cmd_worker must not redirect rotate to /dev/null (workers
+    # inherit fds → old-primary 下线重连 logs vanished after successful switch).
+    if awk '
+        /admin_cmd_worker\(\)/ { infn=1 }
+        infn && /request_primary_rotate/ {
+            line=$0
+            if (line ~ /\/dev\/null/) { bad=1 }
+            print line
+        }
+        infn && /^}/ { infn=0 }
+        END { exit bad+0 }
+    ' entrypoint.sh; then
+        :
+    else
+        echo 'admin_cmd_worker must not run request_primary_rotate under /dev/null' >&2
+        exit 1
+    fi
+    # force_rotate kick must not be a silenced background subshell
+    if grep -n 'force_rotate' entrypoint.sh | grep '/dev/null' | grep -v '^[^:]*:.*#'; then
+        echo 'force_rotate path must not be silenced to /dev/null' >&2
+        exit 1
+    fi
+    if ! grep -q 'request_instance_recovery "\$OLD" "force_rotate"' entrypoint.sh; then
+        echo 'rotate must call request_instance_recovery OLD force_rotate' >&2
+        exit 1
+    fi
 }
 
 test_recovery_worker_has_no_socks_only_shortcut() {
@@ -1240,6 +1317,8 @@ test_last_healthy_pick_latest_standby
 test_haproxy_desired_state_single_active
 test_mark_instance_up_primary_then_standby_drain
 test_request_primary_rotate_thin_ok
+test_failover_primary_excludes_failed
+test_rotate_recovery_not_silenced
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
