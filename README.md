@@ -58,6 +58,8 @@ services:
     restart: always
     ports:
       - "127.0.0.1:1080:1080"
+      # - "127.0.0.1:1081:1081"  # extra SOCKS when PROXY_PORTS=1080,1081
+      # - "9180:9180"            # admin HTTP /status /rotate
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -93,6 +95,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
     environment:
       - BIND_ADDR=0.0.0.0     # Bind address (default: 0.0.0.0)
       - BIND_PORT=1080        # Custom SOCKS5 port (default: 1080)
+      - PROXY_PORTS=1080,1081 # Optional extra SOCKS ports sharing the instance pool (empty = BIND_PORT only)
       - SOCKS_USER=admin      # Enable authentication (leave empty for no auth)
       - SOCKS_PASS=123456     # Auth password
       - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP, or a comma/semicolon-separated candidate list
@@ -179,6 +182,8 @@ services:
     restart: always
     ports:
       - "127.0.0.1:1080:1080" # 标准的无密码 SOCKS5 端口，仅监听本机
+      # - "127.0.0.1:1081:1081" # PROXY_PORTS=1080,1081 时的第二个入口
+      # - "9180:9180"           # admin HTTP /status /rotate
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -216,6 +221,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
     environment:
       - BIND_ADDR=0.0.0.0     # 监听地址 (默认 0.0.0.0，请不要修改这里，除非你知道自己在做什么)
       - BIND_PORT=1080        # 监听端口 (默认 1080)
+      - PROXY_PORTS=1080,1081 # 可选：多个 SOCKS 入口共用实例池（空 = 只用 BIND_PORT）
       - SOCKS_USER=admin      # SOCKS5 认证用户名 (留空则为无密码模式)
       - SOCKS_PASS=123456     # SOCKS5 认证密码
       - ROTATE_IP_ON_START=1 # 每次容器启动时重新注册 WARP 设备并刷新出口 IP (默认: 0)
@@ -275,36 +281,26 @@ nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2
 
 ---
 
-## Single-active rotate（`feat/single-active-rotate`）
+## Multi-service shared pool（`feat/multi-service-shared-pool`）
 
-本分支实现**常驻单活**：任意时刻最多 1 个 HAProxy `ready`（primary）；其余健康实例为 `drain` 热备。
+从 `feat/single-active-rotate` 分出：多个 SOCKS 入口共享同一实例池。每个入口独占 1 个健康实例；rotate 指定服务序号，无感切到空闲健康实例。
 
 ### 产品锁
 
 | 项 | 结论 |
 |---|---|
-| 模式 | **常驻单活**（multi 即一主多备） |
-| 触发 | Web API 手动 rotate + primary 巡检失败自动 failover |
+| 模式 | **多入口 + 共用大池**（不是每端口独立池） |
+| 触发 | `POST /rotate?id=S` + 该服务当前实例巡检失败 failover |
 | MAX_CONN | **本分支关闭**（不因 MAX_CONN 轮转） |
-| 选人 | `last_healthy_at` 最新 + 非 primary、非 recovering（并列更小 id） |
-| 旧主 | drain → 排空 → **至少 WG 重连**（禁止「只拉 SOCKS」）→ 回来仍 standby drain |
-| 实例数 | floor **N=2**（空/非法/`<2` → 2） |
-| Admin HTTP | **写死 `0.0.0.0:9180`**（宿主机 `-p 9180:9180`）；`ADMIN_HTTP_TOKEN`=HMAC secret（空=不启） |
-| Admin 鉴权 | **HTTP + HMAC-SHA256 + 时间戳**；`|now-ts| ≤ 120s`（`ADMIN_HTTP_HMAC_SKEW_SECONDS`，默认 120） |
-| API | `POST /rotate` 只回答是否切到新实例：`{"ok":true,"primary":N}` / `OK to=N`（不暴露旧主后续） |
+| 选人 | `last_healthy_at` 最新 + **未被任何服务占用** + 非 recovering（并列更小 id） |
+| 旧实例 | 该服务 backend `drain` → 排空 → **至少 WG 重连** → 回池热备（不自动抢回） |
+| 实例数 | floor **`max(2, 服务数)`** |
+| 端口 | `PROXY_PORTS=1080,1081,...`（空 = 单端口 `BIND_PORT`/`1080`） |
+| Admin HTTP | **写死 `0.0.0.0:9180`**；`ADMIN_HTTP_TOKEN`=HMAC secret（空=不启） |
+| Admin 鉴权 | **HTTP + HMAC-SHA256 + 时间戳**；`|now-ts| ≤ 120s` |
+| API | `POST /rotate?id=S`（或 JSON `{"id":S}`）→ `{"ok":true,"id":S,"instance":N}` / `OK id=S to=N` |
 
-### Admin 鉴权约定
-
-- **Secret**：环境变量 `ADMIN_HTTP_TOKEN`（空则不启 admin HTTP）
-- **签名串**：`METHOD + "\n" + PATH + "\n" + TIMESTAMP`  
-  例：`POST\n/rotate\n1712345678`
-- **算法**：`HMAC-SHA256(secret, 签名串)` → 小写 hex
-- **Header**（推荐）：
-  - `X-Timestamp: <unix epoch 秒>`
-  - `X-Signature: <hex>`
-- 也支持：`Authorization: HMAC-SHA256 ts=<epoch>,sig=<hex>`，或 query `?ts=&sig=`
-- **时间窗**：默认前后 **2 分钟**（120s）；超时/签名错 → `401 invalid_signature_or_timestamp`
-- **说明**：明文 HTTP 上 HMAC+时间戳可防伪造与简单重放（过期后失效），**不能**防同窗内重放或窃听；需要更强请再加 TLS/反代。
+HMAC 签名 PATH 仍是 `/rotate`（**不含 query**），与现有客户端兼容。未带 `id` 时默认服务 `1`。
 
 ### 部署后 curl 验证
 
@@ -316,38 +312,17 @@ curl -s -H "X-Timestamp: $TS" -H "X-Signature: $SIG" http://127.0.0.1:9180/statu
 
 TS=$(date +%s)
 SIG=$(printf 'POST\n/rotate\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
-curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" http://127.0.0.1:9180/rotate
-# 成功示例: {"ok":true,"primary":2}
-# 无候选 / 进行中: {"ok":false,"error":"no_candidate"|"in_progress"}
-# 鉴权失败: {"ok":false,"error":"invalid_signature_or_timestamp"}
-```
-
-### 客户端如何调用（简版）
-
-容器映射：宿主机 `-p 9180:9180`，环境变量设置 `ADMIN_HTTP_TOKEN=<secret>`。
-
-**1. 查状态**
-
-```bash
-SECRET=your-secret
-TS=$(date +%s)
-SIG=$(printf 'GET\n/status\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
-curl -s -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
-  http://<host>:9180/status
-```
-
-**2. 手动切主**
-
-```bash
-TS=$(date +%s)
-SIG=$(printf 'POST\n/rotate\n%s' "$TS" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
 curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
-  http://<host>:9180/rotate
-# 成功: {"ok":true,"primary":2}
-# 失败: {"ok":false,"error":"no_candidate"|"in_progress"|"invalid_signature_or_timestamp"}
+  'http://127.0.0.1:9180/rotate?id=2'
+# 成功: {"ok":true,"id":2,"instance":5}
+# 无候选 / 进行中 / 坏 id: {"ok":false,"error":"no_candidate"|"in_progress"|"bad_id"}
 ```
+
+建议：`WARP_INSTANCES ≥ 服务数 + 1`，否则没有热备，rotate 会 `no_candidate`。
+
+`GET /status` 含 `services: [{id,port,instance}]`，实例带 `assigned_to`。
 
 **注意**：
 - 签名串固定为 `METHOD\nPATH\nTIMESTAMP`（PATH 不含 query）。
 - 时间戳与服务器相差超过 **120 秒** 会被拒。
-- 客户端只需要关心 rotate 是否成功切到新实例，不必轮询旧主状态。
+- 客户端只需要关心指定服务是否切到新实例，不必轮询旧实例排空。

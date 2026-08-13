@@ -46,6 +46,9 @@ INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
 # Auth: HMAC-SHA256(secret, METHOD\nPATH\nts) + timestamp within ±120s (skew env).
 ADMIN_HTTP_TOKEN="${ADMIN_HTTP_TOKEN:-}"
 ADMIN_HTTP_HMAC_SKEW_SECONDS="${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}"
+# Comma-separated SOCKS listen ports. Empty = single port LISTEN_PORT/BIND_PORT/1080.
+# Each port is one service; all services share the WARP instance pool.
+PROXY_PORTS="${PROXY_PORTS:-}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -55,19 +58,110 @@ is_enabled() {
     esac
 }
 
+# Space-separated unique valid TCP ports from PROXY_PORTS (or default listen port).
+get_normalized_proxy_ports() {
+    RAW=${PROXY_PORTS-}
+    if [ -z "$RAW" ]; then
+        RAW=${LISTEN_PORT:-${BIND_PORT:-1080}}
+    fi
+    OUT=""
+    OLD_IFS=$IFS
+    IFS=','
+    # shellcheck disable=SC2086
+    for P in $RAW; do
+        IFS=$OLD_IFS
+        P=$(printf '%s' "$P" | tr -d ' \t\r\n')
+        case "$P" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$P" -lt 1 ] || [ "$P" -gt 65535 ]; then
+            continue
+        fi
+        DUP=0
+        for E in $OUT; do
+            if [ "$E" = "$P" ]; then
+                DUP=1
+                break
+            fi
+        done
+        if [ "$DUP" -eq 0 ]; then
+            if [ -n "$OUT" ]; then
+                OUT="$OUT $P"
+            else
+                OUT="$P"
+            fi
+        fi
+        IFS=','
+    done
+    IFS=$OLD_IFS
+    if [ -z "$OUT" ]; then
+        OUT=${LISTEN_PORT:-${BIND_PORT:-1080}}
+    fi
+    printf '%s\n' "$OUT"
+}
+
+get_proxy_service_count() {
+    # shellcheck disable=SC2046
+    set -- $(get_normalized_proxy_ports)
+    printf '%s\n' "$#"
+}
+
+get_proxy_port() {
+    SID=$1
+    I=1
+    # shellcheck disable=SC2046
+    set -- $(get_normalized_proxy_ports)
+    for P in "$@"; do
+        if [ "$I" -eq "$SID" ]; then
+            printf '%s\n' "$P"
+            return 0
+        fi
+        I=$((I + 1))
+    done
+    printf '\n'
+}
+
+get_proxy_service_ids() {
+    get_instance_ids "$(get_proxy_service_count)"
+}
+
+is_valid_proxy_service_id() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$1" -lt 1 ]; then
+        return 1
+    fi
+    N=$(get_proxy_service_count)
+    [ "$1" -le "$N" ]
+}
+
+parse_rotate_service_id() {
+    printf '%s' "$1" | sed -n 's/.*[?&]id=\([0-9][0-9]*\).*/\1/p'
+}
+
+parse_rotate_service_id_from_body() {
+    printf '%s' "$1" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+
 get_warp_instance_count() {
-    # Single-active branch: floor 2 (need primary + at least one standby).
-    RAW_COUNT=${WARP_INSTANCES:-2}
+    # Floor = max(2, service count): need at least one spare when possible.
+    RAW_COUNT=${WARP_INSTANCES:-}
+    SVC=$(get_proxy_service_count)
+    FLOOR=2
+    if [ "$SVC" -gt "$FLOOR" ]; then
+        FLOOR=$SVC
+    fi
 
     case "$RAW_COUNT" in
         ''|*[!0-9]*)
-            printf '2\n'
+            printf '%s\n' "$FLOOR"
             return 0
             ;;
     esac
 
-    if [ "$RAW_COUNT" -lt 2 ]; then
-        printf '2\n'
+    if [ "$RAW_COUNT" -lt "$FLOOR" ]; then
+        printf '%s\n' "$FLOOR"
         return 0
     fi
 
@@ -152,6 +246,14 @@ get_rotate_lock_file() {
 
 get_instance_last_healthy_file() {
     printf '%s/inst%s.last_healthy\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+get_service_assigned_file() {
+    printf '%s/svc%s.assigned\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+get_instance_drain_service_file() {
+    printf '%s/inst%s.drain_svc\n' "$INSTANCE_STATE_DIR" "$1"
 }
 
 get_instance_offline_since_file() {
@@ -942,10 +1044,15 @@ render_haproxy_config() {
     BIND_IP=$1
     BIND_P=$2
     STATUS_LIST=$3
-    # NOTE: every known instance stays in the config for its whole life.
+    # NOTE: every known instance stays in EVERY service backend for its whole life.
     # Availability is toggled at runtime via stats socket:
-    #   set server warp_pool/instK state {ready|drain|maint}
+    #   set server warp_svcS/instK state {ready|drain|maint}
     # — no add/remove server lines, no reload on drain/ready (saves reload churn).
+    # BIND_P is the fallback single-port when PROXY_PORTS is empty.
+    SAVED_LISTEN=${LISTEN_PORT-}
+    if [ -z "${PROXY_PORTS-}" ]; then
+        LISTEN_PORT=$BIND_P
+    fi
 
     cat <<EOF
 global
@@ -964,26 +1071,30 @@ defaults
     timeout client  1h
     timeout server  1h
     option redispatch
-
-frontend socks_in
-    bind ${BIND_IP}:${BIND_P}
-    default_backend warp_pool
-
-backend warp_pool
-    balance roundrobin
-    option tcp-check
 EOF
 
-    OLD_IFS=$IFS
-    IFS=' '
-    for ITEM in $STATUS_LIST; do
-        [ -n "$ITEM" ] || continue
-        _sid=${ITEM%%:*}
-        # status ignored for membership — always emit the server line
-        ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+    for SVC_ID in $(get_proxy_service_ids); do
+        SVC_PORT=$(get_proxy_port "$SVC_ID")
+        [ -n "$SVC_PORT" ] || SVC_PORT=$BIND_P
+        printf '\nfrontend socks_svc%s\n' "$SVC_ID"
+        printf '    bind %s:%s\n' "$BIND_IP" "$SVC_PORT"
+        printf '    default_backend warp_svc%s\n' "$SVC_ID"
+        printf '\nbackend warp_svc%s\n' "$SVC_ID"
+        printf '    balance roundrobin\n'
+        printf '    option tcp-check\n'
+        OLD_IFS=$IFS
+        IFS=' '
+        for ITEM in $STATUS_LIST; do
+            [ -n "$ITEM" ] || continue
+            _sid=${ITEM%%:*}
+            ENDPOINT=$(get_instance_socks_endpoint "$_sid")
+            printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+        done
+        IFS=$OLD_IFS
     done
-    IFS=$OLD_IFS
+    if [ -z "${PROXY_PORTS-}" ]; then
+        LISTEN_PORT=$SAVED_LISTEN
+    fi
 }
 
 get_haproxy_sock() {
@@ -1046,7 +1157,8 @@ PY
 haproxy_set_server_state() {
     local INST_ID="$1"
     local STATE="$2"
-    local CMD
+    local SVC_ID="${3:-}"
+    local CMD OK=1 TARGETS
 
     case "$STATE" in
         ready|drain|maint) ;;
@@ -1056,13 +1168,21 @@ haproxy_set_server_state() {
             ;;
     esac
 
-    CMD="set server warp_pool/inst${INST_ID} state ${STATE}"
-    if haproxy_runtime_cmd "$CMD"; then
-        echo "==> [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
-        return 0
+    if [ -n "$SVC_ID" ]; then
+        TARGETS=$SVC_ID
+    else
+        TARGETS=$(get_proxy_service_ids)
     fi
-    echo "==> [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
-    return 1
+    for SVC_ID in $TARGETS; do
+        CMD="set server warp_svc${SVC_ID}/inst${INST_ID} state ${STATE}"
+        if haproxy_runtime_cmd "$CMD"; then
+            echo "==> [inst${INST_ID}] HAProxy warp_svc${SVC_ID} state → ${STATE}（无 reload）"
+        else
+            echo "==> [inst${INST_ID}] [WARN] HAProxy warp_svc${SVC_ID} state ${STATE} 失败（socket 不可用或命令被拒）"
+            OK=0
+        fi
+    done
+    [ "$OK" -eq 1 ]
 }
 
 get_haproxy_pid_file() {
@@ -2009,23 +2129,89 @@ count_healthy_instances() {
 # ---- Single-active rotate: primary + last_healthy + admin HTTP ----
 
 get_primary_id() {
-    local F
-    F=$(get_primary_id_file)
+    # Compat: service 1 assignment is the historical "primary".
+    get_service_assigned_instance 1
+}
+
+set_primary_id() {
+    set_service_assigned_instance 1 "$1"
+}
+
+clear_primary_id() {
+    clear_service_assigned_instance 1
+}
+
+get_service_assigned_instance() {
+    local F VAL
+    F=$(get_service_assigned_file "$1")
     if [ -f "$F" ]; then
-        tr -d ' \n\r\t' < "$F"
+        VAL=$(tr -d ' \n\r\t' < "$F")
+        case "$VAL" in
+            ''|*[!0-9]*) printf '' ;;
+            *) printf '%s' "$VAL" ;;
+        esac
     else
         printf ''
     fi
 }
 
-set_primary_id() {
-    local ID="$1"
+set_service_assigned_instance() {
+    local SID="$1"
+    local INST="$2"
+    local OLD OTHER
     mkdir -p "$INSTANCE_STATE_DIR"
-    printf '%s\n' "$ID" > "$(get_primary_id_file)"
+    OLD=$(get_service_assigned_instance "$SID")
+    if [ -n "$OLD" ] && [ "$OLD" != "$INST" ]; then
+        :
+    fi
+    # Exclusive: an instance can belong to at most one service.
+    if [ -n "$INST" ]; then
+        for OTHER in $(get_proxy_service_ids); do
+            if [ "$OTHER" != "$SID" ] && [ "$(get_service_assigned_instance "$OTHER")" = "$INST" ]; then
+                clear_service_assigned_instance "$OTHER"
+            fi
+        done
+    fi
+    printf '%s\n' "$INST" > "$(get_service_assigned_file "$SID")"
 }
 
-clear_primary_id() {
-    rm -f "$(get_primary_id_file)"
+clear_service_assigned_instance() {
+    rm -f "$(get_service_assigned_file "$1")"
+}
+
+get_instance_assigned_service() {
+    local INST="$1" SID OWN
+    for SID in $(get_proxy_service_ids); do
+        OWN=$(get_service_assigned_instance "$SID")
+        if [ -n "$OWN" ] && [ "$OWN" = "$INST" ]; then
+            printf '%s\n' "$SID"
+            return 0
+        fi
+    done
+    printf ''
+}
+
+get_instance_drain_service() {
+    local F VAL
+    F=$(get_instance_drain_service_file "$1")
+    if [ -f "$F" ]; then
+        VAL=$(tr -d ' \n\r\t' < "$F")
+        case "$VAL" in
+            ''|*[!0-9]*) printf '' ;;
+            *) printf '%s' "$VAL" ;;
+        esac
+    else
+        printf ''
+    fi
+}
+
+set_instance_drain_service() {
+    mkdir -p "$INSTANCE_STATE_DIR"
+    printf '%s\n' "$2" > "$(get_instance_drain_service_file "$1")"
+}
+
+clear_instance_drain_service() {
+    rm -f "$(get_instance_drain_service_file "$1")"
 }
 
 record_instance_last_healthy() {
@@ -2054,13 +2240,13 @@ clear_instance_last_healthy() {
     rm -f "$(get_instance_last_healthy_file "$1")"
 }
 
-# Candidate = status=up, not primary, not recovering.
+# Candidate = status=up, not assigned to any service, not recovering.
 # Pick max(last_healthy_at); tie-break = smaller inst id.
-find_latest_healthy_standby() {
-    local PRIMARY BEST_ID="" BEST_TS=-1 CAND TS
-    PRIMARY=$(get_primary_id)
+find_latest_unassigned_healthy() {
+    local BEST_ID="" BEST_TS=-1 CAND TS OWN
     for CAND in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        if [ -n "$PRIMARY" ] && [ "$CAND" = "$PRIMARY" ]; then
+        OWN=$(get_instance_assigned_service "$CAND")
+        if [ -n "$OWN" ]; then
             continue
         fi
         if [ "$(get_instance_status "$CAND")" != "up" ]; then
@@ -2081,6 +2267,10 @@ find_latest_healthy_standby() {
         fi
     done
     printf '%s\n' "$BEST_ID"
+}
+
+find_latest_healthy_standby() {
+    find_latest_unassigned_healthy
 }
 
 is_rotate_in_progress() {
@@ -2129,22 +2319,48 @@ release_rotate_lock() {
     rm -rf "${INSTANCE_STATE_DIR}/rotate.lock.d"
 }
 
+# Optional $2 = service id. Without it, returns the global/compat desired
+# state (ready only if this inst is assigned to service 1).
 haproxy_desired_state_for_instance() {
     local INST_ID="$1"
-    local STATUS PRIMARY
+    local SVC_ID="${2:-}"
+    local STATUS OWNER DRAIN_SVC
     STATUS=$(get_instance_status "$INST_ID")
-    PRIMARY=$(get_primary_id)
+    OWNER=$(get_instance_assigned_service "$INST_ID")
+    DRAIN_SVC=$(get_instance_drain_service "$INST_ID")
     case "$STATUS" in
-        up)
-            if [ -n "$PRIMARY" ] && [ "$INST_ID" = "$PRIMARY" ]; then
-                printf 'ready\n'
+        draining)
+            if [ -n "$SVC_ID" ]; then
+                if [ -n "$OWNER" ] && [ "$OWNER" = "$SVC_ID" ]; then
+                    printf 'drain\n'
+                elif [ -n "$DRAIN_SVC" ] && [ "$DRAIN_SVC" = "$SVC_ID" ]; then
+                    printf 'drain\n'
+                else
+                    printf 'maint\n'
+                fi
             else
-                # No primary yet, or standby: drain (hot standby / wait for promote)
                 printf 'drain\n'
             fi
             ;;
-        draining)
-            printf 'drain\n'
+        up)
+            if [ -n "$SVC_ID" ]; then
+                if [ -n "$OWNER" ] && [ "$OWNER" = "$SVC_ID" ]; then
+                    printf 'ready\n'
+                elif [ -n "$DRAIN_SVC" ] && [ "$DRAIN_SVC" = "$SVC_ID" ]; then
+                    # Just unbound: keep existing TCP until detach flips status=draining.
+                    printf 'drain\n'
+                else
+                    printf 'maint\n'
+                fi
+            else
+                if [ -n "$OWNER" ] && [ "$OWNER" = "1" ]; then
+                    printf 'ready\n'
+                elif [ -n "$DRAIN_SVC" ]; then
+                    printf 'drain\n'
+                else
+                    printf 'maint\n'
+                fi
+            fi
             ;;
         *)
             printf 'maint\n'
@@ -2153,33 +2369,44 @@ haproxy_desired_state_for_instance() {
 }
 
 haproxy_reapply_instance_states() {
-    local _iid DESIRED
+    local _iid _sid DESIRED
     for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        DESIRED=$(haproxy_desired_state_for_instance "$_iid")
-        haproxy_set_server_state "$_iid" "$DESIRED" || true
+        for _sid in $(get_proxy_service_ids); do
+            DESIRED=$(haproxy_desired_state_for_instance "$_iid" "$_sid")
+            haproxy_set_server_state "$_iid" "$DESIRED" "$_sid" || true
+        done
     done
 }
 
-promote_primary() {
-    local NEW="$1"
+promote_service_instance() {
+    local SID="$1"
+    local NEW="$2"
     local OLD
-    OLD=$(get_primary_id)
+    OLD=$(get_service_assigned_instance "$SID")
     if [ -z "$NEW" ]; then
         return 1
     fi
     if [ "$(get_instance_status "$NEW")" != "up" ]; then
-        echo "==> promote_primary: inst${NEW} 不是 up，拒绝" >&2
+        echo "==> promote svc${SID}: inst${NEW} 不是 up，拒绝" >&2
         return 1
     fi
-    set_primary_id "$NEW"
-    haproxy_reapply_instance_states
-    # Logs on stderr so request_primary_rotate stdout stays machine-readable (OK to=N).
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        echo "==> primary: inst${OLD} → inst${NEW}" >&2
+        # Keep existing client TCP on the old service backend (drain, not maint).
+        set_instance_drain_service "$OLD" "$SID"
+    fi
+    clear_instance_drain_service "$NEW"
+    set_service_assigned_instance "$SID" "$NEW"
+    haproxy_reapply_instance_states
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        echo "==> svc${SID}: inst${OLD} → inst${NEW}" >&2
     else
-        echo "==> primary 设为 inst${NEW}" >&2
+        echo "==> svc${SID} 绑定 inst${NEW}" >&2
     fi
     return 0
+}
+
+promote_primary() {
+    promote_service_instance 1 "$1"
 }
 
 # Publish rotate result for admin HTTP helper ASAP (atomic), independent of stdout pipes.
@@ -2193,17 +2420,23 @@ publish_rotate_result_line() {
     mv -f "$TMP" "$RES"
 }
 
-# Prints: OK to=N | ERR no_candidate | ERR in_progress
-request_primary_rotate() {
+# Prints: OK id=S to=N | ERR no_candidate | ERR in_progress | ERR bad_id
+request_service_rotate() {
+    local SID="$1"
     local OLD NEW
+    if ! is_valid_proxy_service_id "$SID"; then
+        publish_rotate_result_line 'ERR bad_id'
+        printf 'ERR bad_id\n'
+        return 1
+    fi
     if ! acquire_rotate_lock; then
         publish_rotate_result_line 'ERR in_progress'
         printf 'ERR in_progress\n'
         return 1
     fi
 
-    OLD=$(get_primary_id)
-    NEW=$(find_latest_healthy_standby)
+    OLD=$(get_service_assigned_instance "$SID")
+    NEW=$(find_latest_unassigned_healthy)
     if [ -z "$NEW" ]; then
         release_rotate_lock || true
         publish_rotate_result_line 'ERR no_candidate'
@@ -2211,57 +2444,64 @@ request_primary_rotate() {
         return 1
     fi
 
-    if ! promote_primary "$NEW"; then
+    if ! promote_service_instance "$SID" "$NEW"; then
         release_rotate_lock || true
         publish_rotate_result_line 'ERR no_candidate'
         printf 'ERR no_candidate\n'
         return 1
     fi
 
-    # Unlock + publish HTTP result IMMEDIATELY after promote (atomic file).
-    # Helper races the result file — must not wait on old-primary reconnect.
     release_rotate_lock || true
-    publish_rotate_result_line "OK to=${NEW}"
-    printf 'OK to=%s\n' "$NEW"
+    publish_rotate_result_line "OK id=${SID} to=${NEW}"
+    printf 'OK id=%s to=%s\n' "$SID" "$NEW"
 
-    # Old primary MUST leave the pool and do full WG reconnect (product lock).
-    # request_instance_recovery itself is fast: runtime drain kick + spawn worker.
-    # Long drain/WG work runs inside the worker — do NOT wrap in a silenced
-    # background subshell (that hid all recovery logs and made "下线重连" look
-    # like it never happened after a successful primary switch).
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        echo "==> rotate: 旧 primary inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
-        # Never let recovery abort the thin OK path (set -e); promote already done.
+        echo "==> rotate svc${SID}: 旧 inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
         request_instance_recovery "$OLD" "force_rotate" || true
     fi
     return 0
 }
 
-failover_primary_on_health_fail() {
+request_primary_rotate() {
+    # Compat: unspecified id rotates service 1.
+    request_service_rotate "${1:-1}"
+}
+
+failover_assigned_instance_on_health_fail() {
     local FAILED="$1"
-    local PRIMARY NEW
-    PRIMARY=$(get_primary_id)
-    if [ -z "$PRIMARY" ] || [ "$FAILED" != "$PRIMARY" ]; then
+    local SID NEW
+    SID=$(get_instance_assigned_service "$FAILED")
+    if [ -z "$SID" ]; then
         request_instance_recovery "$FAILED"
         return 0
     fi
 
-    # CRITICAL: detach FAILED before selection. clear_primary_id alone is not
-    # enough — FAILED is still status=up with the freshest last_healthy, so
-    # find_latest_healthy_standby would re-pick it as the new primary.
-    detach_instance_from_lb "$FAILED" || true
-    clear_primary_id
-    NEW=$(find_latest_healthy_standby)
-    if [ -n "$NEW" ] && [ "$NEW" != "$FAILED" ]; then
-        promote_primary "$NEW" || true
-        echo "==> primary 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
-    else
-        echo "==> primary 巡检失败且无健康 standby；恢复后首个 up 抢主" >&2
+    if ! acquire_rotate_lock; then
+        echo "==> svc${SID} 巡检失败但 rotate 进行中，只下线 inst${FAILED}" >&2
+        detach_instance_from_lb "$FAILED" || true
+        request_instance_recovery "$FAILED"
+        return 0
     fi
-    # Already draining; request_instance_recovery re-detach is idempotent and
-    # spawns the force WG reconnect worker.
+
+    # CRITICAL: detach FAILED before selection. Clearing assignment alone is not
+    # enough if FAILED is still status=up with the freshest last_healthy.
+    set_instance_drain_service "$FAILED" "$SID"
+    detach_instance_from_lb "$FAILED" || true
+    clear_service_assigned_instance "$SID"
+    NEW=$(find_latest_unassigned_healthy)
+    if [ -n "$NEW" ] && [ "$NEW" != "$FAILED" ]; then
+        promote_service_instance "$SID" "$NEW" || true
+        echo "==> svc${SID} 巡检失败 failover: inst${FAILED} → inst${NEW}" >&2
+    else
+        echo "==> svc${SID} 巡检失败且无空闲健康实例；恢复后首个 up 可回填" >&2
+    fi
+    release_rotate_lock || true
     request_instance_recovery "$FAILED"
     return 0
+}
+
+failover_primary_on_health_fail() {
+    failover_assigned_instance_on_health_fail "$1"
 }
 
 # ---- Admin HMAC helpers (HTTP + HMAC-SHA256 + timestamp, skew default ±120s) ----
@@ -2346,30 +2586,53 @@ stop_admin_http_server() {
 }
 
 build_status_json() {
-    local _iid STATUS ROLE PRIMARY LH FIRST=1 PJSON
+    local _iid _sid STATUS ROLE PRIMARY LH FIRST=1 PJSON OWNER PORT INST IJSON
     PRIMARY=$(get_primary_id)
     if [ -n "$PRIMARY" ]; then
         PJSON=$PRIMARY
     else
         PJSON=null
     fi
-    printf '{"ok":true,"primary":%s,"warp_instances":%s,"instances":[' "$PJSON" "$WARP_INSTANCE_COUNT"
-    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-        STATUS=$(get_instance_status "$_iid")
-        LH=$(get_instance_last_healthy_at "$_iid")
-        if [ -n "$PRIMARY" ] && [ "$_iid" = "$PRIMARY" ]; then
-            ROLE=primary
-        elif [ "$STATUS" = "up" ]; then
-            ROLE=standby
+    printf '{"ok":true,"primary":%s,"warp_instances":%s,"services":[' "$PJSON" "$WARP_INSTANCE_COUNT"
+    FIRST=1
+    for _sid in $(get_proxy_service_ids); do
+        PORT=$(get_proxy_port "$_sid")
+        INST=$(get_service_assigned_instance "$_sid")
+        if [ -n "$INST" ]; then
+            IJSON=$INST
         else
-            ROLE=other
+            IJSON=null
         fi
         if [ "$FIRST" -eq 1 ]; then
             FIRST=0
         else
             printf ','
         fi
-        printf '{"id":%s,"status":"%s","role":"%s","last_healthy":%s}' "$_iid" "$STATUS" "$ROLE" "$LH"
+        printf '{"id":%s,"port":%s,"instance":%s}' "$_sid" "$PORT" "$IJSON"
+    done
+    printf '],"instances":['
+    FIRST=1
+    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+        STATUS=$(get_instance_status "$_iid")
+        LH=$(get_instance_last_healthy_at "$_iid")
+        OWNER=$(get_instance_assigned_service "$_iid")
+        if [ -n "$OWNER" ]; then
+            ROLE=assigned
+            IJSON=$OWNER
+        elif [ "$STATUS" = "up" ]; then
+            ROLE=standby
+            IJSON=null
+        else
+            ROLE=other
+            IJSON=null
+        fi
+        if [ "$FIRST" -eq 1 ]; then
+            FIRST=0
+        else
+            printf ','
+        fi
+        printf '{"id":%s,"status":"%s","role":"%s","assigned_to":%s,"last_healthy":%s}' \
+            "$_iid" "$STATUS" "$ROLE" "$IJSON" "$LH"
     done
     printf ']}'
 }
@@ -2389,13 +2652,17 @@ admin_cmd_worker() {
             rm -f "$STATUS_FILE"
         fi
         if [ -f "$REQ_FILE" ]; then
-            # Result file is published atomically inside request_primary_rotate
+            # Result file is published atomically inside request_service_rotate
             # (publish_rotate_result_line) as soon as promote succeeds/fails.
             # Do NOT redirect stdout/stderr of this call: background recovery
             # workers inherit the caller's fds — >/dev/null would silence all
-            # "下线重连" progress logs for the old primary after a successful switch.
+            # "下线重连" progress logs after a successful switch.
             # HTTP body stays thin via the res file; container logs stay verbose.
-            request_primary_rotate || true
+            SID=$(tr -d ' \r\n\t' < "$REQ_FILE" 2>/dev/null || true)
+            case "$SID" in
+                ''|*[!0-9]*) SID=1 ;;
+            esac
+            request_service_rotate "$SID" || true
             rm -f "$REQ_FILE"
         fi
         sleep 0.1
@@ -2476,8 +2743,11 @@ read_request() {
     PATHQ=$(printf '%s' "$LINE" | cut -d' ' -f2)
     # IMPORTANT: never name this PATH — that clobbers $PATH and breaks awk/openssl lookups.
     REQ_PATH=$(printf '%s' "$PATHQ" | cut -d'?' -f1)
+    ROTATE_ID=$(printf '%s' "$PATHQ" | sed -n 's/.*[?&]id=\([0-9][0-9]*\).*/\1/p')
     TS=""
     SIG=""
+    CLEN=""
+    BODY_IN=""
     while IFS= read -r H; do
         H=$(printf '%s' "$H" | tr -d '\r')
         [ -z "$H" ] && break
@@ -2487,6 +2757,9 @@ read_request() {
                 ;;
             [Xx]-[Ss]ignature:*)
                 SIG=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
+                ;;
+            [Cc]ontent-[Ll]ength:*)
+                CLEN=$(printf '%s' "$H" | cut -d: -f2- | tr -d ' \t')
                 ;;
             [Aa]uthorization:*[Hh][Mm][Aa][Cc]*)
                 AUTH=$(printf '%s' "$H" | cut -d: -f2- | sed 's/^ *//')
@@ -2513,6 +2786,18 @@ read_request() {
             fi
             ;;
     esac
+    # Optional JSON body {"id":N} — only if query did not already supply id.
+    if [ -z "$ROTATE_ID" ] && [ -n "$CLEN" ]; then
+        case "$CLEN" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$CLEN" -gt 0 ] && [ "$CLEN" -le 4096 ]; then
+                    BODY_IN=$(dd bs=1 count="$CLEN" 2>/dev/null || true)
+                    ROTATE_ID=$(printf '%s' "$BODY_IN" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+                fi
+                ;;
+        esac
+    fi
 }
 
 respond() {
@@ -2570,24 +2855,35 @@ case "$METHOD $REQ_PATH" in
         ;;
     "POST /rotate"|"POST /rotate/")
         rm -f "$RES_FILE" "${RES_FILE}.tmp."*
-        : > "$REQ_FILE"
+        case "$ROTATE_ID" in
+            ''|*[!0-9]*) ROTATE_ID=1 ;;
+        esac
+        printf '%s\n' "$ROTATE_ID" > "$REQ_FILE"
         I=0
         while [ "$I" -lt 200 ]; do
             if [ -s "$RES_FILE" ]; then
                 RESP=$(tr -d '\r\n' < "$RES_FILE")
                 case "$RESP" in
-                    OK\ to=*|ERR\ in_progress|ERR\ no_candidate|ERR\ rotate_failed)
+                    OK\ id=*|OK\ to=*|ERR\ in_progress|ERR\ no_candidate|ERR\ bad_id|ERR\ rotate_failed)
                         rm -f "$REQ_FILE" "$RES_FILE"
                         case "$RESP" in
+                            OK\ id=*)
+                                SID=$(printf '%s' "$RESP" | sed -n 's/^OK id=\([0-9][0-9]*\).*/\1/p')
+                                TO=$(printf '%s' "$RESP" | sed -n 's/^OK id=[0-9][0-9]* to=\([0-9][0-9]*\).*/\1/p')
+                                respond '200 OK' "$(printf '{"ok":true,"id":%s,"instance":%s}' "$SID" "$TO")"
+                                ;;
                             OK\ to=*)
                                 TO=$(printf '%s' "$RESP" | sed 's/^OK to=//')
-                                respond '200 OK' "$(printf '{"ok":true,"primary":%s}' "$TO")"
+                                respond '200 OK' "$(printf '{"ok":true,"id":1,"instance":%s}' "$TO")"
                                 ;;
                             ERR\ in_progress)
                                 respond '409 Conflict' '{"ok":false,"error":"in_progress"}'
                                 ;;
                             ERR\ no_candidate)
                                 respond '409 Conflict' '{"ok":false,"error":"no_candidate"}'
+                                ;;
+                            ERR\ bad_id)
+                                respond '400 Bad Request' '{"ok":false,"error":"bad_id"}'
                                 ;;
                             *)
                                 respond '500 Internal Server Error' '{"ok":false,"error":"rotate_failed"}'
@@ -3112,27 +3408,45 @@ restart_instance_with_new_identity() {
     start_instance_warp "$INST_ID"
 }
 
+claim_first_unassigned_service() {
+    local INST_ID="$1"
+    local SID OWN
+    for SID in $(get_proxy_service_ids); do
+        OWN=$(get_service_assigned_instance "$SID")
+        if [ -z "$OWN" ]; then
+            set_service_assigned_instance "$SID" "$INST_ID"
+            printf '%s\n' "$SID"
+            return 0
+        fi
+    done
+    printf ''
+}
+
 mark_instance_up() {
     local INST_ID="$1"
-    local PRIMARY
+    local OWNER CLAIMED
     start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
     record_instance_last_healthy "$INST_ID"
-    PRIMARY=$(get_primary_id)
-    if [ -z "$PRIMARY" ]; then
-        # First healthy instance claims primary.
-        set_primary_id "$INST_ID"
-        haproxy_set_server_state "$INST_ID" "ready" || true
-        echo "==> [inst${INST_ID}] ✅ 已标记健康并抢到 primary（HAProxy ready）"
-    elif [ "$INST_ID" = "$PRIMARY" ]; then
-        haproxy_set_server_state "$INST_ID" "ready" || true
-        echo "==> [inst${INST_ID}] ✅ primary 健康（HAProxy ready）"
+    clear_instance_drain_service "$INST_ID"
+    OWNER=$(get_instance_assigned_service "$INST_ID")
+    if [ -n "$OWNER" ]; then
+        haproxy_reapply_instance_states
+        echo "==> [inst${INST_ID}] ✅ 已标记健康，继续服务 svc${OWNER}（HAProxy ready）"
+        return 0
+    fi
+    CLAIMED=""
+    if acquire_rotate_lock; then
+        CLAIMED=$(claim_first_unassigned_service "$INST_ID")
+        release_rotate_lock || true
+    fi
+    haproxy_reapply_instance_states
+    if [ -n "$CLAIMED" ]; then
+        echo "==> [inst${INST_ID}] ✅ 已标记健康并绑定 svc${CLAIMED}（HAProxy ready）"
     else
-        # Standby hot spare: WARP+SOCKS up, no new client traffic.
-        haproxy_set_server_state "$INST_ID" "drain" || true
-        echo "==> [inst${INST_ID}] ✅ standby 健康（HAProxy drain 热备）"
+        echo "==> [inst${INST_ID}] ✅ 已标记健康，进入共用热备（各服务 backend maint）"
     fi
 }
 
@@ -3161,6 +3475,7 @@ hard_detach_instance_from_lb() {
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
+    clear_instance_drain_service "$INST_ID"
     echo "==> [inst${INST_ID}] HAProxy state=maint（重启服务期间，无 reload）"
     haproxy_set_server_state "$INST_ID" "maint" || true
 }
@@ -3517,7 +3832,7 @@ bootstrap_multi_instances() {
     fi
 
     HEALTHY=$(count_healthy_instances)
-    echo "==> 多实例就绪：${HEALTHY}/${WARP_INSTANCE_COUNT} 健康，统一入口 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    echo "==> 多实例就绪：${HEALTHY}/${WARP_INSTANCE_COUNT} 健康，入口 ${LISTEN_ADDR}:[$(get_normalized_proxy_ports)]"
     print_health_summary
     echo "==> down 实例由配置队列/后台 worker 独立复活，不阻塞主巡检"
     return 0
@@ -3720,7 +4035,8 @@ multi_cleanup_on_exit() {
 # 1. 初始化
 # ==========================================
 WARP_INSTANCE_COUNT=$(get_warp_instance_count)
-echo "==> WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-2}；单活分支下限 2)"
+echo "==> WARP 实例数: ${WARP_INSTANCE_COUNT} (WARP_INSTANCES=${WARP_INSTANCES:-}；下限 max(2, 服务数=$(get_proxy_service_count)))"
+echo "==> 代理服务: $(get_proxy_service_count) 个端口 [$(get_normalized_proxy_ports)]（PROXY_PORTS=${PROXY_PORTS:-默认 BIND_PORT}）"
 
 if [ "$WARP_STACK_MODE" = "ipv6-preferred" ]; then
     echo "precedence ::ffff:0:0/96  10" > /etc/gai.conf
@@ -3754,7 +4070,7 @@ if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
     periodic_test_url_monitor
 else
     # 多实例：单容器内多条 WARP 隧道 + 统一 SOCKS 入口 + 健康 LB
-    echo "==> 多实例模式：容器内并行 ${WARP_INSTANCE_COUNT} 条 WARP，仅暴露 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    echo "==> 多实例模式：容器内并行 ${WARP_INSTANCE_COUNT} 条 WARP，入口 ${LISTEN_ADDR}:[$(get_normalized_proxy_ports)]"
     echo "==> 提示：多实例需要 netns，建议 cap_add: [NET_ADMIN, SYS_ADMIN, SYS_MODULE]"
     trap multi_cleanup_on_exit INT TERM
     bootstrap_multi_instances

@@ -140,7 +140,29 @@ test_haproxy_config_with_no_healthy_backends_still_binds() {
     local cfg
     cfg=$(render_haproxy_config '127.0.0.1' '2080' '1:down 2:down')
     assert_contains "$cfg" 'bind 127.0.0.1:2080' 'frontend should still bind with zero healthy backends'
-    assert_contains "$cfg" 'backend warp_pool' 'backend section remains'
+    assert_contains "$cfg" 'backend warp_svc1' 'single-port backend is warp_svc1'
+}
+
+test_haproxy_config_multi_frontend_backend() {
+    local cfg
+    PROXY_PORTS='1080,1081'
+    cfg=$(render_haproxy_config '0.0.0.0' '1080' '1:up 2:up 3:up')
+    assert_contains "$cfg" 'frontend socks_svc1' 'svc1 frontend'
+    assert_contains "$cfg" 'bind 0.0.0.0:1080' 'svc1 bind'
+    assert_contains "$cfg" 'default_backend warp_svc1' 'svc1 backend ref'
+    assert_contains "$cfg" 'frontend socks_svc2' 'svc2 frontend'
+    assert_contains "$cfg" 'bind 0.0.0.0:1081' 'svc2 bind'
+    assert_contains "$cfg" 'default_backend warp_svc2' 'svc2 backend ref'
+    assert_contains "$cfg" 'backend warp_svc1' 'svc1 backend section'
+    assert_contains "$cfg" 'backend warp_svc2' 'svc2 backend section'
+    # every instance listed in every backend
+    assert_contains "$cfg" 'server inst1 10.66.1.2:1080 check' 'inst1 listed'
+    assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'inst3 listed'
+    if [[ "$cfg" == *'backend warp_pool'* ]]; then
+        echo 'must not keep shared warp_pool backend' >&2
+        exit 1
+    fi
+    unset PROXY_PORTS
 }
 
 test_stagger_skips_after_last_instance() {
@@ -337,7 +359,7 @@ test_haproxy_config_with_no_healthy_backends_still_binds() {
     local cfg
     cfg=$(render_haproxy_config '127.0.0.1' '2080' '1:down 2:down')
     assert_contains "$cfg" 'bind 127.0.0.1:2080' 'frontend should still bind with zero healthy backends'
-    assert_contains "$cfg" 'backend warp_pool' 'backend section remains'
+    assert_contains "$cfg" 'backend warp_svc1' 'single-port backend is warp_svc1'
 }
 
 test_refresh_haproxy_pid_prefers_live_pidfile_over_stale_shell() {
@@ -996,6 +1018,7 @@ test_probe_family_stops_after_threshold_links
 test_probe_family_stops_early_on_success
 test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
+test_haproxy_config_multi_frontend_backend
 test_refresh_haproxy_pid_prefers_live_pidfile_over_stale_shell
 test_reload_uses_soft_path_when_pidfile_live
 test_stagger_skips_after_last_instance
@@ -1071,7 +1094,7 @@ test_haproxy_desired_state_single_active() {
     set_instance_status 2 up
     set_instance_status 3 draining
     assert_eq "$(haproxy_desired_state_for_instance 2)" 'ready' 'primary up → ready'
-    assert_eq "$(haproxy_desired_state_for_instance 1)" 'drain' 'standby up → drain'
+    assert_eq "$(haproxy_desired_state_for_instance 1)" 'maint' 'standby up → maint (not in any service ready set)'
     assert_eq "$(haproxy_desired_state_for_instance 3)" 'drain' 'draining → drain'
     set_instance_status 1 down
     assert_eq "$(haproxy_desired_state_for_instance 1)" 'maint' 'down → maint'
@@ -1101,7 +1124,7 @@ test_mark_instance_up_primary_then_standby_drain() {
 
     mark_instance_up 2 >/dev/null
     assert_eq "$(get_primary_id)" '1' 'primary unchanged'
-    assert_contains "$(tr '\n' ' ' < "$LOG")" '2:drain' 'second up is standby drain'
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '2:maint' 'second up is unassigned maint'
     # last_healthy stamped
     [ -f "$(get_instance_last_healthy_file 1)" ] || { echo 'missing last_healthy 1' >&2; exit 1; }
     [ -f "$(get_instance_last_healthy_file 2)" ] || { echo 'missing last_healthy 2' >&2; exit 1; }
@@ -1135,7 +1158,7 @@ test_request_primary_rotate_thin_ok() {
     request_instance_recovery() { echo "rec:$1:$2" >> "$RECS"; }
 
     OUT=$(request_primary_rotate 2>/dev/null)
-    assert_eq "$OUT" 'OK to=2' 'thin OK line to latest healthy standby'
+    assert_eq "$OUT" 'OK id=1 to=2' 'thin OK line includes service id + new instance'
     assert_eq "$(get_primary_id)" '2' 'primary switched'
     # force_rotate must be kicked synchronously so RECS is complete before return
     assert_eq "$(cat "$RECS")" 'rec:1:force_rotate' 'old primary force_rotate recovery (sync, exact)'
@@ -1209,7 +1232,7 @@ test_rotate_recovery_not_silenced() {
     # inherit fds → old-primary 下线重连 logs vanished after successful switch).
     if awk '
         /admin_cmd_worker\(\)/ { infn=1 }
-        infn && /request_primary_rotate/ {
+        infn && /request_service_rotate/ {
             line=$0
             if (line ~ /\/dev\/null/) { bad=1 }
             print line
@@ -1219,7 +1242,7 @@ test_rotate_recovery_not_silenced() {
     ' entrypoint.sh; then
         :
     else
-        echo 'admin_cmd_worker must not run request_primary_rotate under /dev/null' >&2
+        echo 'admin_cmd_worker must not run request_service_rotate under /dev/null' >&2
         exit 1
     fi
     # force_rotate kick must not be a silenced background subshell
@@ -1229,6 +1252,237 @@ test_rotate_recovery_not_silenced() {
     fi
     if ! grep -q 'request_instance_recovery "\$OLD" "force_rotate"' entrypoint.sh; then
         echo 'rotate must call request_instance_recovery OLD force_rotate' >&2
+        exit 1
+    fi
+}
+
+# ---- Multi-service shared pool (feat/multi-service-shared-pool) ----
+
+test_proxy_ports_default_and_parse() {
+    local SAVED_PORTS="${PROXY_PORTS-}" SAVED_BIND="${BIND_PORT-}" SAVED_LISTEN="${LISTEN_PORT-}"
+    unset PROXY_PORTS
+    BIND_PORT=1080
+    LISTEN_PORT=1080
+    assert_eq "$(get_proxy_service_count)" '1' 'default one service'
+    assert_eq "$(get_proxy_port 1)" '1080' 'default port is BIND_PORT/1080'
+    assert_eq "$(get_proxy_service_ids)" '1' 'single service id'
+
+    PROXY_PORTS='1080,1081,1082'
+    assert_eq "$(get_proxy_service_count)" '3' 'three ports'
+    assert_eq "$(get_proxy_port 1)" '1080' 'svc1'
+    assert_eq "$(get_proxy_port 2)" '1081' 'svc2'
+    assert_eq "$(get_proxy_port 3)" '1082' 'svc3'
+    assert_eq "$(get_proxy_service_ids)" '1 2 3' 'service ids 1-based'
+
+    PROXY_PORTS=' 2080 , 2081 '
+    assert_eq "$(get_proxy_service_count)" '2' 'trim spaces'
+    assert_eq "$(get_proxy_port 1)" '2080' 'trimmed first'
+    assert_eq "$(get_proxy_port 2)" '2081' 'trimmed second'
+
+    PROXY_PORTS='1080,abc,1081,0,-3,1080'
+    assert_eq "$(get_proxy_service_count)" '2' 'drop invalid and duplicate 1080'
+    assert_eq "$(get_proxy_port 1)" '1080' 'keep first 1080'
+    assert_eq "$(get_proxy_port 2)" '1081' 'keep 1081'
+
+    if is_valid_proxy_service_id 1; then :; else echo 'id 1 valid' >&2; exit 1; fi
+    if is_valid_proxy_service_id 2; then :; else echo 'id 2 valid' >&2; exit 1; fi
+    if is_valid_proxy_service_id 3; then echo 'id 3 should be invalid' >&2; exit 1; fi
+    if is_valid_proxy_service_id 0; then echo 'id 0 invalid' >&2; exit 1; fi
+    if is_valid_proxy_service_id abc; then echo 'id abc invalid' >&2; exit 1; fi
+
+    unset PROXY_PORTS
+    if [ -n "$SAVED_PORTS" ]; then
+        PROXY_PORTS=$SAVED_PORTS
+    fi
+    BIND_PORT=$SAVED_BIND
+    LISTEN_PORT=$SAVED_LISTEN
+}
+
+test_instance_count_floor_at_least_service_count() {
+    local SAVED_PORTS="${PROXY_PORTS-}"
+    PROXY_PORTS='1080,1081,1082'
+    WARP_INSTANCES=''
+    assert_eq "$(get_warp_instance_count)" '3' 'blank instances floor to service count when >2'
+    WARP_INSTANCES='2'
+    assert_eq "$(get_warp_instance_count)" '3' 'instances < services floors to services'
+    WARP_INSTANCES='10'
+    assert_eq "$(get_warp_instance_count)" '10' 'instances >= services honored'
+    unset PROXY_PORTS
+    WARP_INSTANCES=''
+    assert_eq "$(get_warp_instance_count)" '2' 'single-port still floors to 2'
+    if [ -n "$SAVED_PORTS" ]; then
+        PROXY_PORTS=$SAVED_PORTS
+    fi
+}
+
+test_parse_rotate_service_id() {
+    assert_eq "$(parse_rotate_service_id '/rotate?id=2')" '2' 'query id'
+    assert_eq "$(parse_rotate_service_id '/rotate?foo=1&id=3')" '3' 'query id among params'
+    assert_eq "$(parse_rotate_service_id '/rotate')" '' 'no id'
+    assert_eq "$(parse_rotate_service_id '/rotate?id=abc')" '' 'non-numeric'
+    assert_eq "$(parse_rotate_service_id_from_body '{"id":2}')" '2' 'json body id'
+    assert_eq "$(parse_rotate_service_id_from_body '{"id": 7 }')" '7' 'json body spaced'
+    assert_eq "$(parse_rotate_service_id_from_body '{}')" '' 'empty json'
+}
+
+test_shared_pool_assignment_and_pick() {
+    local SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    PROXY_PORTS='1080,1081'
+    WARP_INSTANCE_COUNT=4
+    clear_service_assigned_instance 1
+    clear_service_assigned_instance 2
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    set_instance_status 4 up
+    printf '10\n' > "$(get_instance_last_healthy_file 1)"
+    printf '50\n' > "$(get_instance_last_healthy_file 2)"
+    printf '40\n' > "$(get_instance_last_healthy_file 3)"
+    printf '30\n' > "$(get_instance_last_healthy_file 4)"
+    is_instance_recovering() { return 1; }
+
+    assert_eq "$(find_latest_unassigned_healthy)" '2' 'pick freshest unassigned'
+    set_service_assigned_instance 1 2
+    assert_eq "$(get_service_assigned_instance 1)" '2' 'svc1 owns inst2'
+    assert_eq "$(get_instance_assigned_service 2)" '1' 'inst2 assigned to svc1'
+    assert_eq "$(find_latest_unassigned_healthy)" '3' 'skip assigned inst2'
+    set_service_assigned_instance 2 3
+    assert_eq "$(find_latest_unassigned_healthy)" '4' 'skip both assigned'
+
+    # occupied instance must not be picked even if healthier
+    printf '999\n' > "$(get_instance_last_healthy_file 2)"
+    assert_eq "$(find_latest_unassigned_healthy)" '4' 'assigned inst still excluded'
+
+    unset -f is_instance_recovering mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
+test_haproxy_desired_state_per_service() {
+    local SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    PROXY_PORTS='1080,1081'
+    WARP_INSTANCE_COUNT=3
+    set_service_assigned_instance 1 2
+    set_service_assigned_instance 2 1
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    assert_eq "$(haproxy_desired_state_for_instance 2 1)" 'ready' 'inst2 ready only on svc1'
+    assert_eq "$(haproxy_desired_state_for_instance 2 2)" 'maint' 'inst2 maint on svc2'
+    assert_eq "$(haproxy_desired_state_for_instance 1 2)" 'ready' 'inst1 ready on svc2'
+    assert_eq "$(haproxy_desired_state_for_instance 3 1)" 'maint' 'unassigned up is maint on service backends'
+    set_instance_status 2 draining
+    assert_eq "$(haproxy_desired_state_for_instance 2 1)" 'drain' 'old svc assignment draining'
+    unset -f mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
+test_request_service_rotate_by_id() {
+    local SAVED="$INSTANCE_STATE_DIR" OUT RECS
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    PROXY_PORTS='1080,1081'
+    WARP_INSTANCE_COUNT=4
+    set_service_assigned_instance 1 1
+    set_service_assigned_instance 2 2
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    set_instance_status 4 up
+    printf '10\n' > "$(get_instance_last_healthy_file 1)"
+    printf '20\n' > "$(get_instance_last_healthy_file 2)"
+    printf '80\n' > "$(get_instance_last_healthy_file 3)"
+    printf '40\n' > "$(get_instance_last_healthy_file 4)"
+    is_instance_recovering() { return 1; }
+    is_live_pid() { return 1; }
+    haproxy_set_server_state() { return 0; }
+    RECS="$INSTANCE_STATE_DIR/rec.log"
+    : > "$RECS"
+    request_instance_recovery() { echo "rec:$1:$2" >> "$RECS"; }
+
+    OUT=$(request_service_rotate 2 2>/dev/null)
+    assert_eq "$OUT" 'OK id=2 to=3' 'rotate svc2 to freshest free inst'
+    assert_eq "$(get_service_assigned_instance 2)" '3' 'svc2 rebound'
+    assert_eq "$(get_service_assigned_instance 1)" '1' 'svc1 untouched'
+    assert_eq "$(cat "$RECS")" 'rec:2:force_rotate' 'old svc2 instance force_rotate'
+
+    # cannot steal svc1 instance
+    printf '999\n' > "$(get_instance_last_healthy_file 1)"
+    : > "$RECS"
+    OUT=$(request_service_rotate 2 2>/dev/null)
+    assert_eq "$OUT" 'OK id=2 to=4' 'next rotate skips inst assigned to svc1'
+    assert_eq "$(get_service_assigned_instance 1)" '1' 'svc1 still inst1'
+
+    OUT=$(request_service_rotate 9 2>/dev/null || true)
+    assert_eq "$OUT" 'ERR bad_id' 'invalid service id'
+
+    # no free candidate
+    set_instance_status 4 down
+    set_instance_status 3 down
+    set_instance_status 2 down
+    : > "$RECS"
+    OUT=$(request_service_rotate 2 2>/dev/null || true)
+    assert_eq "$OUT" 'ERR no_candidate' 'refuse when no free healthy inst'
+    assert_eq "$(get_service_assigned_instance 2)" '4' 'assignment unchanged on refuse'
+    assert_eq "$(cat "$RECS")" '' 'no recovery when refused'
+
+    unset -f is_instance_recovering is_live_pid haproxy_set_server_state \
+        request_instance_recovery mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
+test_status_json_lists_services() {
+    local SAVED="$INSTANCE_STATE_DIR" JSON
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    PROXY_PORTS='1080,1081'
+    WARP_INSTANCE_COUNT=3
+    set_service_assigned_instance 1 2
+    set_service_assigned_instance 2 1
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    printf '1\n' > "$(get_instance_last_healthy_file 1)"
+    printf '2\n' > "$(get_instance_last_healthy_file 2)"
+    printf '3\n' > "$(get_instance_last_healthy_file 3)"
+    JSON=$(build_status_json)
+    assert_contains "$JSON" '"services":[' 'services array'
+    assert_contains "$JSON" '"id":1,"port":1080,"instance":2' 'svc1 mapping'
+    assert_contains "$JSON" '"id":2,"port":1081,"instance":1' 'svc2 mapping'
+    assert_contains "$JSON" '"assigned_to":1' 'inst2 assigned_to svc1'
+    assert_contains "$JSON" '"assigned_to":2' 'inst1 assigned_to svc2'
+    assert_contains "$JSON" '"assigned_to":null' 'free inst assigned_to null'
+    unset -f mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
+test_admin_rotate_req_carries_service_id() {
+    # handler must write service id into rotate req; worker must pass it through
+    if ! grep -q 'parse_rotate_service_id' entrypoint.sh; then
+        echo 'admin path must parse rotate service id' >&2
+        exit 1
+    fi
+    if ! grep -q 'request_service_rotate' entrypoint.sh; then
+        echo 'admin worker must call request_service_rotate' >&2
+        exit 1
+    fi
+    if ! grep -q 'OK id=' entrypoint.sh; then
+        echo 'rotate result must be OK id=S to=N' >&2
         exit 1
     fi
 }
@@ -1319,6 +1573,14 @@ test_mark_instance_up_primary_then_standby_drain
 test_request_primary_rotate_thin_ok
 test_failover_primary_excludes_failed
 test_rotate_recovery_not_silenced
+test_proxy_ports_default_and_parse
+test_instance_count_floor_at_least_service_count
+test_parse_rotate_service_id
+test_shared_pool_assignment_and_pick
+test_haproxy_desired_state_per_service
+test_request_service_rotate_by_id
+test_status_json_lists_services
+test_admin_rotate_req_carries_service_id
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
