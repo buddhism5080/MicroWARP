@@ -1136,6 +1136,49 @@ test_mark_instance_up_primary_then_standby_drain() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+# Recovery mark_up must only reapply THIS instance (not 20×3 maint spam).
+test_mark_up_reapplies_only_self() {
+    local SAVED="$INSTANCE_STATE_DIR" LOG
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/states.log"
+    : > "$LOG"
+    PROXY_PORTS='1080,1081,1082'
+    WARP_INSTANCE_COUNT=5
+    set_service_assigned_instance 1 1
+    set_service_assigned_instance 2 2
+    set_service_assigned_instance 3 3
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    set_instance_status 4 up
+    set_instance_status 5 down
+    start_instance_socks() { :; }
+    clear_instance_offline_since() { :; }
+    record_instance_online_since() { :; }
+    haproxy_set_server_state() { echo "$1:$2${3:+:$3}" >> "$LOG"; return 0; }
+
+    mark_instance_up 5 >/dev/null
+    # Only inst5 should appear in the log (3 service backends).
+    if grep -E '^[1234]:' "$LOG"; then
+        echo 'mark_up of inst5 must not reapply other instances' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:1' 'unassigned recovered inst5 maint on svc1'
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:2' 'unassigned recovered inst5 maint on svc2'
+    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:3' 'unassigned recovered inst5 maint on svc3'
+    assert_eq "$(get_service_assigned_instance 1)" '1' 'svc1 assignment unchanged'
+    assert_eq "$(get_instance_status 5)" 'up' 'inst5 now up standby'
+
+    unset -f start_instance_socks clear_instance_offline_since record_instance_online_since \
+        haproxy_set_server_state mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
 test_request_primary_rotate_thin_ok() {
     local SAVED="$INSTANCE_STATE_DIR" OUT RECS
     INSTANCE_STATE_DIR=$(mktemp -d)
@@ -1570,6 +1613,7 @@ test_admin_hmac_timestamp_window() {
 test_last_healthy_pick_latest_standby
 test_haproxy_desired_state_single_active
 test_mark_instance_up_primary_then_standby_drain
+test_mark_up_reapplies_only_self
 test_request_primary_rotate_thin_ok
 test_failover_primary_excludes_failed
 test_rotate_recovery_not_silenced

@@ -2368,9 +2368,17 @@ haproxy_desired_state_for_instance() {
     esac
 }
 
+# Optional args = instance ids to refresh. No args = whole fleet
+# (needed after HAProxy reload/cold start, when runtime states reset).
 haproxy_reapply_instance_states() {
-    local _iid _sid DESIRED
-    for _iid in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+    local _iid _sid DESIRED TARGETS
+    if [ "$#" -gt 0 ]; then
+        TARGETS="$*"
+    else
+        TARGETS=$(get_instance_ids "$WARP_INSTANCE_COUNT")
+    fi
+    for _iid in $TARGETS; do
+        [ -n "$_iid" ] || continue
         for _sid in $(get_proxy_service_ids); do
             DESIRED=$(haproxy_desired_state_for_instance "$_iid" "$_sid")
             haproxy_set_server_state "$_iid" "$DESIRED" "$_sid" || true
@@ -2396,7 +2404,11 @@ promote_service_instance() {
     fi
     clear_instance_drain_service "$NEW"
     set_service_assigned_instance "$SID" "$NEW"
-    haproxy_reapply_instance_states
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        haproxy_reapply_instance_states "$OLD" "$NEW"
+    else
+        haproxy_reapply_instance_states "$NEW"
+    fi
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         echo "==> svc${SID}: inst${OLD} → inst${NEW}" >&2
     else
@@ -3433,7 +3445,7 @@ mark_instance_up() {
     clear_instance_drain_service "$INST_ID"
     OWNER=$(get_instance_assigned_service "$INST_ID")
     if [ -n "$OWNER" ]; then
-        haproxy_reapply_instance_states
+        haproxy_reapply_instance_states "$INST_ID"
         echo "==> [inst${INST_ID}] ✅ 已标记健康，继续服务 svc${OWNER}（HAProxy ready）"
         return 0
     fi
@@ -3442,7 +3454,7 @@ mark_instance_up() {
         CLAIMED=$(claim_first_unassigned_service "$INST_ID")
         release_rotate_lock || true
     fi
-    haproxy_reapply_instance_states
+    haproxy_reapply_instance_states "$INST_ID"
     if [ -n "$CLAIMED" ]; then
         echo "==> [inst${INST_ID}] ✅ 已标记健康并绑定 svc${CLAIMED}（HAProxy ready）"
     else
