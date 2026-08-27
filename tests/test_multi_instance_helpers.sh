@@ -888,7 +888,7 @@ test_instance_drain_helpers() {
     }
     sleep() { :; }
     out=$(wait_instance_drain 4 2>&1)
-    assert_contains "$out" '连接已排空' 'drains after busy clears'
+    assert_contains "$out" '排空完成' 'drains after busy clears'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
     rm -f "$BUSY_STATE"
 
@@ -906,8 +906,8 @@ test_instance_drain_helpers() {
     }
     sleep() { :; }
     out=$(wait_instance_drain 9 2>&1)
-    assert_contains "$out" '无限期等待' 'unset timeout logs infinite wait'
-    assert_contains "$out" '连接已排空' 'infinite mode still ends when idle'
+    assert_contains "$out" '无超时上限' 'unset timeout logs infinite wait'
+    assert_contains "$out" '排空完成' 'infinite mode still ends when idle'
     if [[ "$out" == *排空超时* ]]; then
         echo "unset INSTANCE_DRAIN_TIMEOUT must not force-timeout: $out" >&2
         exit 1
@@ -971,6 +971,44 @@ test_instance_drain_helpers() {
     INSTANCE_DRAIN_TIMEOUT=30
 }
 
+test_sum_draining_busy_skips_non_drain() {
+    local SCAN_LOG summary
+    SCAN_LOG=$(mktemp)
+    WARP_INSTANCE_COUNT=3
+    get_instance_ids() { printf '1 2 3\n'; }
+    get_instance_status() {
+        case "$1" in
+            1) printf 'up\n' ;;
+            2) printf 'draining\n' ;;
+            3) printf 'down\n' ;;
+            *) printf 'down\n' ;;
+        esac
+    }
+    count_instance_busy_clients() {
+        printf '%s\n' "$1" >> "$SCAN_LOG"
+        case "$1" in
+            1) printf '9\n' ;;
+            2) printf '3\n' ;;
+            3) printf '7\n' ;;
+            *) printf '0\n' ;;
+        esac
+    }
+    is_instance_recovering() { return 1; }
+    count_healthy_instances() { printf '1\n'; }
+
+    assert_eq "$(sum_draining_busy_clients)" '3' 'only draining inst busy is summed'
+    assert_eq "$(tr -d ' \n' < "$SCAN_LOG")" '2' 'ss only for draining instance'
+
+    summary=$(print_health_summary)
+    assert_contains "$summary" '健康 1/3' 'fleet healthy count'
+    assert_contains "$summary" 'draining 1' 'fleet draining count'
+    assert_contains "$summary" '排空中busy=3' 'busy only when draining'
+
+    unset -f get_instance_ids get_instance_status count_instance_busy_clients \
+        is_instance_recovering count_healthy_instances 2>/dev/null || true
+    rm -f "$SCAN_LOG"
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -1000,5 +1038,6 @@ test_config_stale_offline_threshold
 test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
+test_sum_draining_busy_skips_non_drain
 
 printf 'PASS test_multi_instance_helpers\n'
