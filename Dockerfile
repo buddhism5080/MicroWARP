@@ -1,13 +1,11 @@
 # ==========================================
-# 阶段 1：极速编译 MicroSOCKS 引擎
+# 阶段 1：编译 hev-socks5-server（C，TCP+UDP ASSOCIATE）
 # ==========================================
 ARG ALPINE_IMAGE=alpine:latest
 FROM ${ALPINE_IMAGE} AS builder
-# 安装 C 语言编译环境
-RUN apk add --no-cache build-base git
-# 从官方仓库拉取源码并编译 (只需 2 秒)
-RUN git clone https://github.com/rofl0r/microsocks.git /src && \
-    cd /src && make
+RUN apk add --no-cache build-base git linux-headers
+RUN git clone --recursive --depth 1 https://github.com/heiher/hev-socks5-server.git /src && \
+    make -C /src -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" ENABLE_STATIC=1
 
 # ==========================================
 # 阶段 2：极净运行环境
@@ -22,8 +20,7 @@ RUN apk add --no-cache wireguard-tools iptables iproute2 curl tzdata haproxy soc
     ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime && \
     echo "${TZ}" > /etc/timezone
 
-# 打包microsocks
-COPY --from=builder /src/microsocks /usr/local/bin/microsocks
+COPY --from=builder /src/bin/hev-socks5-server /usr/local/bin/hev-socks5-server
 
 WORKDIR /app
 COPY entrypoint.sh .

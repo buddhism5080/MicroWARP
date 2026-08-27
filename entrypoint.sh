@@ -41,6 +41,8 @@ MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # Unset/empty = wait indefinitely until idle (IM-friendly; no force-kill on timeout).
 # 0 = stop SOCKS immediately. Positive N = max wait seconds then force stop.
 INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
+HEV_SOCKS5_BIN="${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}"
+SOCKS_UDP_PORT_BASE="${SOCKS_UDP_PORT_BASE:-}"
 WARP_INSTANCE_COUNT=1
 
 is_enabled() {
@@ -119,6 +121,125 @@ get_instance_ns_ip() {
 get_instance_socks_endpoint() {
     printf '%s:%s\n' "$(get_instance_ns_ip "$1")" "1080"
 }
+
+get_instance_socks_conf_path() {
+    printf '%s/inst%s.socks.yml\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+get_instance_udp_port_file() {
+    printf '%s/inst%s.udp_port\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+# Unique UDP port per instance so ASSOCIATE BND.PORT pins the HAProxy-chosen backend.
+# Default: LISTEN_PORT + inst_id - 1 (inst1 shares the TCP SOCKS port).
+get_instance_socks_udp_port() {
+    local INST_ID="$1"
+    local BASE
+    BASE=${SOCKS_UDP_PORT_BASE:-}
+    if [ -z "$BASE" ]; then
+        BASE=${LISTEN_PORT:-1080}
+    fi
+    case "$BASE" in
+        ''|*[!0-9]*) BASE=1080 ;;
+    esac
+    case "$INST_ID" in
+        ''|*[!0-9]*) INST_ID=1 ;;
+    esac
+    printf '%s\n' $((BASE + INST_ID - 1))
+}
+
+get_instance_public_udp_port() {
+    get_instance_socks_udp_port "$1"
+}
+
+yaml_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+render_hev_socks_config() {
+    local LISTEN_IP="$1"
+    local TCP_PORT="$2"
+    local UDP_PORT="$3"
+    printf '%s\n' "main:"
+    printf '%s\n' "  workers: 1"
+    printf '%s\n' "  port: ${TCP_PORT}"
+    printf '%s\n' "  listen-address: $(yaml_quote "$LISTEN_IP")"
+    printf '%s\n' "  udp-port: ${UDP_PORT}"
+    printf '%s\n' "  udp-listen-address: $(yaml_quote "$LISTEN_IP")"
+    printf '%s\n' "  udp-public-address-v4: '0.0.0.0'"
+    printf '%s\n' "  listen-ipv6-only: false"
+    if [ -n "${SOCKS_USER:-}" ] && [ -n "${SOCKS_PASS:-}" ]; then
+        printf '%s\n' "auth:"
+        printf '  username: %s\n' "$(yaml_quote "$SOCKS_USER")"
+        printf '  password: %s\n' "$(yaml_quote "$SOCKS_PASS")"
+    fi
+    printf '%s\n' "misc:"
+    printf '%s\n' "  task-stack-size: 8192"
+    printf '%s\n' "  log-level: error"
+    printf '%s\n' "  limit-nofile: 65535"
+}
+
+ensure_udp_nat_chain() {
+    iptables -t nat -N MW_UDP 2>/dev/null || true
+    iptables -t nat -C PREROUTING -p udp -j MW_UDP 2>/dev/null \
+        || iptables -t nat -I PREROUTING -p udp -j MW_UDP 2>/dev/null || true
+    iptables -t nat -C OUTPUT -p udp -j MW_UDP 2>/dev/null \
+        || iptables -t nat -I OUTPUT -p udp -j MW_UDP 2>/dev/null || true
+    iptables -C FORWARD -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null || true
+}
+
+teardown_udp_nat_chain() {
+    iptables -t nat -D PREROUTING -p udp -j MW_UDP 2>/dev/null || true
+    iptables -t nat -D OUTPUT -p udp -j MW_UDP 2>/dev/null || true
+    iptables -t nat -F MW_UDP 2>/dev/null || true
+    iptables -t nat -X MW_UDP 2>/dev/null || true
+}
+
+is_instance_socks_running() {
+    local INST_ID="$1"
+    local PID_FILE PID
+    PID_FILE=$(get_instance_pid_file "$INST_ID")
+    [ -f "$PID_FILE" ] || return 1
+    PID=$(tr -d '\n' < "$PID_FILE")
+    [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null
+}
+
+rebuild_instance_udp_forward() {
+    local _iid PORT NS_IP
+    ensure_udp_nat_chain
+    iptables -t nat -F MW_UDP 2>/dev/null || true
+    for _iid in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
+        is_instance_socks_running "$_iid" || continue
+        PORT=$(get_instance_public_udp_port "$_iid")
+        case "$PORT" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        NS_IP=$(get_instance_ns_ip "$_iid")
+        iptables -t nat -A MW_UDP -p udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
+    done
+}
+
+count_busy_udp_sockets() {
+    local FILTER="$1"
+    local OUT N
+    if ! command -v ss >/dev/null 2>&1; then
+        printf '0\n'
+        return 0
+    fi
+    OUT=$(ss -Hun $FILTER 2>/dev/null) || {
+        printf '0\n'
+        return 0
+    }
+    N=$(printf '%s\n' "$OUT" | sed '/^$/d' | wc -l | tr -d ' ')
+    case "$N" in
+        ''|*[!0-9]*) N=0 ;;
+    esac
+    printf '%s\n' "$N"
+}
+
 
 get_instance_status_file() {
     printf '%s/inst%s.status\n' "$INSTANCE_STATE_DIR" "$1"
@@ -349,11 +470,22 @@ get_instance_drain_timeout() {
 # Busy HAProxy→backend sockets for one instance (host netns view).
 count_instance_busy_clients() {
     local INST_ID="$1"
-    local NS_IP
-
+    local NS_IP UDP_PORT TCP UDP
     NS_IP=$(get_instance_ns_ip "$INST_ID")
     # FILTER must be separate ss tokens: dst host:port
-    count_busy_tcp_sockets "dst ${NS_IP}:1080"
+    TCP=$(count_busy_tcp_sockets "dst ${NS_IP}:1080")
+    case "$TCP" in
+        ''|*[!0-9]*)
+            printf '%s\n' "$TCP"
+            return 0
+            ;;
+    esac
+    UDP_PORT=$(get_instance_socks_udp_port "$INST_ID")
+    UDP=$(count_busy_udp_sockets "dst ${NS_IP}:${UDP_PORT}")
+    case "$UDP" in
+        ''|*[!0-9]*) UDP=0 ;;
+    esac
+    printf '%s\n' $((TCP + UDP))
 }
 
 # Wait until instance has no busy client sockets.
@@ -1387,16 +1519,22 @@ print_socks_health_check_success() {
 }
 
 start_socks() {
+    local CONF UDP_PORT BIN
+    BIN=${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}
     if [ -z "$SOCKS_PID" ] || ! kill -0 "$SOCKS_PID" 2>/dev/null; then
         echo "==> 🟢 节点状态健康，正在启动 SOCKS 服务..."
-        if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
-            microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
-        else
-            microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" > /dev/null 2>&1 &
+        if [ ! -x "$BIN" ]; then
+            echo "==> [ERROR] 未找到 hev-socks5-server ($BIN)"
+            return 1
         fi
+        mkdir -p "$INSTANCE_STATE_DIR"
+        CONF="${INSTANCE_STATE_DIR}/single.socks.yml"
+        UDP_PORT=${LISTEN_PORT:-1080}
+        render_hev_socks_config "${LISTEN_ADDR:-0.0.0.0}" "$UDP_PORT" "$UDP_PORT" > "$CONF"
+        "$BIN" "$CONF" > "${INSTANCE_STATE_DIR}/single.socks.log" 2>&1 &
         SOCKS_PID=$!
         record_socks_online_started_at
-        echo "==> 🚀 MicroSOCKS 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
+        echo "==> 🚀 SOCKS5 (hev, TCP+UDP) 已上线 (监听: ${LISTEN_ADDR}:${LISTEN_PORT}, PID: ${SOCKS_PID})"
     fi
 }
 
@@ -1988,6 +2126,7 @@ enable_host_forwarding() {
     iptables -t nat -C POSTROUTING -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null \
         || true
+    ensure_udp_nat_chain
 }
 
 destroy_instance_netns() {
@@ -2272,29 +2411,51 @@ stop_instance_socks() {
         fi
         rm -f "$PID_FILE"
     fi
+    rm -f "$(get_instance_udp_port_file "$INST_ID")" "$(get_instance_socks_conf_path "$INST_ID")"
+    rebuild_instance_udp_forward
 }
 
 start_instance_socks() {
     local INST_ID="$1"
-    local NS_NAME NS_IP PID_FILE PID
+    local NS_NAME NS_IP PID_FILE PID CONF UDP_PORT BIN CUR LOG
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     NS_IP=$(get_instance_ns_ip "$INST_ID")
     PID_FILE=$(get_instance_pid_file "$INST_ID")
+    CONF=$(get_instance_socks_conf_path "$INST_ID")
+    UDP_PORT=$(get_instance_socks_udp_port "$INST_ID")
+    BIN=${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}
 
     if [ -f "$PID_FILE" ]; then
         PID=$(tr -d '\n' < "$PID_FILE")
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            return 0
+            CUR=""
+            if [ -f "$(get_instance_udp_port_file "$INST_ID")" ]; then
+                CUR=$(tr -d '\n' < "$(get_instance_udp_port_file "$INST_ID")")
+            fi
+            if [ "$CUR" = "$UDP_PORT" ]; then
+                rebuild_instance_udp_forward
+                return 0
+            fi
+            echo "==> [inst${INST_ID}] SOCKS UDP 端口 ${CUR:-?} → ${UDP_PORT}，重启 hev"
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+            rm -f "$PID_FILE"
         fi
     fi
 
-    echo "==> [inst${INST_ID}] 启动内部 MicroSOCKS (${NS_IP}:1080)"
-    if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
-        ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 -u "$SOCKS_USER" -P "$SOCKS_PASS" > /dev/null 2>&1 &
-    else
-        ip netns exec "$NS_NAME" microsocks -i "$NS_IP" -p 1080 > /dev/null 2>&1 &
+    if [ ! -x "$BIN" ]; then
+        echo "==> [inst${INST_ID}] [ERROR] 未找到 hev-socks5-server ($BIN)"
+        return 1
     fi
+
+    mkdir -p "$INSTANCE_STATE_DIR"
+    render_hev_socks_config "$NS_IP" 1080 "$UDP_PORT" > "$CONF"
+    LOG="${INSTANCE_STATE_DIR}/inst${INST_ID}.socks.log"
+    echo "==> [inst${INST_ID}] 启动内部 SOCKS5 hev (${NS_IP}:1080 tcp / :${UDP_PORT} udp)"
+    ip netns exec "$NS_NAME" "$BIN" "$CONF" > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
+    printf '%s\n' "$UDP_PORT" > "$(get_instance_udp_port_file "$INST_ID")"
+    rebuild_instance_udp_forward
 }
 
 ns_ensure_trace_ip() {
@@ -3056,6 +3217,7 @@ multi_cleanup_on_exit() {
     done
 
     iptables -t nat -D POSTROUTING -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null || true
+    teardown_udp_nat_chain
     exit 0
 }
 

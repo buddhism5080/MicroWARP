@@ -1009,6 +1009,28 @@ test_sum_draining_busy_skips_non_drain() {
     rm -f "$SCAN_LOG"
 }
 
+test_hev_socks_config_and_udp_ports() {
+    local cfg
+    SOCKS_USER=''
+    SOCKS_PASS=''
+    cfg=$(render_hev_socks_config '10.66.2.2' '1080' '1082')
+    assert_contains "$cfg" 'workers: 1' 'hev workers'
+    assert_contains "$cfg" "listen-address: '10.66.2.2'" 'listen ns ip'
+    assert_contains "$cfg" 'port: 1080' 'tcp 1080'
+    assert_contains "$cfg" 'udp-port: 1082' 'per-instance udp port'
+    assert_contains "$cfg" "udp-public-address-v4: '0.0.0.0'" 'advertise 0.0.0.0 for RFC1928'
+
+    LISTEN_PORT=1080
+    SOCKS_UDP_PORT_BASE=''
+    assert_eq "$(get_instance_socks_udp_port 1)" '1080' 'inst1 shares BIND_PORT'
+    assert_eq "$(get_instance_socks_udp_port 3)" '1082' 'inst3 is BIND+2'
+    assert_eq "$(get_instance_public_udp_port 3)" '1082' 'lb public udp is unique'
+    SOCKS_UDP_PORT_BASE=20000
+    assert_eq "$(get_instance_socks_udp_port 1)" '20000' 'explicit UDP base'
+    assert_eq "$(get_instance_socks_udp_port 2)" '20001' 'explicit UDP base +1'
+    SOCKS_UDP_PORT_BASE=''
+}
+
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back
@@ -1039,5 +1061,6 @@ test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
 test_sum_draining_busy_skips_non_drain
+test_hev_socks_config_and_udp_ports
 
 printf 'PASS test_multi_instance_helpers\n'

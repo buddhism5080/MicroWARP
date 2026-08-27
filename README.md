@@ -16,7 +16,7 @@ Here is a real-world performance test on a 1C1G (1 vCPU, 1GB RAM) VPS, comparing
 | **Image Size**<br>(Docker 镜像体积) | 201 MB | **9.08 MB** | 📉 **直降 95%** |
 | **RAM Usage**<br>(日常内存占用) | ~150 MB | **800 KiB** (< 1MB) | 📉 **暴降 99.4%** |
 | **CPU Overhead**<br>(高并发 CPU 损耗) | High (Userspace App) | **~0.25%** (Kernel Space) | ⚡ **近乎为零** |
-| **Core Engine**<br>(底层核心引擎) | Cloudflare `warp-cli` (Rust/Heavy) | Linux `wg0` + Pure C `microsocks` | 🛠️ **极简硬核** |
+| **Core Engine**<br>(底层核心引擎) | Cloudflare `warp-cli` (Rust/Heavy) | Linux `wg0` + Pure C `hev-socks5-server` (TCP+UDP) | 🛠️ **极简硬核** |
 
 > **🔥 Real `docker stats` output (真实的生产环境终端输出):**
 > ```text
@@ -40,7 +40,7 @@ Many popular WARP Docker images (like `caomingjun/warp`) rely on the official Cl
 
 **MicroWARP** does things differently:
 1. **Kernel-Level WireGuard**: It drops the bloated official client and uses Linux's native `wg0` interface. CPU usage is almost zero.
-2. **MicroSOCKS**: It uses a pure C-based `microsocks` server instead of heavy Go/Rust proxies.
+2. **SOCKS5 (hev)**: Pure C `hev-socks5-server` — TCP CONNECT + UDP ASSOCIATE, still tiny vs Go/Rust proxies.
 3. **Extreme Low RAM**: Runs smoothly on **< 5MB RAM** (often under 1MB). Perfect for 1C1G cheap VPS.
 4. **Multi-Arch**: Native support for `amd64` and `arm64` (Oracle Cloud ARM ready).
 
@@ -107,6 +107,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
       - MAX_CONN_DURATION=0 # Multi-instance only: max continuous healthy uptime (seconds) per backend; when exceeded AND ready/up pool ≥ half, force offline + reconnect even if busy (default 0=disable; single-instance never rotates; skips when ready < half)
       - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
+      - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
@@ -126,7 +127,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(Startup logs now print a short WARP identity summary, including a private-key fingerprint, interface addresses, and the selected peer endpoint. If you pass multiple endpoints in `ENDPOINT_IP`, separated by commas or semicolons, MicroWARP will randomly pick one on each start.)*
 
-*(Set `WARP_INSTANCES=N` (N>1) to run **multiple WARP tunnels inside one container**. Only one SOCKS port is exposed (`BIND_ADDR`/`BIND_PORT`); HAProxy round-robins to healthy in-container backends and immediately removes unhealthy ones from the pool. Per-instance configs live under `/etc/wireguard/instances/<id>/wg0.conf`. Multi-instance needs extra privileges for network namespaces — add `SYS_ADMIN` (in addition to the usual `NET_ADMIN` / `SYS_MODULE`). Default remains `1` and keeps the original single-tunnel path.)*
+*(Set `WARP_INSTANCES=N` (N>1) to run **multiple WARP tunnels inside one container**. Only one SOCKS **TCP** port is exposed (`BIND_ADDR`/`BIND_PORT`); HAProxy round-robins CONNECT. UDP ASSOCIATE uses per-instance ports `BIND_PORT + inst - 1` (override with `SOCKS_UDP_PORT_BASE`). Publish those UDP ports (or use the docker bridge). Per-instance configs live under `/etc/wireguard/instances/<id>/wg0.conf`. Multi-instance needs extra privileges for network namespaces — add `SYS_ADMIN` (in addition to the usual `NET_ADMIN` / `SYS_MODULE`). Default remains `1` and keeps the original single-tunnel path.)*
 
 *(Multi-instance runtime notes: HAProxy opens as soon as bootstrap begins (even with zero backends). Each instance is health-checked and joined to the pool **as soon as it comes up** — the container does **not** wait for all N tunnels before serving. Instances still start **serially with a 1s stagger**. Health probes are staggered by `TEST_URLS_CHECK_INTERVAL / WARP_INSTANCES`. A failed instance is **removed from HAProxy first** via a **fast** soft-reload on the monitor path (no drain wait). Connection drain (`INSTANCE_DRAIN_TIMEOUT`: **unset/empty = wait until idle with no force timeout**; `0` = stop immediately; positive N = max N seconds then force), SOCKS stop, reconnect and re-register all run inside that instance's **background worker**, so other instances' probes and the main loop are not blocked. If register/config fetch fails 3 times for an instance, it is **enqueued to a serial background config-retry queue** instead of exiting the container; one worker retries those registrations FIFO with backoff. Registration API calls remain serialized across workers/queue.)*
 
@@ -161,7 +162,7 @@ Zero configuration required. On the first run, MicroWARP will automatically regi
 
 **MicroWARP** 采用了完全不同的极客底层架构：
 1. **内核级 WireGuard**：彻底抛弃臃肿的官方客户端，直接调用 Linux 原生内核态的 `wg0` 网卡接管流量，CPU 损耗近乎为零。
-2. **MicroSOCKS 引擎**：使用纯 C 语言编写的 `microsocks` 服务器替代繁重的 Go/Rust 代理引擎。
+2. **SOCKS5 引擎**：纯 C 的 `hev-socks5-server`（TCP CONNECT + UDP ASSOCIATE），替代繁重的 Go/Rust 代理。
 3. **极致极低内存**：高并发下内存占用依然 **< 5MB**（实测常驻 800KB 左右）。专为 1C1G 的廉价小内存 VPS 打造的拯救者。
 4. **多架构支持**：原生支持 `amd64` 和 `arm64`（完美兼容甲骨文免费 ARM 机器）。
 
@@ -229,6 +230,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
       - MAX_CONN_DURATION=0 # 仅多实例：每个后端最长连续健康在线秒数；超时且 ready 实例不少于一半时进入 drain 后重连（可有 busy；默认 0=关闭；单实例永不因本策略下线；ready 不足一半则跳过）
       - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
+      - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
       # - EGRESS_IP_V6_URLS=https://[2606:4700:4700::1111]/cdn-cgi/trace,https://api6.ipify.org,...,https://[2606:4700:4700::1001]/...
