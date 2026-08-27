@@ -372,62 +372,71 @@ print_instance_health_probe_start() {
 }
 
 # Busy (non-idle) TCP states for client sessions:
-#   established  — active data path
-#   syn-sent / syn-recv — handshake in progress
-#   fin-wait-1/2, close-wait, last-ack, closing — teardown still holding a session
+#   ESTAB / established — active data path
+#   SYN-SENT / SYN-RECV — handshake
+#   FIN-WAIT-*, CLOSE-WAIT, LAST-ACK, CLOSING — teardown still holding a session
 # TIME-WAIT is intentionally excluded: pure post-close linger must not block rotation.
 #
-# CRITICAL: many ss builds (iproute2 on Alpine etc.) do NOT accept comma-separated
-# state lists — `ss state established,syn-sent` prints "wrong state name" yet still
-# exits 0 with empty output, which previously made every instance look idle and let
-# MAX_CONN_DURATION kill live sessions. Always query one state at a time.
-SS_BUSY_TCP_STATES='established syn-sent syn-recv fin-wait-1 fin-wait-2 close-wait last-ack closing'
-
-# Count non-idle TCP sockets matching an ss filter expression (e.g. "dst 10.66.1.2:1080").
-# Prints a non-negative integer. On ss unavailability / hard failure prints "unknown"
-# so callers can fail closed (do not treat as idle).
+# Alpine ss rejects comma-separated `state a,b` (empty stdout + exit 0 = false idle).
+# One `ss -Htn FILTER` dump + parse: same fail-closed rules, ~8x fewer forks while
+# draining (INSTANCE_DRAIN_TIMEOUT unset can wait hours on IM/WebSocket).
 count_busy_tcp_sockets() {
     local FILTER="$1"
-    local STATE TOTAL=0 N OUT RC ANY_OK=0
+    local OUT RC N
 
     if ! command -v ss >/dev/null 2>&1; then
         printf 'unknown\n'
         return 0
     fi
 
-    for STATE in $SS_BUSY_TCP_STATES; do
-        # Capture stderr: "wrong state name" must not be treated as zero busy.
-        OUT=$(ss -Htn state "$STATE" $FILTER 2>&1)
-        RC=$?
-        if [ "$RC" -ne 0 ]; then
-            # Some older ss reject individual states; skip unknown state names only.
-            case "$OUT" in
-                *'wrong state name'*|*'invalid'*|*'unknown'*)
-                    continue
-                    ;;
-            esac
-            printf 'unknown\n'
-            return 0
-        fi
-        case "$OUT" in
-            *'wrong state name'*)
-                # ss may exit 0 while rejecting the state — never count as idle.
-                continue
-                ;;
-        esac
-        ANY_OK=1
-        N=$(printf '%s\n' "$OUT" | sed '/^$/d' | wc -l | tr -d ' ')
-        case "$N" in
-            ''|*[!0-9]*) N=0 ;;
-        esac
-        TOTAL=$((TOTAL + N))
-    done
-
-    if [ "$ANY_OK" -eq 0 ]; then
+    OUT=$(ss -Htn $FILTER 2>&1)
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
         printf 'unknown\n'
         return 0
     fi
-    printf '%s\n' "$TOTAL"
+    case "$OUT" in
+        *'wrong state name'*|*'invalid state'*)
+            printf 'unknown\n'
+            return 0
+            ;;
+    esac
+
+    N=$(printf '%s\n' "$OUT" | awk '
+        function busy(s) {
+            return (s == "ESTAB" || s == "ESTABLISHED" || s == "SYN-SENT" || s == "SYN-RECV" \
+                || s == "FIN-WAIT-1" || s == "FIN-WAIT-2" || s == "CLOSE-WAIT" \
+                || s == "LAST-ACK" || s == "CLOSING")
+        }
+        function ignore(s) {
+            return (s == "TIME-WAIT" || s == "TIMEWAIT" || s == "UNCONN" || s == "LISTEN" \
+                || s == "CLOSED" || s == "CLOSE" || s == "IDLE" || s == "FREE" || s == "")
+        }
+        BEGIN { n = 0; bad = 0 }
+        NF == 0 { next }
+        {
+            st = $1
+            if ($1 == "tcp" || $1 == "udp" || $1 == "u_str" || $1 == "p_raw") st = $2
+            if (busy(st)) { n++; next }
+            if (ignore(st)) next
+            bad = 1
+        }
+        END {
+            if (bad) print "unknown"
+            else print n+0
+        }
+    ')
+    case "$N" in
+        unknown|'')
+            printf 'unknown\n'
+            ;;
+        *[!0-9]*)
+            printf 'unknown\n'
+            ;;
+        *)
+            printf '%s\n' "$N"
+            ;;
+    esac
 }
 
 # True (0) if no busy TCP clients to this instance's backend SOCKS endpoint.
@@ -1000,6 +1009,7 @@ global
     daemon
     master-worker
     maxconn 4096
+    nbthread 1
     # Explicit root + chroot /: we intentionally run privileged in this container
     # (netns / bind). Silences HAProxy 3.x startup warnings that look like crashes.
     user root
@@ -1029,7 +1039,7 @@ EOF
         _sid=${ITEM%%:*}
         # status ignored for membership — always emit the server line
         ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-        printf '    server inst%s %s check inter 3s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+        printf '    server inst%s %s check inter 15s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
     done
     IFS=$OLD_IFS
 }
