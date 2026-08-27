@@ -16,7 +16,7 @@ Here is a real-world performance test on a 1C1G (1 vCPU, 1GB RAM) VPS, comparing
 | **Image Size**<br>(Docker 镜像体积) | 201 MB | **9.08 MB** | 📉 **直降 95%** |
 | **RAM Usage**<br>(日常内存占用) | ~150 MB | **800 KiB** (< 1MB) | 📉 **暴降 99.4%** |
 | **CPU Overhead**<br>(高并发 CPU 损耗) | High (Userspace App) | **~0.25%** (Kernel Space) | ⚡ **近乎为零** |
-| **Core Engine**<br>(底层核心引擎) | Cloudflare `warp-cli` (Rust/Heavy) | Linux `wg0` + Pure C `microsocks` | 🛠️ **极简硬核** |
+| **Core Engine**<br>(底层核心引擎) | Cloudflare `warp-cli` (Rust/Heavy) | Linux `wg0` + Pure C `hev-socks5-server` (TCP+UDP) | 🛠️ **极简硬核** |
 
 > **🔥 Real `docker stats` output (真实的生产环境终端输出):**
 > ```text
@@ -40,7 +40,7 @@ Many popular WARP Docker images (like `caomingjun/warp`) rely on the official Cl
 
 **MicroWARP** does things differently:
 1. **Kernel-Level WireGuard**: It drops the bloated official client and uses Linux's native `wg0` interface. CPU usage is almost zero.
-2. **MicroSOCKS**: It uses a pure C-based `microsocks` server instead of heavy Go/Rust proxies.
+2. **SOCKS5 (hev)**: Pure C `hev-socks5-server` — TCP CONNECT + UDP ASSOCIATE, still tiny vs Go/Rust proxies.
 3. **Extreme Low RAM**: Runs smoothly on **< 5MB RAM** (often under 1MB). Perfect for 1C1G cheap VPS.
 4. **Multi-Arch**: Native support for `amd64` and `arm64` (Oracle Cloud ARM ready).
 
@@ -164,7 +164,7 @@ Zero configuration required. On the first run, MicroWARP will automatically regi
 
 **MicroWARP** 采用了完全不同的极客底层架构：
 1. **内核级 WireGuard**：彻底抛弃臃肿的官方客户端，直接调用 Linux 原生内核态的 `wg0` 网卡接管流量，CPU 损耗近乎为零。
-2. **MicroSOCKS 引擎**：使用纯 C 语言编写的 `microsocks` 服务器替代繁重的 Go/Rust 代理引擎。
+2. **SOCKS5 引擎**：纯 C 的 `hev-socks5-server`（TCP CONNECT + UDP ASSOCIATE），替代繁重的 Go/Rust 代理。
 3. **极致极低内存**：高并发下内存占用依然 **< 5MB**（实测常驻 800KB 左右）。专为 1C1G 的廉价小内存 VPS 打造的拯救者。
 4. **多架构支持**：原生支持 `amd64` 和 `arm64`（完美兼容甲骨文免费 ARM 机器）。
 
@@ -296,6 +296,7 @@ nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2
 | 旧实例 | 该服务 backend `drain` → 排空 → **至少 WG 重连** → 回池热备（不自动抢回） |
 | 实例数 | floor **`max(2, 服务数)`** |
 | 端口 | `PROXY_PORTS=1080,1081,...`（空 = 单端口 `BIND_PORT`/`1080`） |
+| SOCKS UDP | 每个服务端口 **TCP+UDP 同端口**；ASSOCIATE 的 BND.PORT 就是该入口。Docker 网络直连容器 IP 即可；若 `-p` 映射请同时映射 `/udp`。 |
 | Admin HTTP | **写死 `0.0.0.0:9180`**；`ADMIN_HTTP_TOKEN`=HMAC secret（空=不启） |
 | Admin 鉴权 | **HTTP + HMAC-SHA256 + 时间戳**；`|now-ts| ≤ 120s` |
 | API | `POST /rotate?id=S`（或 JSON `{"id":S}`）→ `{"ok":true,"id":S,"instance":N}` / `OK id=S to=N` |
@@ -319,6 +320,8 @@ curl -s -X POST -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
 ```
 
 建议：`WARP_INSTANCES ≥ 服务数 + 1`，否则没有热备，rotate 会 `no_candidate`。
+
+SOCKS5 **UDP ASSOCIATE** 已启用：客户端对 `1080`/`1081`/… 的 UDP 与 TCP 走同一端口。3x-ui Freedom 放行 `1080-1087` 时，把 UDP 也放进同一段即可。
 
 `GET /status` 含 `services: [{id,port,instance}]`，实例带 `assigned_to`。
 

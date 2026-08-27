@@ -1610,6 +1610,46 @@ test_admin_hmac_timestamp_window() {
     fi
 }
 
+test_hev_socks_config_and_udp_ports() {
+    local cfg
+    SOCKS_USER=''
+    SOCKS_PASS=''
+    cfg=$(render_hev_socks_config '10.66.2.2' '1080' '1081')
+    assert_contains "$cfg" 'workers: 1' 'hev workers'
+    assert_contains "$cfg" "listen-address: '10.66.2.2'" 'listen ns ip'
+    assert_contains "$cfg" 'port: 1080' 'tcp 1080'
+    assert_contains "$cfg" 'udp-port: 1081' 'udp advertised port'
+    assert_contains "$cfg" "udp-public-address-v4: '0.0.0.0'" 'advertise 0.0.0.0 for RFC1928'
+    if [[ "$cfg" == *auth:* ]]; then
+        echo 'no-auth config must omit auth section' >&2
+        exit 1
+    fi
+    SOCKS_USER='admin'
+    SOCKS_PASS="p'w"
+    cfg=$(render_hev_socks_config '10.66.1.2' '1080' '1080')
+    assert_contains "$cfg" "username: 'admin'" 'auth user'
+    assert_contains "$cfg" "password: 'p''w'" 'yaml-escaped password'
+    SOCKS_USER=''
+    SOCKS_PASS=''
+
+    local SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    PROXY_PORTS='1080,1081'
+    assert_eq "$(get_instance_socks_udp_port 3)" '1080' 'unassigned standby binds 1080'
+    assert_eq "$(get_instance_public_udp_port 3)" '' 'standby has no public UDP DNAT'
+    set_service_assigned_instance 2 3
+    assert_eq "$(get_instance_socks_udp_port 3)" '1081' 'assigned svc2 uses 1081'
+    assert_eq "$(get_instance_public_udp_port 3)" '1081' 'assigned svc2 public UDP 1081'
+    set_instance_drain_service 3 2
+    clear_service_assigned_instance 2
+    assert_eq "$(get_instance_socks_udp_port 3)" '1081' 'drain keeps service udp port'
+    set_service_assigned_instance 2 1
+    assert_eq "$(get_instance_public_udp_port 3)" '' 'drain yields public port after reassign'
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
 test_last_healthy_pick_latest_standby
 test_haproxy_desired_state_single_active
 test_mark_instance_up_primary_then_standby_drain
@@ -1628,4 +1668,5 @@ test_admin_rotate_req_carries_service_id
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
+test_hev_socks_config_and_udp_ports
 printf 'PASS test_multi_instance_helpers\n'
