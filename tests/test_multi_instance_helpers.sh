@@ -1329,6 +1329,37 @@ test_proxy_ports_default_and_parse() {
     assert_eq "$(get_proxy_port 1)" '1080' 'keep first 1080'
     assert_eq "$(get_proxy_port 2)" '1081' 'keep 1081'
 
+    WARP_INSTANCES=''
+    PROXY_PORTS='1080-1085'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082 1083 1084 1085' 'inclusive range 1080-1085'
+    assert_eq "$(get_proxy_service_count)" '6' 'range expands to 6 services'
+    assert_eq "$(get_proxy_port 6)" '1085' 'includes end 1085'
+
+    WARP_INSTANCES='3'
+    PROXY_PORTS='1080-1085'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082' '3 instances keep 1080-1082, drop 1083-1085'
+    assert_eq "$(get_proxy_service_count)" '3' 'capped to instance count'
+    assert_eq "$(get_proxy_port 3)" '1082' 'last kept is 1082'
+    assert_eq "$(get_proxy_port 4)" '' '1083 ignored'
+
+    WARP_INSTANCES='3'
+    PROXY_PORTS='1080-1082,1090'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082' 'mix range+list still caps at 3'
+
+    WARP_INSTANCES=''
+    PROXY_PORTS='1080-1082,1090'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082 1090' 'mix range and extra port'
+    PROXY_PORTS='1080-1080'
+    assert_eq "$(get_normalized_proxy_ports)" '1080' 'single-port range'
+    PROXY_PORTS='1085-1080'
+    LISTEN_PORT=1080
+    BIND_PORT=1080
+    assert_eq "$(get_normalized_proxy_ports)" '1080' 'reverse range ignored, fall back default'
+    PROXY_PORTS=' 1080 - 1082 '
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082' 'spaces inside range'
+    WARP_INSTANCES=''
+
+    PROXY_PORTS='1080,abc,1081,0,-3,1080'
     if is_valid_proxy_service_id 1; then :; else echo 'id 1 valid' >&2; exit 1; fi
     if is_valid_proxy_service_id 2; then :; else echo 'id 2 valid' >&2; exit 1; fi
     if is_valid_proxy_service_id 3; then echo 'id 3 should be invalid' >&2; exit 1; fi
@@ -1349,8 +1380,10 @@ test_instance_count_floor_at_least_service_count() {
     WARP_INSTANCES=''
     assert_eq "$(get_warp_instance_count)" '3' 'blank instances floor to service count when >2'
     WARP_INSTANCES='2'
-    assert_eq "$(get_warp_instance_count)" '3' 'instances < services floors to services'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081' 'explicit 2 instances drop extra port 1082'
+    assert_eq "$(get_warp_instance_count)" '2' 'do not raise instances to unused ports'
     WARP_INSTANCES='10'
+    assert_eq "$(get_normalized_proxy_ports)" '1080 1081 1082' 'instances > ports keeps all ports'
     assert_eq "$(get_warp_instance_count)" '10' 'instances >= services honored'
     unset PROXY_PORTS
     WARP_INSTANCES=''

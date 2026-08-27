@@ -95,7 +95,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
     environment:
       - BIND_ADDR=0.0.0.0     # Bind address (default: 0.0.0.0)
       - BIND_PORT=1080        # Custom SOCKS5 port (default: 1080)
-      - PROXY_PORTS=1080,1081 # Optional extra SOCKS ports sharing the instance pool (empty = BIND_PORT only)
+      - PROXY_PORTS=1080-1085 # SOCKS ports: range and/or 1080,1081. Extra ports past WARP_INSTANCES are ignored
       - SOCKS_USER=admin      # Enable authentication (leave empty for no auth)
       - SOCKS_PASS=123456     # Auth password
       - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP, or a comma/semicolon-separated candidate list
@@ -221,7 +221,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
     environment:
       - BIND_ADDR=0.0.0.0     # 监听地址 (默认 0.0.0.0，请不要修改这里，除非你知道自己在做什么)
       - BIND_PORT=1080        # 监听端口 (默认 1080)
-      - PROXY_PORTS=1080,1081 # 可选：多个 SOCKS 入口共用实例池（空 = 只用 BIND_PORT）
+      - PROXY_PORTS=1080-1085 # 端口：闭区间和/或 1080,1081。多于 WARP_INSTANCES 的口会被丢掉
       - SOCKS_USER=admin      # SOCKS5 认证用户名 (留空则为无密码模式)
       - SOCKS_PASS=123456     # SOCKS5 认证密码
       - ROTATE_IP_ON_START=1 # 每次容器启动时重新注册 WARP 设备并刷新出口 IP (默认: 0)
@@ -295,7 +295,7 @@ nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2
 | 选人 | `last_healthy_at` 最新 + **未被任何服务占用** + 非 recovering（并列更小 id） |
 | 旧实例 | 该服务 backend `drain` → 排空 → **至少 WG 重连** → 回池热备（不自动抢回） |
 | 实例数 | floor **`max(2, 服务数)`** |
-| 端口 | `PROXY_PORTS=1080,1081,...`（空 = 单端口 `BIND_PORT`/`1080`） |
+| 端口 | `PROXY_PORTS=1080-1085` 或 `1080,1081,...`（空 = 单端口 `BIND_PORT`/`1080`）。**含端点**；显式 `WARP_INSTANCES=N` 且 N 小于展开后的端口数时，只留前 N 个口（3 实例 + `1080-1085` → `1080-1082`） |
 | SOCKS UDP | 每个服务端口 **TCP+UDP 同端口**；ASSOCIATE 的 BND.PORT 就是该入口。Docker 网络直连容器 IP 即可；若 `-p` 映射请同时映射 `/udp`。 |
 | Admin HTTP | **写死 `0.0.0.0:9180`**；`ADMIN_HTTP_TOKEN`=HMAC secret（空=不启） |
 | Admin 鉴权 | **HTTP + HMAC-SHA256 + 时间戳**；`|now-ts| ≤ 120s` |

@@ -47,8 +47,9 @@ HEV_SOCKS5_BIN="${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}"
 # Auth: HMAC-SHA256(secret, METHOD\nPATH\nts) + timestamp within ±120s (skew env).
 ADMIN_HTTP_TOKEN="${ADMIN_HTTP_TOKEN:-}"
 ADMIN_HTTP_HMAC_SKEW_SECONDS="${ADMIN_HTTP_HMAC_SKEW_SECONDS:-120}"
-# Comma-separated SOCKS listen ports. Empty = single port LISTEN_PORT/BIND_PORT/1080.
+# SOCKS listen ports: "1080,1081" and/or inclusive ranges "1080-1085". Empty = BIND_PORT/1080.
 # Each port is one service; all services share the WARP instance pool.
+# If WARP_INSTANCES is set and smaller than the expanded list, extra ports are dropped.
 PROXY_PORTS="${PROXY_PORTS:-}"
 WARP_INSTANCE_COUNT=1
 
@@ -60,23 +61,39 @@ is_enabled() {
 }
 
 # Space-separated unique valid TCP ports from PROXY_PORTS (or default listen port).
+# Tokens: integers and inclusive ranges (1080-1085 → 1080 … 1085).
+# Extra ports beyond an explicit WARP_INSTANCES (or MAX_WARP_INSTANCES) are dropped.
 get_normalized_proxy_ports() {
     RAW=${PROXY_PORTS-}
     if [ -z "$RAW" ]; then
         RAW=${LISTEN_PORT:-${BIND_PORT:-1080}}
     fi
     OUT=""
-    OLD_IFS=$IFS
-    IFS=','
-    # shellcheck disable=SC2086
-    for P in $RAW; do
-        IFS=$OLD_IFS
-        P=$(printf '%s' "$P" | tr -d ' \t\r\n')
+    MAX_KEEP=${MAX_WARP_INSTANCES:-100}
+    case "${WARP_INSTANCES-}" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$WARP_INSTANCES" -ge 1 ] && [ "$WARP_INSTANCES" -lt "$MAX_KEEP" ]; then
+                MAX_KEEP=$WARP_INSTANCES
+            fi
+            ;;
+    esac
+
+    _proxy_port_count() {
+        # shellcheck disable=SC2086
+        set -- $OUT
+        printf '%s\n' "$#"
+    }
+    _proxy_ports_append() {
+        local P="$1" DUP E
         case "$P" in
-            ''|*[!0-9]*) continue ;;
+            ''|*[!0-9]*) return 0 ;;
         esac
         if [ "$P" -lt 1 ] || [ "$P" -gt 65535 ]; then
-            continue
+            return 0
+        fi
+        if [ "$(_proxy_port_count)" -ge "$MAX_KEEP" ]; then
+            return 0
         fi
         DUP=0
         for E in $OUT; do
@@ -92,9 +109,48 @@ get_normalized_proxy_ports() {
                 OUT="$P"
             fi
         fi
+    }
+
+    OLD_IFS=$IFS
+    IFS=','
+    # shellcheck disable=SC2086
+    for P in $RAW; do
+        IFS=$OLD_IFS
+        P=$(printf '%s' "$P" | tr -d ' \t\r\n')
+        case "$P" in
+            [0-9]*-[0-9]*)
+                START=${P%%-*}
+                END=${P#*-}
+                case "$START$END" in
+                    *[!0-9]*)
+                        IFS=','
+                        continue
+                        ;;
+                esac
+                if [ "$START" -gt "$END" ]; then
+                    IFS=','
+                    continue
+                fi
+                CUR=$START
+                while [ "$CUR" -le "$END" ]; do
+                    _proxy_ports_append "$CUR"
+                    if [ "$(_proxy_port_count)" -ge "$MAX_KEEP" ]; then
+                        break
+                    fi
+                    CUR=$((CUR + 1))
+                done
+                ;;
+            *)
+                _proxy_ports_append "$P"
+                ;;
+        esac
+        if [ "$(_proxy_port_count)" -ge "$MAX_KEEP" ]; then
+            break
+        fi
         IFS=','
     done
     IFS=$OLD_IFS
+    unset -f _proxy_port_count _proxy_ports_append 2>/dev/null || true
     if [ -z "$OUT" ]; then
         OUT=${LISTEN_PORT:-${BIND_PORT:-1080}}
     fi
