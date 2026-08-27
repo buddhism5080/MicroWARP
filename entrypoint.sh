@@ -308,11 +308,16 @@ ensure_udp_nat_chain() {
         || iptables -I FORWARD -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null || true
     iptables -C FORWARD -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null \
         || iptables -I FORWARD -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j ACCEPT 2>/dev/null || true
+    # DNAT 进 netns 的 UDP 必须 SNAT 成 host veth IP。否则 hev 看到的源是客户端公网/桥 IP，
+    # 回程走 wg0 默认路由（WARP）而不是 veth，ASSOCIATE 只有上行。
+    iptables -t nat -C POSTROUTING -p udp -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -p udp -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null || true
 }
 
 teardown_udp_nat_chain() {
     iptables -t nat -D PREROUTING -p udp -j MW_UDP 2>/dev/null || true
     iptables -t nat -D OUTPUT -p udp -j MW_UDP 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -p udp -d "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null || true
     iptables -t nat -F MW_UDP 2>/dev/null || true
     iptables -t nat -X MW_UDP 2>/dev/null || true
 }

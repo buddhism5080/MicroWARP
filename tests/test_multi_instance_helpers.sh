@@ -1620,6 +1620,8 @@ test_hev_socks_config_and_udp_ports() {
     assert_contains "$cfg" 'port: 1080' 'tcp 1080'
     assert_contains "$cfg" 'udp-port: 1081' 'udp advertised port'
     assert_contains "$cfg" "udp-public-address-v4: '0.0.0.0'" 'advertise 0.0.0.0 for RFC1928'
+    body=$(declare -f ensure_udp_nat_chain)
+    assert_contains "$body" 'POSTROUTING -p udp -d' 'incoming UDP DNAT must SNAT back via veth'
     if [[ "$cfg" == *auth:* ]]; then
         echo 'no-auth config must omit auth section' >&2
         exit 1
