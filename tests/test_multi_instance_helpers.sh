@@ -126,6 +126,8 @@ test_haproxy_config_only_includes_healthy_servers() {
     assert_contains "$cfg" 'mode tcp' 'tcp mode'
     assert_contains "$cfg" 'balance roundrobin' 'round robin'
     assert_contains "$cfg" 'stats socket' 'runtime admin socket'
+    assert_contains "$cfg" 'nbthread 1' 'single HAProxy thread'
+    assert_contains "$cfg" 'check inter 15s' 'tcp-check not every 3s'
     assert_contains "$cfg" 'server inst1 10.66.1.2:1080 check' 'down instance still listed'
     assert_contains "$cfg" 'server inst2 10.66.2.2:1080 check' 'healthy instance 2'
     assert_contains "$cfg" 'server inst3 10.66.3.2:1080 check' 'healthy instance 3'
@@ -1652,6 +1654,40 @@ test_hev_socks_config_and_udp_ports() {
     unset PROXY_PORTS
 }
 
+test_count_busy_tcp_one_ss_dump() {
+    local SS_LOG n
+    SS_LOG=$(mktemp)
+    ss() {
+        printf '%s\n' "$*" >> "$SS_LOG"
+        cat <<'EOF'
+ESTAB      0      0    10.66.1.1:1000 10.66.1.2:1080
+TIME-WAIT  0      0    10.66.1.1:1001 10.66.1.2:1080
+CLOSE-WAIT 0      0    10.66.1.1:1002 10.66.1.2:1080
+EOF
+    }
+    n=$(count_busy_tcp_sockets 'dst 10.66.1.2:1080')
+    assert_eq "$n" '2' 'ESTAB+CLOSE-WAIT; TIME-WAIT excluded'
+    assert_eq "$(wc -l < "$SS_LOG" | tr -d ' ')" '1' 'one ss dump not 8 state queries'
+
+    ss() {
+        printf '%s\n' "$*" >> "$SS_LOG"
+        printf ''
+    }
+    : > "$SS_LOG"
+    assert_eq "$(count_busy_tcp_sockets 'dst 10.66.1.2:1080')" '0' 'empty dump is idle'
+
+    ss() {
+        cat <<'EOF'
+ESTAB      0      0    10.66.1.1:1000 10.66.1.2:1080
+WAT        0      0    10.66.1.1:1003 10.66.1.2:1080
+EOF
+    }
+    assert_eq "$(count_busy_tcp_sockets 'dst 10.66.1.2:1080')" 'unknown' 'unrecognized state fail-closed'
+
+    unset -f ss
+    rm -f "$SS_LOG"
+}
+
 test_last_healthy_pick_latest_standby
 test_haproxy_desired_state_single_active
 test_mark_instance_up_primary_then_standby_drain
@@ -1671,4 +1707,5 @@ test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
 test_hev_socks_config_and_udp_ports
+test_count_busy_tcp_one_ss_dump
 printf 'PASS test_multi_instance_helpers\n'
