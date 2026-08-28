@@ -1128,9 +1128,9 @@ warp_pool,BACKEND,1,1,7,20,4096,50,0,0,0,0,0,0,0,0,0,UP,2,2,0,0,0,0,0,,1,2,0,,0,
 EOF
 )
     n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 1)
-    assert_eq "$n" '3' 'inst1 scur=3 qcur=0 (not FRONTEND/BACKEND, not inst10)'
+    assert_eq "$n" '3 0' 'inst1 scur=3 qcur=0 (not FRONTEND/BACKEND, not inst10)'
     n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 10)
-    assert_eq "$n" '5' 'inst10 scur+qcur=4+1; FAILED check_status must not break parse'
+    assert_eq "$n" '4 1' 'inst10 scur=4 qcur=1; FAILED check_status must not break parse'
     n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 2)
     assert_eq "$n" 'unknown' 'missing server is unknown not 0'
 
@@ -1153,10 +1153,11 @@ EOF
         fi
         return 1
     }
-    assert_eq "$(count_instance_busy_clients 1)" '3' 'count uses show stat scur'
+    assert_eq "$(count_instance_busy_clients 1)" '3' 'count = scur+qcur from show stat'
     assert_eq "$(get_scur_via)" 'stat' 'via=stat when show stat works'
-    assert_eq "$(format_scur_log 3)" 'scur=3 via=stat' 'log fragment names source'
-    assert_eq "$(count_instance_busy_clients 10)" '5' 'count inst10 from scur+qcur'
+    assert_eq "$(format_scur_log 3)" 'scur=3 qcur=0 via=stat' 'log shows scur and qcur'
+    assert_eq "$(count_instance_busy_clients 10)" '5' 'count inst10 scur 4 + qcur 1'
+    assert_eq "$(format_scur_log 5)" 'scur=4 qcur=1 via=stat' 'qcur is visible in log'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
     haproxy_runtime_query() {
@@ -1169,14 +1170,14 @@ EOF
         fi
         return 1
     }
-    assert_eq "$(count_instance_busy_clients 1)" '3' 'falls back to show servers conn used'
-    assert_eq "$(get_scur_via)" 'conn' 'via=conn on fallback'
+    assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'conn fallback is not used (no qcur)'
+    assert_eq "$(get_scur_via)" 'none' 'via=none without show stat'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
     haproxy_runtime_query() { return 1; }
     assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'socket down is unknown not 0'
     assert_eq "$(get_scur_via)" 'none' 'via=none when unread'
-    assert_eq "$(format_scur_log unknown)" 'scur=? via=none' 'unread log is scur=? not unknown'
+    assert_eq "$(format_scur_log unknown)" 'scur=? qcur=? via=none' 'unread log is not a fake 0'
     unset -f haproxy_runtime_query 2>/dev/null || true
 }
 

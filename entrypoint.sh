@@ -442,8 +442,10 @@ count_busy_tcp_sockets() {
     esac
 }
 
-# Parse `show stat` CSV on stdin → scur+qcur for warp_pool/instN.
+# Parse `show stat` CSV on stdin → "scur qcur" for warp_pool/instN.
 # Exact svname match (inst1 ≠ inst10). Missing line / bad CSV → unknown.
+# Idle decision MUST use both: sessions already on the server (scur) plus
+# still queued for it (qcur). Never scur alone.
 parse_haproxy_server_scur() {
     local INST_ID="$1"
     awk -F',' -v want="inst${INST_ID}" -v px="warp_pool" '
@@ -465,7 +467,7 @@ parse_haproxy_server_scur() {
         {
             gsub(/\r/, "")
             if ($pxi == px && $sv == want) {
-                print ($qc + 0) + ($sc + 0)
+                print ($sc + 0) " " ($qc + 0)
                 found = 1
                 exit
             }
@@ -569,55 +571,76 @@ get_scur_via() {
     esac
 }
 
-# Live client load on one backend: HAProxy scur (+ qcur), after drain.
-# Do NOT use host `ss` here — empty/wrong filter looks like idle and kills sessions.
-# Fail closed (unknown) if the stats socket cannot be read.
-# Records via=stat|conn|none so logs show whether scur was actually read.
+get_scur_pair_file() {
+    printf '%s\n' "${MICROWARP_SCUR_PAIR_FILE:-${TMPDIR:-/tmp}/microwarp.scur.pair}"
+}
+
+set_scur_pair() {
+    printf '%s %s\n' "$1" "$2" > "$(get_scur_pair_file)" 2>/dev/null || true
+}
+
+get_scur_pair() {
+    local S Q
+    S=
+    Q=
+    read S Q < "$(get_scur_pair_file)" 2>/dev/null || true
+    case "$S" in
+        ''|*[!0-9]*) S='?' ;;
+    esac
+    case "$Q" in
+        ''|*[!0-9]*) Q='?' ;;
+    esac
+    printf '%s %s\n' "$S" "$Q"
+}
+
+# Live client load: HAProxy show stat scur + qcur for this server. Both required.
+# Do NOT use host ss. Do NOT use show servers conn (no qcur).
+# Fail closed (unknown) if show stat cannot be parsed.
 count_instance_busy_clients() {
     local INST_ID="$1"
-    local OUT N
+    local OUT PAIR SC QC
 
     set_scur_via none
+    set_scur_pair '?' '?'
     OUT=$(haproxy_runtime_query "show stat" 2>/dev/null) || OUT=""
     if [ -n "$OUT" ]; then
-        N=$(printf '%s\n' "$OUT" | parse_haproxy_server_scur "$INST_ID")
-        case "$N" in
-            ''|*[!0-9]*) ;;
+        PAIR=$(printf '%s\n' "$OUT" | parse_haproxy_server_scur "$INST_ID")
+        SC=${PAIR%% *}
+        QC=${PAIR#* }
+        case "$PAIR" in
+            unknown|'') ;;
             *)
-                set_scur_via stat
-                printf '%s\n' "$N"
-                return 0
-                ;;
-        esac
-    fi
-
-    OUT=$(haproxy_runtime_query "show servers conn warp_pool" 2>/dev/null) || OUT=""
-    if [ -n "$OUT" ]; then
-        N=$(printf '%s\n' "$OUT" | parse_haproxy_servers_conn_used "$INST_ID")
-        case "$N" in
-            ''|*[!0-9]*) ;;
-            *)
-                set_scur_via conn
-                printf '%s\n' "$N"
-                return 0
+                case "$SC" in ''|*[!0-9]*) SC='' ;; esac
+                case "$QC" in ''|*[!0-9]*) QC='' ;; esac
+                if [ -n "$SC" ] && [ -n "$QC" ] && [ "$SC" = "${PAIR%% *}" ]; then
+                    set_scur_via stat
+                    set_scur_pair "$SC" "$QC"
+                    printf '%s\n' $((SC + QC))
+                    return 0
+                fi
                 ;;
         esac
     fi
 
     set_scur_via none
+    set_scur_pair '?' '?'
     printf 'unknown\n'
 }
 
-# Log fragment: "scur=3 via=stat" or "scur=? via=none"
+# Log fragment: "scur=3 qcur=1 via=stat" or "scur=? qcur=? via=none"
 format_scur_log() {
     local N="$1"
-    local VIA="${2:-$(get_scur_via)}"
+    local VIA PAIR SC QC
+    VIA="${2:-$(get_scur_via)}"
+    PAIR=$(get_scur_pair)
+    SC=${PAIR%% *}
+    QC=${PAIR#* }
     case "$N" in
         ''|*[!0-9]*)
-            printf 'scur=? via=%s' "$VIA"
+            printf 'scur=? qcur=? via=%s' "$VIA"
             ;;
         *)
-            printf 'scur=%s via=%s' "$N" "$VIA"
+            printf 'scur=%s qcur=%s via=%s' "$SC" "$QC" "$VIA"
             ;;
     esac
 }
