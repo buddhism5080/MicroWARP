@@ -133,7 +133,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
-*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy **multi-instance** backend may stay continuously online. **Single-instance (`WARP_INSTANCES<=1`) never force-rotates** under this policy. On each multi-instance health probe, if uptime ≥ this value **and** ready/`up` instances are **not strictly below half** of `WARP_INSTANCES`, MicroWARP enters runtime **drain** (even if busy) and reconnects via the background recovery worker after idle — or after `INSTANCE_DRAIN_TIMEOUT` when that env is set. Busy sockets use ESTABLISHED plus SYN/FIN/CLOSE-WAIT style states; TIME-WAIT alone does not count. When the ready pool is already below half, MAX_CONN does **not** drain further.)*
+*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy **multi-instance** backend may stay continuously online. **Single-instance (`WARP_INSTANCES<=1`) never force-rotates** under this policy. On each multi-instance health probe, if uptime ≥ this value **and** ready/`up` instances are **not strictly below half** of `WARP_INSTANCES`, MicroWARP enters runtime **drain** first (even if sessions are live) so HAProxy stops **new** picks, then the background worker waits until that server's `scur` (plus `qcur`) is 0 — or until `INSTANCE_DRAIN_TIMEOUT` if set — before stopping SOCKS and reconnect. Idle is **HAProxy `show stat` scur**, not host `ss`. When the ready pool is already below half, MAX_CONN does **not** drain further.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -256,7 +256,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 >
-> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制**多实例**每个后端最长连续健康在线时长。**单实例（`WARP_INSTANCES<=1`）不会因本策略下线/重连。** 多实例健康巡检时若已在线 ≥ 该值，**且当前 ready/`up` 实例数不少于一半**（`ready * 2 >= WARP_INSTANCES`），则进入 runtime **drain**（**即使仍有 busy**），由后台 worker 等到空闲——若设置了 `INSTANCE_DRAIN_TIMEOUT` 则最多等该秒数后强停——再重连。busy 判定不止 `ESTABLISHED`，还包括握手中（SYN）与半关闭/收尾（FIN-WAIT / CLOSE-WAIT / LAST-ACK / CLOSING）；纯 `TIME-WAIT` 不算占用。**ready 池已不足一半时，不会再因 MAX_CONN 去 drain。**
+> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制**多实例**每个后端最长连续健康在线时长。**单实例（`WARP_INSTANCES<=1`）不会因本策略下线/重连。** 多实例健康巡检时若已在线 ≥ 该值，**且当前 ready/`up` 实例数不少于一半**（`ready * 2 >= WARP_INSTANCES`），则**先 runtime drain**（停新连接，已有 TCP 留下），后台 worker 等该 server 的 HAProxy **`scur`（加 `qcur`）到 0**——若设置了 `INSTANCE_DRAIN_TIMEOUT` 则最多等该秒数后强停——再停 SOCKS/重连。空闲看的是 **HAProxy `show stat`，不是宿主机 `ss`**。**ready 池已不足一半时，不会再因 MAX_CONN 去 drain。**
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 

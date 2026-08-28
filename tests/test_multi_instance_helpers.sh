@@ -1004,7 +1004,7 @@ test_sum_draining_busy_skips_non_drain() {
     summary=$(print_health_summary)
     assert_contains "$summary" '健康 1/3' 'fleet healthy count'
     assert_contains "$summary" 'draining 1' 'fleet draining count'
-    assert_contains "$summary" '排空中busy=3' 'busy only when draining'
+    assert_contains "$summary" '排空中scur=3' 'scur only when draining'
 
     unset -f get_instance_ids get_instance_status count_instance_busy_clients \
         is_instance_recovering count_healthy_instances 2>/dev/null || true
@@ -1069,6 +1069,65 @@ EOF
     rm -f "$SS_LOG"
 }
 
+test_parse_haproxy_scur_and_conn() {
+    local csv conn n
+    csv=$(cat <<'EOF'
+# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,cli_abrt,srv_abrt
+warp_pool,FRONTEND,0,0,12,20,4096,100,0,0,0,0,0,0,0,0,0,OPEN,0,0,0,0,0,0,0,,1,1,0,,0,,0,0,0,0,,,,0,0,0,0,0,0,,0,0,0,0,0
+warp_pool,inst1,0,0,3,8,4096,40,0,0,0,0,0,0,0,0,0,UP,1,1,0,0,0,0,0,,1,2,1,,0,,4,0,0,0,L4OK,,1,0,0,0,0,0,0,0,0,0,0,0,0
+warp_pool,inst10,1,1,4,9,4096,10,0,0,0,0,0,0,0,0,0,UP,1,1,0,0,0,0,0,,1,2,10,,0,,4,0,0,0,FAILED,,1,0,0,0,0,0,0,0,0,0,0,0,0
+warp_pool,BACKEND,1,1,7,20,4096,50,0,0,0,0,0,0,0,0,0,UP,2,2,0,0,0,0,0,,1,2,0,,0,,1,0,0,0,,,,0,0,0,0,0,0,,0,0,0,0,0
+EOF
+)
+    n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 1)
+    assert_eq "$n" '3' 'inst1 scur=3 qcur=0 (not FRONTEND/BACKEND, not inst10)'
+    n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 10)
+    assert_eq "$n" '5' 'inst10 scur+qcur=4+1; FAILED check_status must not break parse'
+    n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 2)
+    assert_eq "$n" 'unknown' 'missing server is unknown not 0'
+
+    conn=$(cat <<'EOF'
+warp_pool/inst1: 0/0 idle, 3/4096 used, 0/0 conn
+warp_pool/inst10: 0/0 idle, 9/4096 used, 0/0 conn
+EOF
+)
+    n=$(printf '%s\n' "$conn" | parse_haproxy_servers_conn_used 1)
+    assert_eq "$n" '3' 'conn used inst1 not inst10'
+    n=$(printf '%s\n' "$conn" | parse_haproxy_servers_conn_used 10)
+    assert_eq "$n" '9' 'conn used inst10'
+    n=$(printf '%s\n' "$conn" | parse_haproxy_servers_conn_used 2)
+    assert_eq "$n" 'unknown' 'missing conn line is unknown'
+
+    haproxy_runtime_query() {
+        if [ "$1" = "show stat" ]; then
+            printf '%s\n' "$csv"
+            return 0
+        fi
+        return 1
+    }
+    assert_eq "$(count_instance_busy_clients 1)" '3' 'count uses show stat scur'
+    assert_eq "$(count_instance_busy_clients 10)" '5' 'count inst10 from scur+qcur'
+    unset -f haproxy_runtime_query 2>/dev/null || true
+
+    haproxy_runtime_query() {
+        if [ "$1" = "show stat" ]; then
+            return 1
+        fi
+        if [ "$1" = "show servers conn warp_pool" ]; then
+            printf '%s\n' "$conn"
+            return 0
+        fi
+        return 1
+    }
+    assert_eq "$(count_instance_busy_clients 1)" '3' 'falls back to show servers conn used'
+    unset -f haproxy_runtime_query 2>/dev/null || true
+
+    haproxy_runtime_query() { return 1; }
+    assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'socket down is unknown not 0'
+    unset -f haproxy_runtime_query 2>/dev/null || true
+}
+
+test_parse_haproxy_scur_and_conn
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back

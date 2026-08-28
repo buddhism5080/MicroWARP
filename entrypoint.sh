@@ -32,9 +32,9 @@ INSTANCE_START_STAGGER_SECONDS=1
 # Default 7200s = 2 hours. Set 0 to disable.
 CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
 # Max continuous healthy uptime (seconds) per multi-instance backend.
-# When exceeded AND the instance currently has no busy client connections (idle)
-# AND healthy pool is not below half, force it offline and reconnect.
-# Default 0 = disabled. Single-instance (WARP_INSTANCES<=1) never uses this.
+# When exceeded AND healthy pool is not below half, drain first then reconnect.
+# Drain wait uses HAProxy scur (not host ss). Default 0 = disabled.
+# Single-instance (WARP_INSTANCES<=1) never uses this.
 MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # After kicking a multi-instance backend out of HAProxy, wait for busy client
 # sockets to drain before stopping internal SOCKS.
@@ -439,22 +439,67 @@ count_busy_tcp_sockets() {
     esac
 }
 
-# True (0) if no busy TCP clients to this instance's backend SOCKS endpoint.
-# HAProxy talks to 10.66.<id>.2:1080 from the host netns; ss (iproute2) is available.
+# Parse `show stat` CSV on stdin → scur+qcur for warp_pool/instN.
+# Exact svname match (inst1 ≠ inst10). Missing line / bad CSV → unknown.
+parse_haproxy_server_scur() {
+    local INST_ID="$1"
+    awk -F',' -v want="inst${INST_ID}" -v px="warp_pool" '
+        BEGIN { pxi = 1; sv = 2; qc = 3; sc = 5; found = 0 }
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                h = $i
+                gsub(/\r/, "", h)
+                sub(/^#/, "", h)
+                sub(/^ +/, "", h)
+                sub(/ +$/, "", h)
+                if (h == "pxname") pxi = i
+                if (h == "svname") sv = i
+                if (h == "qcur") qc = i
+                if (h == "scur") sc = i
+            }
+            next
+        }
+        {
+            gsub(/\r/, "")
+            if ($pxi == px && $sv == want) {
+                print ($qc + 0) + ($sc + 0)
+                found = 1
+                exit
+            }
+        }
+        END { if (!found) print "unknown" }
+    '
+}
+
+# Parse `show servers conn` on stdin → "used" for warp_pool/instN (cur_sess).
+# Line prefix warp_pool/instN: so inst1 does not match inst10.
+parse_haproxy_servers_conn_used() {
+    local INST_ID="$1"
+    awk -v id="$INST_ID" '
+        BEGIN { want = "warp_pool/inst" id ":"; found = 0 }
+        index($0, want) == 1 {
+            if (match($0, / [0-9]+\/[0-9]+ used/)) {
+                n = substr($0, RSTART + 1)
+                sub(/\/.*/, "", n)
+                print n + 0
+                found = 1
+                exit
+            }
+        }
+        END { if (!found) print "unknown" }
+    '
+}
+
+# True (0) if HAProxy reports no current sessions on this backend.
 # Fail CLOSED: unknown/error ⇒ not idle (refuse MAX_CONN rotation).
 is_instance_idle() {
     local INST_ID="$1"
     local COUNT
 
-    if ! command -v ss >/dev/null 2>&1; then
-        # Without ss we cannot prove idle; refuse forced rotation to avoid killing live traffic.
-        return 1
-    fi
-
     COUNT=$(count_instance_busy_clients "$INST_ID")
     case "$COUNT" in
         ''|*[!0-9]*)
-            echo "==> [inst${INST_ID}] [WARN] 无法可靠统计 busy 连接（${COUNT:-?}），视为非空闲"
+            echo "==> [inst${INST_ID}] [WARN] 无法可靠读取 HAProxy scur（${COUNT:-?}），视为非空闲"
             return 1
             ;;
     esac
@@ -481,34 +526,48 @@ get_instance_drain_timeout() {
     printf '%s\n' "$RAW"
 }
 
-# Busy HAProxy→backend sockets for one instance (host netns view).
+# Live client load on one backend: HAProxy scur (+ qcur), after drain.
+# Do NOT use host `ss` here — empty/wrong filter looks like idle and kills sessions.
+# Fail closed (unknown) if the stats socket cannot be read.
 count_instance_busy_clients() {
     local INST_ID="$1"
-    local NS_IP UDP_PORT TCP UDP
-    NS_IP=$(get_instance_ns_ip "$INST_ID")
-    # FILTER must be separate ss tokens: dst host:port
-    TCP=$(count_busy_tcp_sockets "dst ${NS_IP}:1080")
-    case "$TCP" in
-        ''|*[!0-9]*)
-            printf '%s\n' "$TCP"
-            return 0
-            ;;
-    esac
-    UDP_PORT=$(get_instance_socks_udp_port "$INST_ID")
-    UDP=$(count_busy_udp_sockets "dst ${NS_IP}:${UDP_PORT}")
-    case "$UDP" in
-        ''|*[!0-9]*) UDP=0 ;;
-    esac
-    printf '%s\n' $((TCP + UDP))
+    local OUT N
+
+    OUT=$(haproxy_runtime_query "show stat" 2>/dev/null) || OUT=""
+    if [ -n "$OUT" ]; then
+        N=$(printf '%s\n' "$OUT" | parse_haproxy_server_scur "$INST_ID")
+        case "$N" in
+            ''|*[!0-9]*) ;;
+            *)
+                printf '%s\n' "$N"
+                return 0
+                ;;
+        esac
+    fi
+
+    OUT=$(haproxy_runtime_query "show servers conn warp_pool" 2>/dev/null) || OUT=""
+    if [ -n "$OUT" ]; then
+        N=$(printf '%s\n' "$OUT" | parse_haproxy_servers_conn_used "$INST_ID")
+        case "$N" in
+            ''|*[!0-9]*) ;;
+            *)
+                printf '%s\n' "$N"
+                return 0
+                ;;
+        esac
+    fi
+
+    printf 'unknown\n'
 }
 
-# Wait until instance has no busy client sockets.
+# Wait until HAProxy scur/qcur for this server is 0 (call AFTER runtime drain).
 # INSTANCE_DRAIN_TIMEOUT empty/unset → wait indefinitely (IM-friendly).
 # 0 → skip wait; positive N → force-stop after N seconds.
-# Returns 0 if drained idle, 1 if timed out / cannot observe (caller still stops SOCKS).
+# Returns 0 if drained idle, 1 if timed out (caller still stops SOCKS).
+# Unreadable scur → unknown → wait forever unless a timeout is set (never treat as 0).
 wait_instance_drain() {
     local INST_ID="$1"
-    local TIMEOUT COUNT SLEPT
+    local TIMEOUT COUNT SLEPT SHOW
 
     TIMEOUT=$(get_instance_drain_timeout)
     # Explicit 0 only: empty TIMEOUT means infinite wait below.
@@ -517,33 +576,31 @@ wait_instance_drain() {
         return 1
     fi
 
-    if ! command -v ss >/dev/null 2>&1; then
-        echo "==> [inst${INST_ID}] [WARN] 无 ss，无法观察 busy 连接，跳过排空直接停服务"
-        return 1
-    fi
-
     COUNT=$(count_instance_busy_clients "$INST_ID")
     case "$COUNT" in
         ''|*[!0-9]*)
             if [ -n "$TIMEOUT" ]; then
-                echo "==> [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
+                echo "==> [inst${INST_ID}] [WARN] HAProxy scur 不可读（${COUNT:-?}），仍等待最多 ${TIMEOUT}s 后停服务"
             else
-                echo "==> [inst${INST_ID}] [WARN] busy 统计不可靠（${COUNT:-?}），无限期等待至可观测且空闲（未设 INSTANCE_DRAIN_TIMEOUT）"
+                echo "==> [inst${INST_ID}] [WARN] HAProxy scur 不可读（${COUNT:-?}），无限期等待至可观测且 scur=0（未设 INSTANCE_DRAIN_TIMEOUT）"
             fi
             COUNT=-1
             ;;
     esac
     if [ "$COUNT" -eq 0 ]; then
-        echo "==> [inst${INST_ID}] 已无 busy 连接，可以停服务"
+        echo "==> [inst${INST_ID}] 已无 busy 连接（scur=0），可以停服务"
         return 0
     fi
 
-    if [ "$COUNT" -gt 0 ] || [ "$COUNT" -lt 0 ]; then
-        if [ -n "$TIMEOUT" ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 开始排空 busy=${COUNT}，最长等待 ${TIMEOUT}s"
-        else
-            echo "==> [inst${INST_ID}] 复活进度: 开始排空 busy=${COUNT}，无超时上限（等到空闲）"
-        fi
+    if [ "$COUNT" -lt 0 ]; then
+        SHOW="?"
+    else
+        SHOW="$COUNT"
+    fi
+    if [ -n "$TIMEOUT" ]; then
+        echo "==> [inst${INST_ID}] 复活进度: 开始排空 scur=${SHOW}，最长等待 ${TIMEOUT}s"
+    else
+        echo "==> [inst${INST_ID}] 复活进度: 开始排空 scur=${SHOW}，无超时上限（等到空闲）"
     fi
     SLEPT=0
     while true; do
@@ -554,19 +611,24 @@ wait_instance_drain() {
             ''|*[!0-9]*) COUNT=-1 ;;
         esac
         if [ "$COUNT" -eq 0 ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 排空完成 busy=0，已等待 ${SLEPT}s → 停 SOCKS"
+            echo "==> [inst${INST_ID}] 复活进度: 排空完成 scur=0，已等待 ${SLEPT}s → 停 SOCKS"
             return 0
         fi
+        if [ "$COUNT" -lt 0 ]; then
+            SHOW="?"
+        else
+            SHOW="$COUNT"
+        fi
         if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 busy=${COUNT} → 强制停 SOCKS"
+            echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 scur=${SHOW} → 强制停 SOCKS"
             return 1
         fi
         # Keep log noise low: every 5s.
         if [ $((SLEPT % 5)) -eq 0 ]; then
             if [ -n "$TIMEOUT" ]; then
-                echo "==> [inst${INST_ID}] 复活进度: 排空中 busy=${COUNT}，已等待 ${SLEPT}s/${TIMEOUT}s"
+                echo "==> [inst${INST_ID}] 复活进度: 排空中 scur=${SHOW}，已等待 ${SLEPT}s/${TIMEOUT}s"
             else
-                echo "==> [inst${INST_ID}] 复活进度: 排空中 busy=${COUNT}，已等待 ${SLEPT}s（无上限，等到空闲）"
+                echo "==> [inst${INST_ID}] 复活进度: 排空中 scur=${SHOW}，已等待 ${SLEPT}s（无上限，等到空闲）"
             fi
             if [ $((SLEPT % 30)) -eq 0 ]; then
                 print_health_summary 2>/dev/null || true
@@ -663,11 +725,11 @@ instance_should_force_rotate_for_max_conn() {
     esac
     DRAIN_TO=$(get_instance_drain_timeout)
     if [ "$BUSY" = "0" ]; then
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(busy=0)，准备 drain 后强制重连"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲(scur=0)，准备 drain 后强制重连"
     elif [ -n "$DRAIN_TO" ]; then
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 scur=${BUSY} → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
     else
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 busy=${BUSY} → 仍进入 drain，无限期等到空闲后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
+        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 scur=${BUSY} → 仍进入 drain，无限期等到 scur=0 后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
     fi
     return 0
 }
@@ -1052,6 +1114,20 @@ get_haproxy_sock() {
 # Returns 0 if the socket accepts the command (HAProxy replies).
 haproxy_runtime_cmd() {
     local CMD="$1"
+    local OUT
+    OUT=$(haproxy_runtime_query "$CMD" 2>/dev/null) || return 1
+    case "$OUT" in
+        *'Unknown command'*|*'No such server'*|*'No such backend'*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Print stats-socket response. Does NOT treat CSV fields like check_status=FAILED
+# as a command error (haproxy_runtime_cmd used to match *failed* and break show stat).
+haproxy_runtime_query() {
+    local CMD="$1"
     local SOCK OUT
     SOCK=$(get_haproxy_sock)
 
@@ -1061,16 +1137,15 @@ haproxy_runtime_cmd() {
 
     if command -v socat >/dev/null 2>&1; then
         OUT=$(printf '%s\n' "$CMD" | socat -T2 STDIO "UNIX-CONNECT:${SOCK}" 2>/dev/null) || return 1
-        # HAProxy returns empty or an error string; treat obvious failures.
         case "$OUT" in
-            *'Unknown command'*|*'No such'*|*'failed'*)
+            *'Unknown command'*|*'No such server'*|*'No such backend'*)
                 return 1
                 ;;
         esac
+        printf '%s\n' "$OUT"
         return 0
     fi
 
-    # Minimal Python fallback (rarely present in the image).
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$SOCK" "$CMD" <<'PY' 2>/dev/null
 import socket, sys
@@ -1090,8 +1165,11 @@ except Exception:
     pass
 s.close()
 text = data.decode(errors="replace")
-if "Unknown command" in text or "No such" in text:
+if "Unknown command" in text or "No such server" in text or "No such backend" in text:
     sys.exit(1)
+sys.stdout.write(text)
+if text and not text.endswith("\n"):
+    sys.stdout.write("\n")
 sys.exit(0)
 PY
         return $?
@@ -2092,8 +2170,8 @@ count_instances_with_status() {
     printf '%s\n' "$N"
 }
 
-# Busy sockets are only meaningful while draining (wait_instance_drain).
-# Do NOT ss-scan every instance on the monitor tick — wasteful for up/down.
+# Busy (HAProxy scur) is only meaningful while draining (wait_instance_drain).
+# Do NOT poll every instance on the monitor tick — wasteful for up/down.
 sum_draining_busy_clients() {
     local _id ST C TOTAL=0
     for _id in $(get_instance_ids "${WARP_INSTANCE_COUNT:-1}"); do
@@ -2128,7 +2206,7 @@ print_health_summary() {
             ;;
         *)
             BUSY=$(sum_draining_busy_clients 2>/dev/null || printf '0')
-            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中busy=${BUSY}）"
+            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中scur=${BUSY}）"
             ;;
     esac
 }
@@ -2775,9 +2853,8 @@ instance_recovery_worker() {
     esac
     print_health_summary
 
-    # Parent already kicked this backend out of HAProxy. Finish offline gracefully:
-    # wait until not busy (or drain timeout), then stop internal SOCKS before we
-    # touch the tunnel / re-register.
+    # Parent already set HAProxy drain. Wait until scur=0 (or drain timeout), then
+    # stop internal SOCKS before we touch the tunnel / re-register.
     drain_and_stop_instance_socks "$INST_ID"
     echo "==> [inst${INST_ID}] 复活进度: 排空结束，SOCKS 已停 → 开始 WG 重连/重注册"
 
@@ -2896,7 +2973,8 @@ request_instance_recovery() {
         return 0
     fi
 
-    # 1) Kick LB immediately (fast). SOCKS kept for existing sessions until worker drains.
+    # 1) Drain immediately so HAProxy stops NEW picks. Existing TCP stay.
+    # 2) Worker waits until show stat scur=0 (or INSTANCE_DRAIN_TIMEOUT), then stop SOCKS.
     detach_instance_from_lb "$INST_ID"
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
@@ -3110,7 +3188,7 @@ probe_instance_and_schedule_recovery() {
         _st=$(get_instance_status "$INST_ID")
         if [ "$_st" = "draining" ]; then
             _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [inst${INST_ID}] 后台复活进行中（排空中 busy=${_busy}），本轮巡检跳过重活"
+            echo "==> [inst${INST_ID}] 后台复活进行中（排空中 scur=${_busy}），本轮巡检跳过重活"
         else
             echo "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
         fi
@@ -3153,7 +3231,7 @@ probe_instance_and_schedule_recovery() {
         # MAX_CONN: enter drain even if busy; worker waits until idle (or INSTANCE_DRAIN_TIMEOUT if set).
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then
             BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [inst${INST_ID}] MAX_CONN_DURATION 到期(busy=${BUSY_NOW}) → runtime drain，空闲后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
+            echo "==> [inst${INST_ID}] MAX_CONN_DURATION 到期(scur=${BUSY_NOW}) → runtime drain，scur=0 后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
             request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
@@ -3195,7 +3273,7 @@ multi_periodic_monitor() {
                     case "$_st" in
                         draining)
                             _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
-                            echo "==> [inst${X}] 复活进度: 排空中 status=draining busy=${_busy}"
+                            echo "==> [inst${X}] 复活进度: 排空中 status=draining scur=${_busy}"
                             ;;
                         down)
                             echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down"
