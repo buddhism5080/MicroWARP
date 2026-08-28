@@ -230,25 +230,6 @@ rebuild_instance_udp_forward() {
     done
 }
 
-count_busy_udp_sockets() {
-    local FILTER="$1"
-    local OUT N
-    if ! command -v ss >/dev/null 2>&1; then
-        printf '0\n'
-        return 0
-    fi
-    OUT=$(ss -Hun $FILTER 2>/dev/null) || {
-        printf '0\n'
-        return 0
-    }
-    N=$(printf '%s\n' "$OUT" | sed '/^$/d' | wc -l | tr -d ' ')
-    case "$N" in
-        ''|*[!0-9]*) N=0 ;;
-    esac
-    printf '%s\n' "$N"
-}
-
-
 get_instance_status_file() {
     printf '%s/inst%s.status\n' "$INSTANCE_STATE_DIR" "$1"
 }
@@ -372,74 +353,6 @@ print_instance_health_probe_start() {
     else
         echo "==> [inst${INST_ID}] 执行健康巡检（已在线: ${UPTIME_TEXT}）..."
     fi
-}
-
-# Busy (non-idle) TCP states for client sessions:
-#   ESTAB / established — active data path
-#   SYN-SENT / SYN-RECV — handshake
-#   FIN-WAIT-*, CLOSE-WAIT, LAST-ACK, CLOSING — teardown still holding a session
-# TIME-WAIT is intentionally excluded: pure post-close linger must not block rotation.
-#
-# Alpine ss rejects comma-separated `state a,b` (empty stdout + exit 0 = false idle).
-# One `ss -Htn FILTER` dump + parse: same fail-closed rules, ~8x fewer forks while
-# draining (INSTANCE_DRAIN_TIMEOUT unset can wait hours on IM/WebSocket).
-count_busy_tcp_sockets() {
-    local FILTER="$1"
-    local OUT RC N
-
-    if ! command -v ss >/dev/null 2>&1; then
-        printf 'unknown\n'
-        return 0
-    fi
-
-    OUT=$(ss -Htn $FILTER 2>&1)
-    RC=$?
-    if [ "$RC" -ne 0 ]; then
-        printf 'unknown\n'
-        return 0
-    fi
-    case "$OUT" in
-        *'wrong state name'*|*'invalid state'*)
-            printf 'unknown\n'
-            return 0
-            ;;
-    esac
-
-    N=$(printf '%s\n' "$OUT" | awk '
-        function busy(s) {
-            return (s == "ESTAB" || s == "ESTABLISHED" || s == "SYN-SENT" || s == "SYN-RECV" \
-                || s == "FIN-WAIT-1" || s == "FIN-WAIT-2" || s == "CLOSE-WAIT" \
-                || s == "LAST-ACK" || s == "CLOSING")
-        }
-        function ignore(s) {
-            return (s == "TIME-WAIT" || s == "TIMEWAIT" || s == "UNCONN" || s == "LISTEN" \
-                || s == "CLOSED" || s == "CLOSE" || s == "IDLE" || s == "FREE" || s == "")
-        }
-        BEGIN { n = 0; bad = 0 }
-        NF == 0 { next }
-        {
-            st = $1
-            if ($1 == "tcp" || $1 == "udp" || $1 == "u_str" || $1 == "p_raw") st = $2
-            if (busy(st)) { n++; next }
-            if (ignore(st)) next
-            bad = 1
-        }
-        END {
-            if (bad) print "unknown"
-            else print n+0
-        }
-    ')
-    case "$N" in
-        unknown|'')
-            printf 'unknown\n'
-            ;;
-        *[!0-9]*)
-            printf 'unknown\n'
-            ;;
-        *)
-            printf '%s\n' "$N"
-            ;;
-    esac
 }
 
 # Parse `show stat` CSV on stdin → "scur qcur" for warp_pool/instN.
@@ -3319,7 +3232,7 @@ probe_instance_and_schedule_recovery() {
 
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then
-        # Only count busy while draining; other phases skip ss scan.
+        # Only count busy while draining; other phases skip HAProxy scur.
         _st=$(get_instance_status "$INST_ID")
         if [ "$_st" = "draining" ]; then
             _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
@@ -3401,7 +3314,7 @@ multi_periodic_monitor() {
 
             # Fleet one-liner after each probe (健康 N/M + 复活/排空/busy)
             print_health_summary
-            # Per recovering inst: only ss-count busy while draining
+            # Per recovering inst: only scur+qcur while draining
             for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
                 if is_instance_recovering "$X"; then
                     _st=$(get_instance_status "$X")
