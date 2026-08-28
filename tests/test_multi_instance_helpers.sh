@@ -1106,6 +1106,8 @@ EOF
         return 1
     }
     assert_eq "$(count_instance_busy_clients 1)" '3' 'count uses show stat scur'
+    assert_eq "$(get_scur_via)" 'stat' 'via=stat when show stat works'
+    assert_eq "$(format_scur_log 3)" 'scur=3 via=stat' 'log fragment names source'
     assert_eq "$(count_instance_busy_clients 10)" '5' 'count inst10 from scur+qcur'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
@@ -1120,10 +1122,13 @@ EOF
         return 1
     }
     assert_eq "$(count_instance_busy_clients 1)" '3' 'falls back to show servers conn used'
+    assert_eq "$(get_scur_via)" 'conn' 'via=conn on fallback'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
     haproxy_runtime_query() { return 1; }
     assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'socket down is unknown not 0'
+    assert_eq "$(get_scur_via)" 'none' 'via=none when unread'
+    assert_eq "$(format_scur_log unknown)" 'scur=? via=none' 'unread log is scur=? not unknown'
     unset -f haproxy_runtime_query 2>/dev/null || true
 }
 
