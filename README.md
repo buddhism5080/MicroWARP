@@ -108,7 +108,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - MAX_CONN_DURATION=0 # Multi-instance only: max continuous healthy uptime (seconds) per backend; when exceeded AND ready/up pool ≥ half, force offline + reconnect even if busy (default 0=disable; single-instance never rotates; skips when ready < half)
       - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 scur 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）
       - INSTANCE_DRAIN_SETTLE_SECONDS=20 # scur 到 0 后再连续空闲这么多秒才停 SOCKS（默认 20；0=第一次 0 就停）。中途 scur>0 会重新等 0 再确认。不阻塞其它实例。
-      - LOG_MODE=simple # simple（默认）折叠巡检/出口IP/测速200；verbose 恢复逐条明细。drain/MAX_CONN/失败始终打印。
+      - LOG_MODE=simple # simple（默认）每实例一行巡检通过/失败；折叠 URL/出口IP/测速200。verbose 恢复逐条。drain/MAX_CONN 始终打印。
       - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
@@ -233,7 +233,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - MAX_CONN_DURATION=0 # 仅多实例：每个后端最长连续健康在线秒数；超时且 ready 实例不少于一半时进入 drain 后重连（可有 busy；默认 0=关闭；单实例永不因本策略下线；ready 不足一半则跳过）
       - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 scur 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）
       - INSTANCE_DRAIN_SETTLE_SECONDS=20 # scur 到 0 后再连续空闲这么多秒才停 SOCKS（默认 20；0=第一次 0 就停）。中途 scur>0 会重新等 0 再确认。不阻塞其它实例。
-      - LOG_MODE=simple # simple（默认）折叠巡检/出口IP/测速200；verbose 恢复逐条明细。drain/MAX_CONN/失败始终打印。
+      - LOG_MODE=simple # simple（默认）每实例一行巡检通过/失败；折叠 URL/出口IP/测速200。verbose 恢复逐条。drain/MAX_CONN 始终打印。
       - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
