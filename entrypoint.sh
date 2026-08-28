@@ -1262,6 +1262,16 @@ haproxy_set_server_state() {
     CMD="set server warp_pool/inst${INST_ID} state ${STATE}"
     if haproxy_runtime_cmd "$CMD"; then
         echo "==> [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
+        # drain: stop HAProxy tcp-check too (user: draining 不需要巡检).
+        # ready: resume checks. maint already disables checks.
+        case "$STATE" in
+            drain)
+                haproxy_runtime_cmd "disable health warp_pool/inst${INST_ID}" || true
+                ;;
+            ready)
+                haproxy_runtime_cmd "enable health warp_pool/inst${INST_ID}" || true
+                ;;
+        esac
         return 0
     fi
     echo "==> [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
@@ -2294,7 +2304,7 @@ print_health_summary() {
             ;;
         *)
             BUSY=$(sum_draining_busy_clients 2>/dev/null || printf '0')
-            LINE="==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中scur=${BUSY}）"
+            LINE="==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中scur+qcur=${BUSY}）"
             ;;
     esac
     if is_log_verbose; then
@@ -3295,16 +3305,23 @@ probe_instance_and_schedule_recovery() {
         return 0
     fi
 
+    # Draining: no TEST_URLS / egress 巡检, no HAProxy tcp-check (disabled at drain).
+    # Worker owns idle wait (scur+qcur). Do not probe the tunnel under a live stream.
+    if [ "$(get_instance_status "$INST_ID")" = "draining" ]; then
+        if is_instance_recovering "$INST_ID"; then
+            _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
+            log_verbose "==> [inst${INST_ID}] draining，跳过巡检（排空中 $(format_scur_log "$_busy")）"
+        else
+            echo "==> [inst${INST_ID}] draining 但无 worker → 补拉后台复活（不巡检）"
+            request_instance_recovery "$INST_ID"
+        fi
+        return 0
+    fi
+
     # If a recovery worker is already busy, just skip heavy work.
     if is_instance_recovering "$INST_ID"; then
-        # Only count busy while draining; other phases skip HAProxy scur.
         _st=$(get_instance_status "$INST_ID")
-        if [ "$_st" = "draining" ]; then
-            _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            log_verbose "==> [inst${INST_ID}] 后台复活进行中（排空中 $(format_scur_log "$_busy")），本轮巡检跳过重活"
-        else
-            log_verbose "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
-        fi
+        log_verbose "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
         return 0
     fi
 

@@ -1054,12 +1054,56 @@ test_sum_draining_busy_skips_non_drain() {
     summary=$(print_health_summary)
     assert_contains "$summary" '健康 1/3' 'fleet healthy count'
     assert_contains "$summary" 'draining 1' 'fleet draining count'
-    assert_contains "$summary" '排空中scur=3' 'scur only when draining'
+    assert_contains "$summary" '排空中scur+qcur=3' 'scur+qcur only when draining'
 
     unset -f get_instance_ids get_instance_status count_instance_busy_clients \
         is_instance_recovering count_healthy_instances 2>/dev/null || true
     rm -f "$SCAN_LOG" "$STATE"
     unset MICROWARP_HEALTH_SUMMARY_STATE
+}
+
+test_probe_skips_draining_without_health_checks() {
+    local out CONF
+    CONF=$(mktemp)
+    printf 'x\n' > "$CONF"
+    (
+        get_instance_conf_path() { printf '%s\n' "$CONF"; }
+        is_instance_queued_for_config_retry() { return 1; }
+        get_instance_status() { printf 'draining\n'; }
+        is_instance_recovering() { return 1; }
+        run_instance_health_checks() { echo 'RAN_HEALTH'; return 0; }
+        request_instance_recovery() { echo 'RECOVERY_ONLY'; }
+        count_instance_busy_clients() { printf '1\n'; }
+        out=$(probe_instance_and_schedule_recovery 4 2>&1)
+        assert_contains "$out" '不巡检' 'draining skips 巡检'
+        assert_contains "$out" 'RECOVERY_ONLY' 'missing worker still spawned'
+        if [[ "$out" == *RAN_HEALTH* ]]; then
+            echo "must not run TEST_URLS while draining: $out" >&2
+            exit 1
+        fi
+    )
+    (
+        get_instance_conf_path() { printf '%s\n' "$CONF"; }
+        is_instance_queued_for_config_retry() { return 1; }
+        get_instance_status() { printf 'draining\n'; }
+        is_instance_recovering() { return 0; }
+        run_instance_health_checks() { echo 'RAN_HEALTH'; return 0; }
+        request_instance_recovery() { echo 'RECOVERY_ONLY'; }
+        count_instance_busy_clients() { printf '2\n'; }
+        format_scur_log() { printf 'scur=2 qcur=0 via=stat'; }
+        LOG_MODE=verbose
+        out=$(probe_instance_and_schedule_recovery 4 2>&1)
+        assert_contains "$out" '跳过巡检' 'recovering drain skips 巡检'
+        if [[ "$out" == *RAN_HEALTH* ]]; then
+            echo "must not run TEST_URLS while draining+recovering: $out" >&2
+            exit 1
+        fi
+        if [[ "$out" == *RECOVERY_ONLY* ]]; then
+            echo "must not re-request recovery when worker exists: $out" >&2
+            exit 1
+        fi
+    )
+    rm -f "$CONF"
 }
 
 test_hev_socks_config_and_udp_ports() {
@@ -1217,6 +1261,7 @@ test_max_conn_duration_helpers
 test_instance_online_duration_probe_log
 test_instance_drain_helpers
 test_sum_draining_busy_skips_non_drain
+test_probe_skips_draining_without_health_checks
 test_hev_socks_config_and_udp_ports
 
 printf 'PASS test_multi_instance_helpers\n'
