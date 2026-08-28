@@ -3346,7 +3346,6 @@ probe_instance_and_schedule_recovery() {
     if is_log_verbose; then
         print_instance_health_probe_start "$INST_ID"
     fi
-    PROBE_ROUND_RAN=$((${PROBE_ROUND_RAN:-0} + 1))
     if run_instance_health_checks "$INST_ID"; then
         OLD_STATUS=$(get_instance_status "$INST_ID")
         case "$OLD_STATUS" in
@@ -3361,18 +3360,16 @@ probe_instance_and_schedule_recovery() {
                 ;;
             up)
                 # Already serving: do NOT mark_instance_up (avoids ready spam / accidental drain cancel).
-                if is_log_verbose; then
-                    ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
-                    case "$ELAPSED" in
-                        ''|*[!0-9]*)
-                            echo "==> [inst${INST_ID}] 巡检通过，继续保持在线"
-                            ;;
-                        *)
-                            UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
-                            echo "==> [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
-                            ;;
-                    esac
-                fi
+                ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
+                case "$ELAPSED" in
+                    ''|*[!0-9]*)
+                        echo "==> [inst${INST_ID}] 巡检通过"
+                        ;;
+                    *)
+                        UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
+                        echo "==> [inst${INST_ID}] 巡检通过（已在线: ${UPTIME_TEXT}）"
+                        ;;
+                esac
                 ;;
             *)
                 # down / unknown → bring back into pool
@@ -3392,7 +3389,6 @@ probe_instance_and_schedule_recovery() {
     fi
 
     echo "==> [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
-    PROBE_ROUND_FAIL=$((${PROBE_ROUND_FAIL:-0} + 1))
     request_instance_recovery "$INST_ID"
     return 0
 }
@@ -3416,12 +3412,10 @@ multi_periodic_monitor() {
     if is_log_verbose; then
         echo "==> 日志模式: verbose"
     else
-        echo "==> 日志模式: simple（巡检明细已折叠；LOG_MODE=verbose 可打开）"
+        echo "==> 日志模式: simple（每实例巡检一行；URL/出口 IP 明细用 LOG_MODE=verbose）"
     fi
 
     while true; do
-        PROBE_ROUND_RAN=0
-        PROBE_ROUND_FAIL=0
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
             probe_instance_and_schedule_recovery "$INST_ID"
 
@@ -3449,7 +3443,6 @@ multi_periodic_monitor() {
             fi
             sleep "$HEALTH_STAGGER" & wait $!
         done
-        echo "==> 巡检一轮: 探测 ${PROBE_ROUND_RAN}/${WARP_INSTANCE_COUNT} 台，失败 ${PROBE_ROUND_FAIL}，健康 $(count_healthy_instances 2>/dev/null || printf '?')/${WARP_INSTANCE_COUNT}"
         print_health_summary
     done
 }
