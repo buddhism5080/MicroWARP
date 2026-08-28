@@ -1022,8 +1022,10 @@ test_instance_drain_helpers() {
 }
 
 test_sum_draining_busy_skips_non_drain() {
-    local SCAN_LOG summary
+    local SCAN_LOG summary STATE
     SCAN_LOG=$(mktemp)
+    STATE=$(mktemp)
+    MICROWARP_HEALTH_SUMMARY_STATE=$STATE
     WARP_INSTANCE_COUNT=3
     get_instance_ids() { printf '1 2 3\n'; }
     get_instance_status() {
@@ -1047,7 +1049,7 @@ test_sum_draining_busy_skips_non_drain() {
     count_healthy_instances() { printf '1\n'; }
 
     assert_eq "$(sum_draining_busy_clients)" '3' 'only draining inst busy is summed'
-    assert_eq "$(tr -d ' \n' < "$SCAN_LOG")" '2' 'ss only for draining instance'
+    assert_eq "$(tr -d ' \n' < "$SCAN_LOG")" '2' 'scur only for draining instance'
 
     summary=$(print_health_summary)
     assert_contains "$summary" '健康 1/3' 'fleet healthy count'
@@ -1056,7 +1058,8 @@ test_sum_draining_busy_skips_non_drain() {
 
     unset -f get_instance_ids get_instance_status count_instance_busy_clients \
         is_instance_recovering count_healthy_instances 2>/dev/null || true
-    rm -f "$SCAN_LOG"
+    rm -f "$SCAN_LOG" "$STATE"
+    unset MICROWARP_HEALTH_SUMMARY_STATE
 }
 
 test_hev_socks_config_and_udp_ports() {
@@ -1147,7 +1150,36 @@ EOF
     unset -f haproxy_runtime_query 2>/dev/null || true
 }
 
+test_log_mode_simple_hides_repeat_summary() {
+    local out STATE
+    LOG_MODE=simple
+    is_log_verbose && { echo 'simple must not be verbose' >&2; exit 1; }
+    LOG_MODE=verbose
+    is_log_verbose || { echo 'verbose must be verbose' >&2; exit 1; }
+    LOG_MODE=simple
+
+    STATE=$(mktemp)
+    # Subshell so mocks do not unset real entrypoint functions for later tests.
+    (
+        MICROWARP_HEALTH_SUMMARY_STATE=$STATE
+        WARP_INSTANCE_COUNT=2
+        count_healthy_instances() { printf '2\n'; }
+        count_instances_recovering() { printf '0\n'; }
+        count_instances_with_status() { printf '0\n'; }
+        out=$(print_health_summary)
+        assert_contains "$out" '健康 2/2' 'first summary prints'
+        out=$(print_health_summary)
+        [ -z "$out" ] || { echo "repeat summary should be silent in simple: $out" >&2; exit 1; }
+        LOG_MODE=verbose
+        out=$(print_health_summary)
+        assert_contains "$out" '健康 2/2' 'verbose always prints summary'
+    )
+    LOG_MODE=simple
+    rm -f "$STATE"
+}
+
 test_parse_haproxy_scur_and_conn
+test_log_mode_simple_hides_repeat_summary
 test_default_instance_count_is_one
 test_explicit_instance_count
 test_invalid_instance_count_falls_back

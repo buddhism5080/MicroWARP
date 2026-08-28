@@ -44,6 +44,8 @@ INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
 # After scur hits 0, require this many consecutive idle seconds before stopping SOCKS.
 # Unset/empty/non-numeric → 20. 0 → stop at first scur=0 (no confirm).
 INSTANCE_DRAIN_SETTLE_SECONDS="${INSTANCE_DRAIN_SETTLE_SECONDS-20}"
+# simple (default): fold per-tick health-check spam. verbose: every probe/URL/IP line.
+LOG_MODE="${LOG_MODE:-simple}"
 HEV_SOCKS5_BIN="${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}"
 SOCKS_UDP_PORT_BASE="${SOCKS_UDP_PORT_BASE:-}"
 WARP_INSTANCE_COUNT=1
@@ -53,6 +55,20 @@ is_enabled() {
         1|true|yes|on) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# LOG_MODE=simple (default): hide per-tick health-check spam so drain/MAX_CONN
+# stay visible. LOG_MODE=verbose restores every probe/URL/egress-IP line.
+is_log_verbose() {
+    case "$(printf '%s' "${LOG_MODE:-simple}" | tr '[:upper:]' '[:lower:]')" in
+        verbose|debug|full|all) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+log_verbose() {
+    is_log_verbose || return 0
+    echo "$@"
 }
 
 get_warp_instance_count() {
@@ -567,7 +583,7 @@ format_scur_log() {
 # Runs in the per-instance recovery worker — does not block other instances.
 wait_instance_drain() {
     local INST_ID="$1"
-    local TIMEOUT SETTLE COUNT SLEPT SHOW CONFIRMED
+    local TIMEOUT SETTLE COUNT SLEPT SHOW CONFIRMED _tick
 
     TIMEOUT=$(get_instance_drain_timeout)
     SETTLE=$(get_instance_drain_settle_seconds)
@@ -619,7 +635,9 @@ wait_instance_drain() {
                 echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
                 return 1
             fi
-            if [ $((SLEPT % 5)) -eq 0 ]; then
+            _tick=5
+            is_log_verbose || _tick=30
+            if [ $((SLEPT % _tick)) -eq 0 ]; then
                 if [ -n "$TIMEOUT" ]; then
                     echo "==> [inst${INST_ID}] 复活进度: 排空中 ${SHOW}，已等待 ${SLEPT}s/${TIMEOUT}s"
                 else
@@ -665,7 +683,7 @@ wait_instance_drain() {
                 echo "==> [inst${INST_ID}] 复活进度: 确认被打断 ${SHOW}（已确认 ${CONFIRMED}s/${SETTLE}s），重新等到 scur=0"
                 break
             fi
-            if [ $((CONFIRMED % 5)) -eq 0 ]; then
+            if is_log_verbose && [ $((CONFIRMED % 5)) -eq 0 ]; then
                 echo "==> [inst${INST_ID}] 复活进度: 确认空闲中 $(format_scur_log 0)，${CONFIRMED}s/${SETTLE}s"
             fi
         done
@@ -1638,6 +1656,7 @@ record_socks_online_started_at() {
 }
 
 print_socks_health_check_success() {
+    is_log_verbose || return 0
     if [ -z "$SOCKS_ONLINE_AT_EPOCH" ] || [ -z "$SOCKS_ONLINE_AT_TEXT" ]; then
         echo "==> 巡检通过，SOCKS 服务继续保持在线"
         return 0
@@ -1851,7 +1870,7 @@ probe_egress_ips() {
     PROBE_URL_ATTEMPTS=0
     if probe_egress_ip_family v4 "$NS_NAME"; then
         TRACE_IP_V4="ip=${PROBED_IP}"
-        echo "${PREFIX} 出口 IPv4: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
+        log_verbose "${PREFIX} 出口 IPv4: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
     fi
     EGRESS_IP_URLS_TRIED=$((EGRESS_IP_URLS_TRIED + PROBE_URL_ATTEMPTS))
 
@@ -1860,7 +1879,7 @@ probe_egress_ips() {
     PROBE_URL_ATTEMPTS=0
     if probe_egress_ip_family v6 "$NS_NAME"; then
         TRACE_IP_V6="ip=${PROBED_IP}"
-        echo "${PREFIX} 出口 IPv6: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
+        log_verbose "${PREFIX} 出口 IPv6: ${PROBED_IP}  (via ${PROBED_IP_SOURCE}, tried ${PROBE_URL_ATTEMPTS} link(s))"
     fi
     EGRESS_IP_URLS_TRIED=$((EGRESS_IP_URLS_TRIED + PROBE_URL_ATTEMPTS))
 
@@ -1945,7 +1964,13 @@ check_single_test_url() {
         fi
 
         [ -n "$TEST_HTTP_CODE" ] || TEST_HTTP_CODE="000"
-        echo "==> 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        _log_code=0
+        case "$TEST_HTTP_CODE" in
+            4*|5*|000|"") _log_code=1 ;;
+        esac
+        if is_log_verbose || [ "$_log_code" -eq 1 ]; then
+            echo "==> 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        fi
 
         if is_retryable_test_url_curl_exit "$CURL_EXIT" && [ "$ATTEMPT" -le "$RETRYABLE_FAILURE_RETRIES" ]; then
             RETRY_REASON=$(get_test_url_retry_reason "$CURL_EXIT")
@@ -2119,7 +2144,7 @@ periodic_test_url_monitor() {
         # 睡眠等待期间能随时响应容器的停止信号
         sleep "$TEST_URLS_CHECK_INTERVAL" & wait $!
 
-        echo "==> 正在执行 TEST_URLS 巡检（间隔 ${TEST_URLS_CHECK_INTERVAL} 秒）..."
+        log_verbose "==> 正在执行 TEST_URLS 巡检（间隔 ${TEST_URLS_CHECK_INTERVAL} 秒）..."
 
         # 巡检时直接发起检测，不干扰正常运行的 SOCKS
         if check_test_urls; then
@@ -2240,8 +2265,14 @@ sum_all_busy_clients() {
 }
 
 # One-line fleet health. busy only reported when someone is draining.
+# simple: print on change, or at most once per 60s if unchanged.
+# Persist last line to a file so `out=$(print_health_summary)` tests still see it.
+get_health_summary_state_file() {
+    printf '%s\n' "${MICROWARP_HEALTH_SUMMARY_STATE:-${TMPDIR:-/tmp}/microwarp.health.summary}"
+}
+
 print_health_summary() {
-    local TOTAL HEALTHY RECOVERING DRAINING DOWN BUSY EXTRA
+    local TOTAL HEALTHY RECOVERING DRAINING DOWN BUSY EXTRA LINE NOW LAST LAST_LINE STATE
     TOTAL=${WARP_INSTANCE_COUNT:-1}
     HEALTHY=$(count_healthy_instances 2>/dev/null || printf '0')
     RECOVERING=$(count_instances_recovering 2>/dev/null || printf '0')
@@ -2250,13 +2281,32 @@ print_health_summary() {
     EXTRA="draining ${DRAINING}，down ${DOWN}"
     case "$DRAINING" in
         ''|0)
-            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}）"
+            LINE="==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}）"
             ;;
         *)
             BUSY=$(sum_draining_busy_clients 2>/dev/null || printf '0')
-            echo "==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中scur=${BUSY}）"
+            LINE="==> 健康 ${HEALTHY}/${TOTAL}，后台复活中 ${RECOVERING}（${EXTRA}，排空中scur=${BUSY}）"
             ;;
     esac
+    if is_log_verbose; then
+        echo "$LINE"
+        return 0
+    fi
+    NOW=$(date +%s)
+    LAST=0
+    LAST_LINE=
+    STATE=$(get_health_summary_state_file)
+    if [ -f "$STATE" ]; then
+        read LAST LAST_LINE < "$STATE" 2>/dev/null || true
+    fi
+    case "$LAST" in
+        ''|*[!0-9]*) LAST=0 ;;
+    esac
+    if [ "$LINE" = "$LAST_LINE" ] && [ $((NOW - LAST)) -lt 60 ]; then
+        return 0
+    fi
+    printf '%s %s\n' "$NOW" "$LINE" > "$STATE" 2>/dev/null || true
+    echo "$LINE"
 }
 
 enable_host_forwarding() {
@@ -2608,7 +2658,7 @@ ns_ensure_trace_ip() {
 ns_check_single_test_url() {
     local INST_ID="$1"
     local TARGET_URL="$2"
-    local NS_NAME TEST_HTTP_CODE CURL_EXIT RETRYABLE_FAILURE_RETRIES ATTEMPT RETRY_REASON
+    local NS_NAME TEST_HTTP_CODE CURL_EXIT RETRYABLE_FAILURE_RETRIES ATTEMPT RETRY_REASON _log_code
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     RETRYABLE_FAILURE_RETRIES=2
     ATTEMPT=1
@@ -2621,7 +2671,13 @@ ns_check_single_test_url() {
         fi
 
         [ -n "$TEST_HTTP_CODE" ] || TEST_HTTP_CODE="000"
-        echo "==> [inst${INST_ID}] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        _log_code=0
+        case "$TEST_HTTP_CODE" in
+            4*|5*|000|"") _log_code=1 ;;
+        esac
+        if is_log_verbose || [ "$_log_code" -eq 1 ]; then
+            echo "==> [inst${INST_ID}] 测速反馈 ${TARGET_URL} HTTP 状态码: ${TEST_HTTP_CODE}"
+        fi
 
         if is_retryable_test_url_curl_exit "$CURL_EXIT" && [ "$ATTEMPT" -le "$RETRYABLE_FAILURE_RETRIES" ]; then
             RETRY_REASON=$(get_test_url_retry_reason "$CURL_EXIT")
@@ -2798,7 +2854,7 @@ _reload_haproxy_from_status_unlocked() {
     if [ -f "$HAPROXY_CFG" ] && cmp -s "$NEW_CFG" "$HAPROXY_CFG" 2>/dev/null; then
         rm -f "$NEW_CFG"
         if refresh_haproxy_pid; then
-            echo "==> HAProxy 配置未变（健康标记 ${HEALTHY}/${WARP_INSTANCE_COUNT}），跳过 reload"
+            log_verbose "==> HAProxy 配置未变（健康标记 ${HEALTHY}/${WARP_INSTANCE_COUNT}），跳过 reload"
             return 0
         fi
         echo "==> HAProxy 配置未变但进程不在，冷启动..."
@@ -3219,7 +3275,7 @@ probe_instance_and_schedule_recovery() {
 
     # Config retry queue owns registration for conf-less / register-failed insts.
     if is_instance_queued_for_config_retry "$INST_ID"; then
-        echo "==> [inst${INST_ID}] 配置串行重试队列处理中，本轮巡检跳过"
+        log_verbose "==> [inst${INST_ID}] 配置串行重试队列处理中，本轮巡检跳过"
         ensure_config_retry_worker
         return 0
     fi
@@ -3236,14 +3292,16 @@ probe_instance_and_schedule_recovery() {
         _st=$(get_instance_status "$INST_ID")
         if [ "$_st" = "draining" ]; then
             _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [inst${INST_ID}] 后台复活进行中（排空中 $(format_scur_log "$_busy")），本轮巡检跳过重活"
+            log_verbose "==> [inst${INST_ID}] 后台复活进行中（排空中 $(format_scur_log "$_busy")），本轮巡检跳过重活"
         else
-            echo "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
+            log_verbose "==> [inst${INST_ID}] 后台复活进行中（status=${_st}），本轮巡检跳过重活"
         fi
         return 0
     fi
 
-    print_instance_health_probe_start "$INST_ID"
+    if is_log_verbose; then
+        print_instance_health_probe_start "$INST_ID"
+    fi
     if run_instance_health_checks "$INST_ID"; then
         OLD_STATUS=$(get_instance_status "$INST_ID")
         case "$OLD_STATUS" in
@@ -3258,16 +3316,18 @@ probe_instance_and_schedule_recovery() {
                 ;;
             up)
                 # Already serving: do NOT mark_instance_up (avoids ready spam / accidental drain cancel).
-                ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
-                case "$ELAPSED" in
-                    ''|*[!0-9]*)
-                        echo "==> [inst${INST_ID}] 巡检通过，继续保持在线"
-                        ;;
-                    *)
-                        UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
-                        echo "==> [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
-                        ;;
-                esac
+                if is_log_verbose; then
+                    ELAPSED=$(get_instance_online_elapsed_seconds "$INST_ID")
+                    case "$ELAPSED" in
+                        ''|*[!0-9]*)
+                            echo "==> [inst${INST_ID}] 巡检通过，继续保持在线"
+                            ;;
+                        *)
+                            UPTIME_TEXT=$(format_uptime_duration "$ELAPSED")
+                            echo "==> [inst${INST_ID}] 巡检通过，继续保持在线（已在线: ${UPTIME_TEXT}）"
+                            ;;
+                    esac
+                fi
                 ;;
             *)
                 # down / unknown → bring back into pool
@@ -3307,6 +3367,11 @@ multi_periodic_monitor() {
     HEALTH_STAGGER=$(get_health_check_stagger_seconds "$WARP_INSTANCE_COUNT")
     echo "==> 多实例守护模式：巡检总间隔 ${TEST_URLS_CHECK_INTERVAL}s / ${WARP_INSTANCE_COUNT} 实例 → 错峰 ${HEALTH_STAGGER}s"
     echo "==> 主循环只做轻量探活；失败实例在后台独立重连/重注册直到复活"
+    if is_log_verbose; then
+        echo "==> 日志模式: verbose"
+    else
+        echo "==> 日志模式: simple（巡检明细已折叠；LOG_MODE=verbose 可打开）"
+    fi
 
     while true; do
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
@@ -3314,26 +3379,27 @@ multi_periodic_monitor() {
 
             # Fleet one-liner after each probe (健康 N/M + 复活/排空/busy)
             print_health_summary
-            # Per recovering inst: only scur+qcur while draining
-            for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
-                if is_instance_recovering "$X"; then
-                    _st=$(get_instance_status "$X")
-                    case "$_st" in
-                        draining)
-                            _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
-                            echo "==> [inst${X}] 复活进度: 排空中 status=draining $(format_scur_log "$_busy")"
-                            ;;
-                        down)
-                            echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down"
-                            ;;
-                        *)
-                            echo "==> [inst${X}] 复活进度: 进行中 status=${_st}"
-                            ;;
-                    esac
-                fi
-            done
-
-            echo "==> 健康巡检错峰：等待 ${HEALTH_STAGGER}s 后检查下一个实例"
+            if is_log_verbose; then
+                # Per recovering inst: only scur+qcur while draining
+                for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
+                    if is_instance_recovering "$X"; then
+                        _st=$(get_instance_status "$X")
+                        case "$_st" in
+                            draining)
+                                _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
+                                echo "==> [inst${X}] 复活进度: 排空中 status=draining $(format_scur_log "$_busy")"
+                                ;;
+                            down)
+                                echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down"
+                                ;;
+                            *)
+                                echo "==> [inst${X}] 复活进度: 进行中 status=${_st}"
+                                ;;
+                        esac
+                    fi
+                done
+                echo "==> 健康巡检错峰：等待 ${HEALTH_STAGGER}s 后检查下一个实例"
+            fi
             sleep "$HEALTH_STAGGER" & wait $!
         done
     done
