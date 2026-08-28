@@ -252,7 +252,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 出口 IP 探测为**多源、短超时、同厂商错开**（例如先 `1.1.1.1`，中间插其它厂商，再试 `1.0.0.1`）。**同一次**健康检查内，每个地址族最多试 `EGRESS_IP_FAIL_THRESHOLD` 条链接（默认 **4**），成功即停；若这几条都拿不到 IP，判定 WARP 连接失败。`EGRESS_IP_FAIL_THRESHOLD=0` 时不因 IP 判死，改由 `TEST_URLS` 决定。健康检查失败后仍按 `WG_RECONNECT_RETRIES` 先重连再重检，全部失败后才重新向 API 申请配置（默认 `5`，`0` 跳过重连，过大值封顶 `20`）。
 >
-> 现在启动日志还会打印一份简短的身份摘要，包括私钥指纹、接口地址和最终采用的 Peer Endpoint，方便你确认“设备身份是否真的变了”。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
+> 新注册（首次或 `ROTATE_IP_ON_START` / 重注册）时会打印一份简短身份摘要：私钥指纹、接口地址、Peer Endpoint，方便确认设备身份是否变了。复用已有配置时不打印。如果 `ENDPOINT_IP` 传入多个候选（逗号或分号分隔），容器每次启动时会随机挑一个。
 >
 > 设置 `WARP_INSTANCES=N`（N>1）可在**同一个容器内**并行多条 WARP 隧道：对外仍只暴露一个 SOCKS 端口（`BIND_ADDR`/`BIND_PORT`），由 HAProxy 轮询健康后端，不健康实例会立刻从池中剔除。各实例配置保存在 `/etc/wireguard/instances/<id>/wg0.conf`。多实例依赖 network namespace，除常规 `NET_ADMIN` / `SYS_MODULE` 外建议再加 `SYS_ADMIN`。默认仍是 `1`，完全走原来的单隧道路径。
 >

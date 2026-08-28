@@ -1921,7 +1921,7 @@ probe_egress_ips() {
     fi
 
     MAX_URLS=$(get_egress_ip_fail_threshold)
-    echo "${PREFIX} ⚠️ 出口 IP 探测失败：本轮已试链接均未取到 IP（每栈最多试 ${MAX_URLS} 条，同厂商已错开）"
+    log_verbose "${PREFIX} ⚠️ 出口 IP 探测失败：本轮已试链接均未取到 IP（每栈最多试 ${MAX_URLS} 条，同厂商已错开）"
     return 1
 }
 
@@ -1952,7 +1952,7 @@ ensure_trace_ip() {
         return 1
     fi
 
-    echo "${PREFIX} 本轮 ${THRESH} 条链接内未取到出口 IP，判定 WARP 连接失败"
+    echo "${PREFIX} 出口 IP 未取到，判定 WARP 未通"
     return 2
 }
 
@@ -2382,7 +2382,7 @@ setup_instance_netns() {
 
     destroy_instance_netns "$INST_ID"
 
-    echo "==> [inst${INST_ID}] 创建 netns ${NS_NAME} 与 veth 对"
+    log_verbose "==> [inst${INST_ID}] 创建 netns ${NS_NAME} 与 veth 对"
     ip netns add "$NS_NAME"
     ip link add "$HOST_VETH" type veth peer name "$NS_VETH"
     ip link set "$NS_VETH" netns "$NS_NAME"
@@ -3146,7 +3146,7 @@ ensure_instance_ready() {
         return 0
     fi
 
-    echo "==> [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
+    log_verbose "==> [inst${_eid}] 启动期连通性未通过，不阻塞后续实例；交给后台 worker 复活"
     request_instance_recovery "$_eid"
     return 1
 }
@@ -3204,6 +3204,7 @@ bootstrap_multi_instances() {
         if [ "$_need_register" -eq 1 ]; then
             if generate_warp_config "$CONF_PATH"; then
                 _config_ok=1
+                print_warp_identity_summary "$CONF_PATH" "inst${_bid}"
             else
                 echo "==> [inst${_bid}] 启动期配置获取失败（不退出容器），加入后台串行重试队列"
                 enqueue_instance_config_retry "$_bid"
@@ -3220,7 +3221,6 @@ bootstrap_multi_instances() {
             continue
         fi
 
-        print_warp_identity_summary "$CONF_PATH" "inst${_bid}"
         setup_instance_netns "$_bid"
         start_instance_warp "$_bid" || true
 
@@ -3491,17 +3491,17 @@ if [ "$WARP_INSTANCE_COUNT" -le 1 ]; then
             echo "==> [FATAL] 单实例首次注册连续失败，无法启动"
             exit 1
         fi
+        print_warp_identity_summary
     elif is_enabled "$ROTATE_IP_ON_START"; then
         echo "==> 检测到 ROTATE_IP_ON_START=${ROTATE_IP_ON_START}，正在重新注册 WARP 设备以刷新出口 IP..."
         if ! generate_warp_config; then
             echo "==> [FATAL] ROTATE_IP_ON_START 注册失败，无法启动"
             exit 1
         fi
+        print_warp_identity_summary
     else
         echo "==> 检测到已有持久化配置，跳过注册。"
     fi
-
-    print_warp_identity_summary
     trap cleanup_on_exit INT TERM
     start_warp_interface
     ensure_network_ready
