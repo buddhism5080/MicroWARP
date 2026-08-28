@@ -487,18 +487,24 @@ get_instance_drain_settle_seconds() {
 }
 
 # Persist scur source across `COUNT=$(count_instance_busy_clients)` subshells.
+# Per-instance files: many drain workers must not clobber each other's via=stat.
 get_scur_via_file() {
-    printf '%s\n' "${MICROWARP_SCUR_VIA_FILE:-${TMPDIR:-/tmp}/microwarp.scur.via}"
+    local INST_ID="${1:-}"
+    if [ -n "${MICROWARP_SCUR_VIA_FILE:-}" ]; then
+        printf '%s\n' "$MICROWARP_SCUR_VIA_FILE"
+        return 0
+    fi
+    printf '%s\n' "${TMPDIR:-/tmp}/microwarp.scur.via.${INST_ID:-x}"
 }
 
 set_scur_via() {
     LAST_HAPROXY_SCUR_VIA="$1"
-    printf '%s\n' "$1" > "$(get_scur_via_file)" 2>/dev/null || true
+    printf '%s\n' "$1" > "$(get_scur_via_file "${2:-}")" 2>/dev/null || true
 }
 
 get_scur_via() {
     local V
-    V=$(cat "$(get_scur_via_file)" 2>/dev/null || true)
+    V=$(cat "$(get_scur_via_file "${1:-}")" 2>/dev/null || true)
     case "$V" in
         stat|conn|none)
             printf '%s\n' "$V"
@@ -510,18 +516,23 @@ get_scur_via() {
 }
 
 get_scur_pair_file() {
-    printf '%s\n' "${MICROWARP_SCUR_PAIR_FILE:-${TMPDIR:-/tmp}/microwarp.scur.pair}"
+    local INST_ID="${1:-}"
+    if [ -n "${MICROWARP_SCUR_PAIR_FILE:-}" ]; then
+        printf '%s\n' "$MICROWARP_SCUR_PAIR_FILE"
+        return 0
+    fi
+    printf '%s\n' "${TMPDIR:-/tmp}/microwarp.scur.pair.${INST_ID:-x}"
 }
 
 set_scur_pair() {
-    printf '%s %s\n' "$1" "$2" > "$(get_scur_pair_file)" 2>/dev/null || true
+    printf '%s %s\n' "$1" "$2" > "$(get_scur_pair_file "${3:-}")" 2>/dev/null || true
 }
 
 get_scur_pair() {
     local S Q
     S=
     Q=
-    read S Q < "$(get_scur_pair_file)" 2>/dev/null || true
+    read S Q < "$(get_scur_pair_file "${1:-}")" 2>/dev/null || true
     case "$S" in
         ''|*[!0-9]*) S='?' ;;
     esac
@@ -538,8 +549,8 @@ count_instance_busy_clients() {
     local INST_ID="$1"
     local OUT PAIR SC QC
 
-    set_scur_via none
-    set_scur_pair '?' '?'
+    set_scur_via none "$INST_ID"
+    set_scur_pair '?' '?' "$INST_ID"
     OUT=$(haproxy_runtime_query "show stat" 2>/dev/null) || OUT=""
     if [ -n "$OUT" ]; then
         PAIR=$(printf '%s\n' "$OUT" | parse_haproxy_server_scur "$INST_ID")
@@ -551,8 +562,8 @@ count_instance_busy_clients() {
                 case "$SC" in ''|*[!0-9]*) SC='' ;; esac
                 case "$QC" in ''|*[!0-9]*) QC='' ;; esac
                 if [ -n "$SC" ] && [ -n "$QC" ] && [ "$SC" = "${PAIR%% *}" ]; then
-                    set_scur_via stat
-                    set_scur_pair "$SC" "$QC"
+                    set_scur_via stat "$INST_ID"
+                    set_scur_pair "$SC" "$QC" "$INST_ID"
                     printf '%s\n' $((SC + QC))
                     return 0
                 fi
@@ -560,17 +571,20 @@ count_instance_busy_clients() {
         esac
     fi
 
-    set_scur_via none
-    set_scur_pair '?' '?'
+    set_scur_via none "$INST_ID"
+    set_scur_pair '?' '?' "$INST_ID"
     printf 'unknown\n'
 }
 
 # Log fragment: "scur=3 qcur=1 via=stat" or "scur=? qcur=? via=none"
+# $3 = inst id so parallel drain workers do not share one via file.
 format_scur_log() {
     local N="$1"
-    local VIA PAIR SC QC
-    VIA="${2:-$(get_scur_via)}"
-    PAIR=$(get_scur_pair)
+    local VIA="$2"
+    local INST_ID="$3"
+    local PAIR SC QC
+    [ -n "$VIA" ] || VIA=$(get_scur_via "$INST_ID")
+    PAIR=$(get_scur_pair "$INST_ID")
     SC=${PAIR%% *}
     QC=${PAIR#* }
     case "$N" in
@@ -606,18 +620,18 @@ wait_instance_drain() {
     case "$COUNT" in
         ''|*[!0-9]*)
             if [ -n "$TIMEOUT" ]; then
-                echo "==> [inst${INST_ID}] [WARN] HAProxy $(format_scur_log "$COUNT") 不可读，仍等待最多 ${TIMEOUT}s 后停服务"
+                echo "==> [inst${INST_ID}] [WARN] HAProxy $(format_scur_log "$COUNT" "" "$INST_ID") 不可读，仍等待最多 ${TIMEOUT}s 后停服务"
             else
-                echo "==> [inst${INST_ID}] [WARN] HAProxy $(format_scur_log "$COUNT") 不可读，无限期等待至可观测且 scur=0（未设 INSTANCE_DRAIN_TIMEOUT）"
+                echo "==> [inst${INST_ID}] [WARN] HAProxy $(format_scur_log "$COUNT" "" "$INST_ID") 不可读，无限期等待至可观测且 scur=0（未设 INSTANCE_DRAIN_TIMEOUT）"
             fi
             COUNT=-1
             ;;
     esac
 
     if [ "$COUNT" -lt 0 ]; then
-        SHOW=$(format_scur_log "")
+        SHOW=$(format_scur_log "" "" "$INST_ID")
     else
-        SHOW=$(format_scur_log "$COUNT")
+        SHOW=$(format_scur_log "$COUNT" "" "$INST_ID")
     fi
     if [ -n "$TIMEOUT" ]; then
         echo "==> [inst${INST_ID}] 复活进度: 开始排空 ${SHOW}，确认空闲 ${SETTLE}s，最长等待 ${TIMEOUT}s"
@@ -636,9 +650,9 @@ wait_instance_drain() {
                 ''|*[!0-9]*) COUNT=-1 ;;
             esac
             if [ "$COUNT" -lt 0 ]; then
-                SHOW=$(format_scur_log "")
+                SHOW=$(format_scur_log "" "" "$INST_ID")
             else
-                SHOW=$(format_scur_log "$COUNT")
+                SHOW=$(format_scur_log "$COUNT" "" "$INST_ID")
             fi
             if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
                 echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
@@ -660,11 +674,11 @@ wait_instance_drain() {
 
         # Phase 2: scur=0. SETTLE=0 → stop now. Else require consecutive idle.
         if [ "$SETTLE" -le 0 ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0)，已等待 ${SLEPT}s → 停 SOCKS"
+            echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0 "" "$INST_ID")，已等待 ${SLEPT}s → 停 SOCKS"
             return 0
         fi
 
-        echo "==> [inst${INST_ID}] 复活进度: $(format_scur_log 0)，开始确认空闲 ${SETTLE}s（期间非 0 则重新等）"
+        log_verbose "==> [inst${INST_ID}] 复活进度: $(format_scur_log 0 "" "$INST_ID")，开始确认空闲 ${SETTLE}s（期间非 0 则重新等）"
         CONFIRMED=0
         while [ "$CONFIRMED" -lt "$SETTLE" ]; do
             sleep 1
@@ -676,28 +690,28 @@ wait_instance_drain() {
             esac
             if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
                 if [ "$COUNT" -lt 0 ]; then
-                    SHOW=$(format_scur_log "")
+                    SHOW=$(format_scur_log "" "" "$INST_ID")
                 else
-                    SHOW=$(format_scur_log "$COUNT")
+                    SHOW=$(format_scur_log "$COUNT" "" "$INST_ID")
                 fi
                 echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
                 return 1
             fi
             if [ "$COUNT" -ne 0 ]; then
                 if [ "$COUNT" -lt 0 ]; then
-                    SHOW=$(format_scur_log "")
+                    SHOW=$(format_scur_log "" "" "$INST_ID")
                 else
-                    SHOW=$(format_scur_log "$COUNT")
+                    SHOW=$(format_scur_log "$COUNT" "" "$INST_ID")
                 fi
                 echo "==> [inst${INST_ID}] 复活进度: 确认被打断 ${SHOW}（已确认 ${CONFIRMED}s/${SETTLE}s），重新等到 scur=0"
                 break
             fi
             if is_log_verbose && [ $((CONFIRMED % 5)) -eq 0 ]; then
-                echo "==> [inst${INST_ID}] 复活进度: 确认空闲中 $(format_scur_log 0)，${CONFIRMED}s/${SETTLE}s"
+                echo "==> [inst${INST_ID}] 复活进度: 确认空闲中 $(format_scur_log 0 "" "$INST_ID")，${CONFIRMED}s/${SETTLE}s"
             fi
         done
         if [ "$COUNT" -eq 0 ] && [ "$CONFIRMED" -ge "$SETTLE" ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0) 已稳定 ${SETTLE}s，已等待 ${SLEPT}s → 停 SOCKS"
+            echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0 "" "$INST_ID") 已稳定 ${SETTLE}s，已等待 ${SLEPT}s → 停 SOCKS"
             return 0
         fi
         # scur rose or unread during settle → outer loop waits for 0 again.
@@ -792,11 +806,11 @@ instance_should_force_rotate_for_max_conn() {
     esac
     DRAIN_TO=$(get_instance_drain_timeout)
     if [ "$BUSY" = "0" ]; then
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲($(format_scur_log 0))，准备 drain 后强制重连"
+        log_verbose "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且空闲($(format_scur_log 0 "" "$INST_ID"))，准备 drain 后强制重连"
     elif [ -n "$DRAIN_TO" ]; then
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 $(format_scur_log "$BUSY") → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
+        log_verbose "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 $(format_scur_log "$BUSY" "" "$INST_ID") → 仍进入 drain，空闲或 ${DRAIN_TO}s 超时后再停 SOCKS/重连"
     else
-        echo "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 $(format_scur_log "$BUSY") → 仍进入 drain，无限期等到 scur=0 后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
+        log_verbose "==> [inst${INST_ID}] 已连续在线 ${ELAPSED}s ≥ ${THRESHOLD}s 且仍有 $(format_scur_log "$BUSY" "" "$INST_ID") → 仍进入 drain，无限期等到 scur=0 后再停 SOCKS/重连（未设 INSTANCE_DRAIN_TIMEOUT）"
     fi
     return 0
 }
@@ -831,7 +845,7 @@ record_instance_offline_since() {
     mkdir -p "$(dirname "$FILE")"
     if [ ! -f "$FILE" ]; then
         date +%s > "$FILE"
-        echo "==> [inst${_oid}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
+        log_verbose "==> [inst${_oid}] 开始累计离线时间（超过 $(get_config_stale_offline_seconds)s 未上线将强制换新配置）"
     fi
 }
 
@@ -1261,7 +1275,7 @@ haproxy_set_server_state() {
 
     CMD="set server warp_pool/inst${INST_ID} state ${STATE}"
     if haproxy_runtime_cmd "$CMD"; then
-        echo "==> [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
+        log_verbose "==> [inst${INST_ID}] HAProxy runtime state → ${STATE}（无 reload）"
         # drain: stop HAProxy tcp-check too (user: draining 不需要巡检).
         # ready: resume checks. maint already disables checks.
         case "$STATE" in
@@ -2324,6 +2338,10 @@ print_health_summary() {
     if [ "$LINE" = "$LAST_LINE" ] && [ $((NOW - LAST)) -lt 60 ]; then
         return 0
     fi
+    # simple: even on change, at most every 15s (MAX_CONN wave used to reprint every 3s)
+    if ! is_log_verbose && [ -n "$LAST_LINE" ] && [ $((NOW - LAST)) -lt 15 ]; then
+        return 0
+    fi
     printf '%s %s\n' "$NOW" "$LINE" > "$STATE" 2>/dev/null || true
     echo "$LINE"
 }
@@ -2536,7 +2554,7 @@ prepare_instance_wg_conf() {
         if RESOLVED_IP=$(resolve_host_to_ip "$ENDPOINT_HOST"); then
             NEW_ENDPOINT=$(format_endpoint_ip_port "$RESOLVED_IP" "$ENDPOINT_PORT")
             if [ "$NEW_ENDPOINT" != "$RAW_ENDPOINT" ]; then
-                echo "==> [inst${INST_ID}] Endpoint 预解析: ${RAW_ENDPOINT} -> ${NEW_ENDPOINT}"
+                log_verbose "==> [inst${INST_ID}] Endpoint 预解析: ${RAW_ENDPOINT} -> ${NEW_ENDPOINT}"
             fi
             # Replace only the Endpoint line; keep the on-disk identity conf unchanged.
             sed -i "s|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = ${NEW_ENDPOINT}|" "$RUNTIME_CONF"
@@ -2567,7 +2585,7 @@ start_instance_warp() {
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     ip netns exec "$NS_NAME" ip link delete "$WG_NAME" >/dev/null 2>&1 || true
 
-    echo "==> [inst${INST_ID}] 正在 netns 内启动 WireGuard (${WG_NAME})..."
+    log_verbose "==> [inst${INST_ID}] 正在 netns 内启动 WireGuard (${WG_NAME})..."
     # Bound the up attempt: DNS/UDP stalls must not freeze serial multi-instance boot.
     # Do NOT use eval with nested quotes — call timeout/wg-quick directly.
     if command -v timeout >/dev/null 2>&1; then
@@ -2603,7 +2621,7 @@ start_instance_warp() {
     fi
 
     sleep 2
-    echo "==> [inst${INST_ID}] 隧道已启动"
+    log_verbose "==> [inst${INST_ID}] 隧道已启动"
     return 0
 }
 
@@ -2615,7 +2633,7 @@ stop_instance_socks() {
     if [ -f "$PID_FILE" ]; then
         PID=$(tr -d '\n' < "$PID_FILE")
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            echo "==> [inst${INST_ID}] 停止内部 SOCKS (PID: ${PID})"
+            log_verbose "==> [inst${INST_ID}] 停止内部 SOCKS (PID: ${PID})"
             kill "$PID" 2>/dev/null || true
             wait "$PID" 2>/dev/null || true
         fi
@@ -2661,7 +2679,7 @@ start_instance_socks() {
     mkdir -p "$INSTANCE_STATE_DIR"
     render_hev_socks_config "$NS_IP" 1080 "$UDP_PORT" > "$CONF"
     LOG="${INSTANCE_STATE_DIR}/inst${INST_ID}.socks.log"
-    echo "==> [inst${INST_ID}] 启动内部 SOCKS5 hev (${NS_IP}:1080 tcp / :${UDP_PORT} udp)"
+    log_verbose "==> [inst${INST_ID}] 启动内部 SOCKS5 hev (${NS_IP}:1080 tcp / :${UDP_PORT} udp)"
     ip netns exec "$NS_NAME" "$BIN" "$CONF" > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
     printf '%s\n' "$UDP_PORT" > "$(get_instance_udp_port_file "$INST_ID")"
@@ -2766,7 +2784,7 @@ restart_instance_wg() {
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
 
-    echo "==> [inst${INST_ID}] 正在断开并重连 WireGuard..."
+    log_verbose "==> [inst${INST_ID}] 正在断开并重连 WireGuard..."
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
     start_instance_warp "$INST_ID"
 }
@@ -2783,9 +2801,9 @@ try_instance_wg_reconnect_recovery() {
 
     ATTEMPT=1
     while [ "$ATTEMPT" -le "$RECONNECT_RETRIES" ]; do
-        echo "==> [inst${INST_ID}] WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
+        log_verbose "==> [inst${INST_ID}] WG 重连重试 (${ATTEMPT}/${RECONNECT_RETRIES})..."
         if restart_instance_wg "$INST_ID" && run_instance_health_checks "$INST_ID"; then
-            echo "==> [inst${INST_ID}] WG 重连后健康检查已恢复"
+            log_verbose "==> [inst${INST_ID}] WG 重连后健康检查已恢复"
             return 0
         fi
         ATTEMPT=$((ATTEMPT + 1))
@@ -2822,7 +2840,7 @@ mark_instance_up() {
     record_instance_online_since "$INST_ID"
     # Re-enable LB scheduling without rewriting haproxy.cfg / reload.
     haproxy_set_server_state "$INST_ID" "ready" || true
-    echo "==> [inst${INST_ID}] ✅ 已标记为健康（SOCKS up + HAProxy ready）"
+    log_verbose "==> [inst${INST_ID}] ✅ 已标记为健康（SOCKS up + HAProxy ready）"
 }
 
 # Runtime drain only — no config rewrite, no reload.
@@ -2968,10 +2986,10 @@ instance_recovery_worker() {
     case "$REASON" in
         max_conn|force_rotate|force)
             SKIP_HEALTHY_SHORTCUT=1
-            echo "==> [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}，与巡检失败同等：强制重连/重注册)"
+            log_verbose "==> [inst${INST_ID}] 后台复活 worker 启动 (reason=${REASON}，与巡检失败同等：强制重连/重注册)"
             ;;
         *)
-            echo "==> [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile${REASON:+, reason=$REASON})"
+            log_verbose "==> [inst${INST_ID}] 后台复活 worker 启动 (job pid via parent pidfile${REASON:+, reason=$REASON})"
             ;;
     esac
     print_health_summary
@@ -3011,7 +3029,7 @@ instance_recovery_worker() {
             exit 0
         fi
         if [ "$SKIP_HEALTHY_SHORTCUT" -eq 1 ]; then
-            echo "==> [inst${INST_ID}] MAX_CONN/强制轮转：跳过「仍健康只拉 SOCKS」，执行 WG 重连/重注册"
+            log_verbose "==> [inst${INST_ID}] MAX_CONN/强制轮转：跳过「仍健康只拉 SOCKS」，执行 WG 重连/重注册"
             # Only force the first cycle; after a full reconnect attempt, allow
             # normal healthy success so we don't loop reconnect forever while up.
             SKIP_HEALTHY_SHORTCUT=0
@@ -3102,15 +3120,15 @@ request_instance_recovery() {
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
     if [ -n "$REASON" ]; then
-        echo "==> [inst${INST_ID}] 拉起后台复活 worker（reason=${REASON}；排空/停 SOCKS/重连均在后台）..."
+        log_verbose "==> [inst${INST_ID}] 拉起后台复活 worker（reason=${REASON}；排空/停 SOCKS/重连均在后台）..."
     else
-        echo "==> [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
+        log_verbose "==> [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
     fi
     # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
     instance_recovery_worker "$INST_ID" "$REASON" &
     _rec_pid=$!
     echo "$_rec_pid" > "$_pid_file"
-    echo "==> [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
+    log_verbose "==> [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
     print_health_summary
 }
 
@@ -3310,7 +3328,7 @@ probe_instance_and_schedule_recovery() {
     if [ "$(get_instance_status "$INST_ID")" = "draining" ]; then
         if is_instance_recovering "$INST_ID"; then
             _busy=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            log_verbose "==> [inst${INST_ID}] draining，跳过巡检（排空中 $(format_scur_log "$_busy")）"
+            log_verbose "==> [inst${INST_ID}] draining，跳过巡检（排空中 $(format_scur_log "$_busy" "" "$INST_ID")）"
         else
             echo "==> [inst${INST_ID}] draining 但无 worker → 补拉后台复活（不巡检）"
             request_instance_recovery "$INST_ID"
@@ -3328,6 +3346,7 @@ probe_instance_and_schedule_recovery() {
     if is_log_verbose; then
         print_instance_health_probe_start "$INST_ID"
     fi
+    PROBE_ROUND_RAN=$((${PROBE_ROUND_RAN:-0} + 1))
     if run_instance_health_checks "$INST_ID"; then
         OLD_STATUS=$(get_instance_status "$INST_ID")
         case "$OLD_STATUS" in
@@ -3365,7 +3384,7 @@ probe_instance_and_schedule_recovery() {
         # MAX_CONN: enter drain even if busy; worker waits until idle (or INSTANCE_DRAIN_TIMEOUT if set).
         if instance_should_force_rotate_for_max_conn "$INST_ID"; then
             BUSY_NOW=$(count_instance_busy_clients "$INST_ID" 2>/dev/null || printf '?')
-            echo "==> [inst${INST_ID}] MAX_CONN_DURATION 到期($(format_scur_log "$BUSY_NOW")) → runtime drain，scur=0 后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
+            echo "==> [inst${INST_ID}] MAX_CONN_DURATION 到期($(format_scur_log "$BUSY_NOW" "" "$INST_ID")) → runtime drain，scur=0 后再重连（有 INSTANCE_DRAIN_TIMEOUT 才强制超时）"
             request_instance_recovery "$INST_ID" "max_conn"
             return 0
         fi
@@ -3373,6 +3392,7 @@ probe_instance_and_schedule_recovery() {
     fi
 
     echo "==> [inst${INST_ID}] ❌ 巡检失败 → runtime drain 停新连接，后台排空后复活"
+    PROBE_ROUND_FAIL=$((${PROBE_ROUND_FAIL:-0} + 1))
     request_instance_recovery "$INST_ID"
     return 0
 }
@@ -3400,12 +3420,13 @@ multi_periodic_monitor() {
     fi
 
     while true; do
+        PROBE_ROUND_RAN=0
+        PROBE_ROUND_FAIL=0
         for INST_ID in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
             probe_instance_and_schedule_recovery "$INST_ID"
 
-            # Fleet one-liner after each probe (健康 N/M + 复活/排空/busy)
-            print_health_summary
             if is_log_verbose; then
+                print_health_summary
                 # Per recovering inst: only scur+qcur while draining
                 for X in $(get_instance_ids "$WARP_INSTANCE_COUNT"); do
                     if is_instance_recovering "$X"; then
@@ -3413,7 +3434,7 @@ multi_periodic_monitor() {
                         case "$_st" in
                             draining)
                                 _busy=$(count_instance_busy_clients "$X" 2>/dev/null || printf '?')
-                                echo "==> [inst${X}] 复活进度: 排空中 status=draining $(format_scur_log "$_busy")"
+                                echo "==> [inst${X}] 复活进度: 排空中 status=draining $(format_scur_log "$_busy" "" "$X")"
                                 ;;
                             down)
                                 echo "==> [inst${X}] 复活进度: 重连/重注册中 status=down"
@@ -3428,6 +3449,8 @@ multi_periodic_monitor() {
             fi
             sleep "$HEALTH_STAGGER" & wait $!
         done
+        echo "==> 巡检一轮: 探测 ${PROBE_ROUND_RAN}/${WARP_INSTANCE_COUNT} 台，失败 ${PROBE_ROUND_FAIL}，健康 $(count_healthy_instances 2>/dev/null || printf '?')/${WARP_INSTANCE_COUNT}"
+        print_health_summary
     done
 }
 

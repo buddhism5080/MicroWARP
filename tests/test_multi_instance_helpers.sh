@@ -937,6 +937,7 @@ test_instance_drain_helpers() {
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
 
     # settle: scur=0 must stay 0 for N consecutive seconds
+    LOG_MODE=verbose
     INSTANCE_DRAIN_TIMEOUT=
     INSTANCE_DRAIN_SETTLE_SECONDS=2
     count_instance_busy_clients() { printf '0\n'; }
@@ -972,6 +973,7 @@ test_instance_drain_helpers() {
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
     rm -f "$CALLS"
     INSTANCE_DRAIN_SETTLE_SECONDS=0
+    LOG_MODE=simple
 
     # mark_instance_down / detach: runtime drain only — must NOT wait/stop (non-blocking).
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
@@ -1174,10 +1176,10 @@ EOF
         return 1
     }
     assert_eq "$(count_instance_busy_clients 1)" '3' 'count = scur+qcur from show stat'
-    assert_eq "$(get_scur_via)" 'stat' 'via=stat when show stat works'
-    assert_eq "$(format_scur_log 3)" 'scur=3 qcur=0 via=stat' 'log shows scur and qcur'
+    assert_eq "$(get_scur_via 1)" 'stat' 'via=stat when show stat works'
+    assert_eq "$(format_scur_log 3 '' 1)" 'scur=3 qcur=0 via=stat' 'log shows scur and qcur'
     assert_eq "$(count_instance_busy_clients 10)" '5' 'count inst10 scur 4 + qcur 1'
-    assert_eq "$(format_scur_log 5)" 'scur=4 qcur=1 via=stat' 'qcur is visible in log'
+    assert_eq "$(format_scur_log 5 '' 10)" 'scur=4 qcur=1 via=stat' 'qcur is visible in log'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
     haproxy_runtime_query() {
@@ -1191,13 +1193,13 @@ EOF
         return 1
     }
     assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'conn fallback is not used (no qcur)'
-    assert_eq "$(get_scur_via)" 'none' 'via=none without show stat'
+    assert_eq "$(get_scur_via 1)" 'none' 'via=none without show stat'
     unset -f haproxy_runtime_query 2>/dev/null || true
 
     haproxy_runtime_query() { return 1; }
     assert_eq "$(count_instance_busy_clients 1)" 'unknown' 'socket down is unknown not 0'
-    assert_eq "$(get_scur_via)" 'none' 'via=none when unread'
-    assert_eq "$(format_scur_log unknown)" 'scur=? qcur=? via=none' 'unread log is not a fake 0'
+    assert_eq "$(get_scur_via 1)" 'none' 'via=none when unread'
+    assert_eq "$(format_scur_log unknown '' 1)" 'scur=? qcur=? via=none' 'unread log is not a fake 0'
     unset -f haproxy_runtime_query 2>/dev/null || true
 }
 
