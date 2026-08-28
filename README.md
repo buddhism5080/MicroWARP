@@ -106,7 +106,8 @@ MicroWARP supports powerful environment variables to customize your setup while 
       - WARP_INSTANCES=1 # Number of in-container WARP tunnels (default 1, max 100). >1 enables single-port HAProxy LB over healthy instances only
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # If an instance stays offline this long, force re-register (default 7200=2h; 0=disable)
       - MAX_CONN_DURATION=0 # Multi-instance only: max continuous healthy uptime (seconds) per backend; when exceeded AND ready/up pool ≥ half, force offline + reconnect even if busy (default 0=disable; single-instance never rotates; skips when ready < half)
-      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
+      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 scur 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）
+      - INSTANCE_DRAIN_SETTLE_SECONDS=20 # scur 到 0 后再连续空闲这么多秒才停 SOCKS（默认 20；0=第一次 0 就停）。中途 scur>0 会重新等 0 再确认。不阻塞其它实例。
       - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # Optional egress-IP probe overrides (multi-source; first success wins per family; vendors interleaved):
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
@@ -133,7 +134,7 @@ MicroWARP supports powerful environment variables to customize your setup while 
 
 *(If an instance stays continuously offline for `CONFIG_STALE_OFFLINE_SECONDS` (default **7200** = 2 hours), MicroWARP treats its WARP config as stale: it skips further reconnect-only attempts and forces a new registration. The offline timer is persisted under the wireguard volume so container restarts do not reset it. Set `0` to disable.)*
 
-*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy **multi-instance** backend may stay continuously online. **Single-instance (`WARP_INSTANCES<=1`) never force-rotates** under this policy. On each multi-instance health probe, if uptime ≥ this value **and** ready/`up` instances are **not strictly below half** of `WARP_INSTANCES`, MicroWARP enters runtime **drain** first (even if sessions are live) so HAProxy stops **new** picks, then the background worker waits until that server's `scur` (plus `qcur`) is 0 — or until `INSTANCE_DRAIN_TIMEOUT` if set — before stopping SOCKS and reconnect. Idle is **HAProxy `show stat` scur**, not host `ss`. When the ready pool is already below half, MAX_CONN does **not** drain further.)*
+*(Set `MAX_CONN_DURATION` (seconds, default **0** = disabled) to cap how long a healthy **multi-instance** backend may stay continuously online. **Single-instance (`WARP_INSTANCES<=1`) never force-rotates** under this policy. On each multi-instance health probe, if uptime ≥ this value **and** ready/`up` instances are **not strictly below half** of `WARP_INSTANCES`, MicroWARP enters runtime **drain** first so HAProxy stops **new** picks, then the background worker waits until that server's `scur` (+ `qcur`) is 0 **and stays 0 for `INSTANCE_DRAIN_SETTLE_SECONDS` (default 20)**. If scur rises during the confirm window, it waits for 0 again and re-confirms. Idle is **HAProxy `show stat` scur**, not host `ss`. When the ready pool is already below half, MAX_CONN does **not** drain further.)*
 
 ### 🚀 Need an HTTP Proxy?
 
@@ -229,7 +230,8 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
       - WARP_INSTANCES=1 # 单容器内并行 WARP 隧道数量（默认 1，最大 100）。>1 时只暴露一个 SOCKS 端口，经 HAProxy 只负载到健康实例
       - CONFIG_STALE_OFFLINE_SECONDS=7200 # 连续离线超过该秒数则判定配置失效并强制重注册（默认 7200=2小时；0=关闭）
       - MAX_CONN_DURATION=0 # 仅多实例：每个后端最长连续健康在线秒数；超时且 ready 实例不少于一半时进入 drain 后重连（可有 busy；默认 0=关闭；单实例永不因本策略下线；ready 不足一半则跳过）
-      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 busy 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）。流式连接（WebSocket/SSE）将无限期等待直到空闲或客户端关闭——防止有限超时导致的中途断开。
+      - INSTANCE_DRAIN_TIMEOUT= # 多实例：踢出 LB 后等待 scur 排空再停 SOCKS（不设/空=一直等到空闲；0=立刻停；N=最多等 N 秒后强停）
+      - INSTANCE_DRAIN_SETTLE_SECONDS=20 # scur 到 0 后再连续空闲这么多秒才停 SOCKS（默认 20；0=第一次 0 就停）。中途 scur>0 会重新等 0 再确认。不阻塞其它实例。
       - SOCKS_UDP_PORT_BASE= # UDP ASSOCIATE 端口起点（默认=BIND_PORT）。instK 使用 BASE+K-1
       # 可选：出口 IP 多源探测（每栈按顺序试、成功即停；同厂商错开）：
       # - EGRESS_IP_V4_URLS=https://1.1.1.1/cdn-cgi/trace,https://api4.ipify.org,...,https://1.0.0.1/cdn-cgi/trace,...
@@ -256,7 +258,7 @@ MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功�
 >
 > 若某个实例**连续离线**超过 `CONFIG_STALE_OFFLINE_SECONDS`（默认 **7200 秒 = 2 小时**），会判定现有 WARP 配置失效：跳过“只重连”阶段，直接强制重新注册新配置。离线计时落在 wireguard volume 里，容器重启不会清零。设为 `0` 可关闭该策略。
 >
-> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制**多实例**每个后端最长连续健康在线时长。**单实例（`WARP_INSTANCES<=1`）不会因本策略下线/重连。** 多实例健康巡检时若已在线 ≥ 该值，**且当前 ready/`up` 实例数不少于一半**（`ready * 2 >= WARP_INSTANCES`），则**先 runtime drain**（停新连接，已有 TCP 留下），后台 worker 等该 server 的 HAProxy **`scur`（加 `qcur`）到 0**——若设置了 `INSTANCE_DRAIN_TIMEOUT` 则最多等该秒数后强停——再停 SOCKS/重连。空闲看的是 **HAProxy `show stat`，不是宿主机 `ss`**。**ready 池已不足一半时，不会再因 MAX_CONN 去 drain。**
+> 设置 `MAX_CONN_DURATION`（秒，默认 **0** = 关闭）可限制**多实例**每个后端最长连续健康在线时长。**单实例（`WARP_INSTANCES<=1`）不会因本策略下线/重连。** 到期且 ready 不少于一半时：**先 drain**，后台 worker 等 HAProxy **`scur` 到 0，再连续空闲 `INSTANCE_DRAIN_SETTLE_SECONDS`（默认 20）秒**才停 SOCKS/重连。确认期间 scur 又非 0，会重新等到 0 再确认。排空在该实例的后台 worker 里做，**不阻塞**其它实例。空闲看 **`show stat` scur，不是 `ss`**。**ready 不足一半时不再因 MAX_CONN drain。**
 
 ### 🚀 高级玩法：如何将其转换为 HTTP 代理？
 

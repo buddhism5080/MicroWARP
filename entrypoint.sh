@@ -41,6 +41,9 @@ MAX_CONN_DURATION="${MAX_CONN_DURATION:-0}"
 # Unset/empty = wait indefinitely until idle (IM-friendly; no force-kill on timeout).
 # 0 = stop SOCKS immediately. Positive N = max wait seconds then force stop.
 INSTANCE_DRAIN_TIMEOUT="${INSTANCE_DRAIN_TIMEOUT-}"
+# After scur hits 0, require this many consecutive idle seconds before stopping SOCKS.
+# Unset/empty/non-numeric → 20. 0 → stop at first scur=0 (no confirm).
+INSTANCE_DRAIN_SETTLE_SECONDS="${INSTANCE_DRAIN_SETTLE_SECONDS-20}"
 HEV_SOCKS5_BIN="${HEV_SOCKS5_BIN:-/usr/local/bin/hev-socks5-server}"
 SOCKS_UDP_PORT_BASE="${SOCKS_UDP_PORT_BASE:-}"
 WARP_INSTANCE_COUNT=1
@@ -526,6 +529,23 @@ get_instance_drain_timeout() {
     printf '%s\n' "$RAW"
 }
 
+# Seconds scur must stay 0 after first idle before SOCKS is stopped.
+# Unset/empty/non-numeric → 20. 0 → no confirm.
+get_instance_drain_settle_seconds() {
+    RAW=${INSTANCE_DRAIN_SETTLE_SECONDS-20}
+    case "$RAW" in
+        '')
+            printf '20\n'
+            ;;
+        *[!0-9]*)
+            printf '20\n'
+            ;;
+        *)
+            printf '%s\n' "$RAW"
+            ;;
+    esac
+}
+
 # Persist scur source across `COUNT=$(count_instance_busy_clients)` subshells.
 get_scur_via_file() {
     printf '%s\n' "${MICROWARP_SCUR_VIA_FILE:-${TMPDIR:-/tmp}/microwarp.scur.via}"
@@ -602,16 +622,19 @@ format_scur_log() {
     esac
 }
 
-# Wait until HAProxy scur/qcur for this server is 0 (call AFTER runtime drain).
+# Wait until HAProxy scur/qcur for this server is 0 (call AFTER runtime drain),
+# then require INSTANCE_DRAIN_SETTLE_SECONDS of consecutive scur=0 (default 20).
+# If scur rises during settle, wait for 0 again and re-confirm.
 # INSTANCE_DRAIN_TIMEOUT empty/unset → wait indefinitely (IM-friendly).
-# 0 → skip wait; positive N → force-stop after N seconds.
-# Returns 0 if drained idle, 1 if timed out (caller still stops SOCKS).
-# Unreadable scur → unknown → wait forever unless a timeout is set (never treat as 0).
+# 0 → skip wait; positive N → force-stop after N seconds (includes settle).
+# Unreadable scur → unknown → not 0.
+# Runs in the per-instance recovery worker — does not block other instances.
 wait_instance_drain() {
     local INST_ID="$1"
-    local TIMEOUT COUNT SLEPT SHOW
+    local TIMEOUT SETTLE COUNT SLEPT SHOW CONFIRMED
 
     TIMEOUT=$(get_instance_drain_timeout)
+    SETTLE=$(get_instance_drain_settle_seconds)
     # Explicit 0 only: empty TIMEOUT means infinite wait below.
     if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -le 0 ]; then
         echo "==> [inst${INST_ID}] INSTANCE_DRAIN_TIMEOUT=0，跳过连接排空，立即停服务"
@@ -629,10 +652,6 @@ wait_instance_drain() {
             COUNT=-1
             ;;
     esac
-    if [ "$COUNT" -eq 0 ]; then
-        echo "==> [inst${INST_ID}] 已无 busy 连接（$(format_scur_log 0)），可以停服务"
-        return 0
-    fi
 
     if [ "$COUNT" -lt 0 ]; then
         SHOW=$(format_scur_log "")
@@ -640,42 +659,85 @@ wait_instance_drain() {
         SHOW=$(format_scur_log "$COUNT")
     fi
     if [ -n "$TIMEOUT" ]; then
-        echo "==> [inst${INST_ID}] 复活进度: 开始排空 ${SHOW}，最长等待 ${TIMEOUT}s"
+        echo "==> [inst${INST_ID}] 复活进度: 开始排空 ${SHOW}，确认空闲 ${SETTLE}s，最长等待 ${TIMEOUT}s"
     else
-        echo "==> [inst${INST_ID}] 复活进度: 开始排空 ${SHOW}，无超时上限（等到空闲）"
+        echo "==> [inst${INST_ID}] 复活进度: 开始排空 ${SHOW}，确认空闲 ${SETTLE}s，无超时上限（等到空闲）"
     fi
+
     SLEPT=0
     while true; do
-        sleep 1
-        SLEPT=$((SLEPT + 1))
-        COUNT=$(count_instance_busy_clients "$INST_ID")
-        case "$COUNT" in
-            ''|*[!0-9]*) COUNT=-1 ;;
-        esac
-        if [ "$COUNT" -eq 0 ]; then
+        # Phase 1: wait until a readable scur=0.
+        while [ "$COUNT" -ne 0 ]; do
+            sleep 1
+            SLEPT=$((SLEPT + 1))
+            COUNT=$(count_instance_busy_clients "$INST_ID")
+            case "$COUNT" in
+                ''|*[!0-9]*) COUNT=-1 ;;
+            esac
+            if [ "$COUNT" -lt 0 ]; then
+                SHOW=$(format_scur_log "")
+            else
+                SHOW=$(format_scur_log "$COUNT")
+            fi
+            if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
+                echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
+                return 1
+            fi
+            if [ $((SLEPT % 5)) -eq 0 ]; then
+                if [ -n "$TIMEOUT" ]; then
+                    echo "==> [inst${INST_ID}] 复活进度: 排空中 ${SHOW}，已等待 ${SLEPT}s/${TIMEOUT}s"
+                else
+                    echo "==> [inst${INST_ID}] 复活进度: 排空中 ${SHOW}，已等待 ${SLEPT}s（无上限，等到空闲）"
+                fi
+                if [ $((SLEPT % 30)) -eq 0 ]; then
+                    print_health_summary 2>/dev/null || true
+                fi
+            fi
+        done
+
+        # Phase 2: scur=0. SETTLE=0 → stop now. Else require consecutive idle.
+        if [ "$SETTLE" -le 0 ]; then
             echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0)，已等待 ${SLEPT}s → 停 SOCKS"
             return 0
         fi
-        if [ "$COUNT" -lt 0 ]; then
-            SHOW=$(format_scur_log "")
-        else
-            SHOW=$(format_scur_log "$COUNT")
-        fi
-        if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
-            echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
-            return 1
-        fi
-        # Keep log noise low: every 5s.
-        if [ $((SLEPT % 5)) -eq 0 ]; then
-            if [ -n "$TIMEOUT" ]; then
-                echo "==> [inst${INST_ID}] 复活进度: 排空中 ${SHOW}，已等待 ${SLEPT}s/${TIMEOUT}s"
-            else
-                echo "==> [inst${INST_ID}] 复活进度: 排空中 ${SHOW}，已等待 ${SLEPT}s（无上限，等到空闲）"
+
+        echo "==> [inst${INST_ID}] 复活进度: $(format_scur_log 0)，开始确认空闲 ${SETTLE}s（期间非 0 则重新等）"
+        CONFIRMED=0
+        while [ "$CONFIRMED" -lt "$SETTLE" ]; do
+            sleep 1
+            SLEPT=$((SLEPT + 1))
+            CONFIRMED=$((CONFIRMED + 1))
+            COUNT=$(count_instance_busy_clients "$INST_ID")
+            case "$COUNT" in
+                ''|*[!0-9]*) COUNT=-1 ;;
+            esac
+            if [ -n "$TIMEOUT" ] && [ "$SLEPT" -ge "$TIMEOUT" ]; then
+                if [ "$COUNT" -lt 0 ]; then
+                    SHOW=$(format_scur_log "")
+                else
+                    SHOW=$(format_scur_log "$COUNT")
+                fi
+                echo "==> [inst${INST_ID}] 复活进度: 排空超时 ${TIMEOUT}s 仍 ${SHOW} → 强制停 SOCKS"
+                return 1
             fi
-            if [ $((SLEPT % 30)) -eq 0 ]; then
-                print_health_summary 2>/dev/null || true
+            if [ "$COUNT" -ne 0 ]; then
+                if [ "$COUNT" -lt 0 ]; then
+                    SHOW=$(format_scur_log "")
+                else
+                    SHOW=$(format_scur_log "$COUNT")
+                fi
+                echo "==> [inst${INST_ID}] 复活进度: 确认被打断 ${SHOW}（已确认 ${CONFIRMED}s/${SETTLE}s），重新等到 scur=0"
+                break
             fi
+            if [ $((CONFIRMED % 5)) -eq 0 ]; then
+                echo "==> [inst${INST_ID}] 复活进度: 确认空闲中 $(format_scur_log 0)，${CONFIRMED}s/${SETTLE}s"
+            fi
+        done
+        if [ "$COUNT" -eq 0 ] && [ "$CONFIRMED" -ge "$SETTLE" ]; then
+            echo "==> [inst${INST_ID}] 复活进度: 排空完成 $(format_scur_log 0) 已稳定 ${SETTLE}s，已等待 ${SLEPT}s → 停 SOCKS"
+            return 0
         fi
+        # scur rose or unread during settle → outer loop waits for 0 again.
     done
 }
 

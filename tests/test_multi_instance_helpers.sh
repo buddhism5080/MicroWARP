@@ -852,8 +852,18 @@ test_instance_online_duration_probe_log() {
 test_instance_drain_helpers() {
     local out calls
 
+    INSTANCE_DRAIN_SETTLE_SECONDS=0
     INSTANCE_DRAIN_TIMEOUT=''
     assert_eq "$(get_instance_drain_timeout)" '' 'blank drain timeout = infinite (no cap)'
+    assert_eq "$(get_instance_drain_settle_seconds)" '0' 'test override settle 0'
+
+    INSTANCE_DRAIN_SETTLE_SECONDS=
+    assert_eq "$(get_instance_drain_settle_seconds)" '20' 'blank settle defaults to 20'
+    INSTANCE_DRAIN_SETTLE_SECONDS=abc
+    assert_eq "$(get_instance_drain_settle_seconds)" '20' 'invalid settle defaults to 20'
+    INSTANCE_DRAIN_SETTLE_SECONDS=20
+    assert_eq "$(get_instance_drain_settle_seconds)" '20' 'explicit settle 20'
+    INSTANCE_DRAIN_SETTLE_SECONDS=0
 
     INSTANCE_DRAIN_TIMEOUT=0
     assert_eq "$(get_instance_drain_timeout)" '0' '0 disables drain wait'
@@ -869,11 +879,12 @@ test_instance_drain_helpers() {
     out=$(wait_instance_drain 1 2>&1) || true
     assert_contains "$out" 'INSTANCE_DRAIN_TIMEOUT=0' 'timeout 0 logs skip'
 
-    # already idle → immediate success
+    # already idle + settle 0 → success without waiting
     INSTANCE_DRAIN_TIMEOUT=5
+    INSTANCE_DRAIN_SETTLE_SECONDS=0
     count_instance_busy_clients() { printf '0\n'; }
     out=$(wait_instance_drain 3 2>&1)
-    assert_contains "$out" '已无 busy 连接' 'idle skips wait loop'
+    assert_contains "$out" '排空完成' 'idle + settle 0 completes'
     unset -f count_instance_busy_clients 2>/dev/null || true
 
     # busy then idle after one sleep
@@ -924,6 +935,43 @@ test_instance_drain_helpers() {
     out=$(wait_instance_drain 5 2>&1) || true
     assert_contains "$out" '排空超时' 'timeout forces stop path'
     unset -f count_instance_busy_clients sleep 2>/dev/null || true
+
+    # settle: scur=0 must stay 0 for N consecutive seconds
+    INSTANCE_DRAIN_TIMEOUT=
+    INSTANCE_DRAIN_SETTLE_SECONDS=2
+    count_instance_busy_clients() { printf '0\n'; }
+    sleep() { :; }
+    out=$(wait_instance_drain 6 2>&1)
+    assert_contains "$out" '开始确认空闲 2s' 'settle starts after scur=0'
+    assert_contains "$out" '已稳定 2s' 'settle requires consecutive idle'
+    unset -f count_instance_busy_clients sleep 2>/dev/null || true
+
+    # settle interrupted by scur>0 → wait for 0 again, then re-confirm
+    INSTANCE_DRAIN_SETTLE_SECONDS=2
+    CALLS=$(mktemp)
+    echo 0 > "$CALLS"
+    count_instance_busy_clients() {
+        local n
+        n=$(cat "$CALLS")
+        n=$((n + 1))
+        echo "$n" > "$CALLS"
+        # 1=initial 0 → enter settle
+        # 2=settle tick 1 → 2 (interrupt)
+        # 3+=wait/settle → 0
+        if [ "$n" -eq 2 ]; then
+            printf '2\n'
+        else
+            printf '0\n'
+        fi
+    }
+    sleep() { :; }
+    out=$(wait_instance_drain 7 2>&1)
+    assert_contains "$out" '确认被打断' 'scur rise aborts settle'
+    assert_contains "$out" '重新等到 scur=0' 're-wait after interrupt'
+    assert_contains "$out" '已稳定 2s' 're-confirm after second idle'
+    unset -f count_instance_busy_clients sleep 2>/dev/null || true
+    rm -f "$CALLS"
+    INSTANCE_DRAIN_SETTLE_SECONDS=0
 
     # mark_instance_down / detach: runtime drain only — must NOT wait/stop (non-blocking).
     local SAVED_STATE_DIR="$INSTANCE_STATE_DIR"
