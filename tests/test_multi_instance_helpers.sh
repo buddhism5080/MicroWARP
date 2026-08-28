@@ -1102,6 +1102,13 @@ EOF
     assert_eq "$n" '4 1' 'inst10 scur=4 qcur=1; FAILED check_status must not break parse'
     n=$(printf '%s\n' "$csv" | parse_haproxy_server_scur 2)
     assert_eq "$n" 'unknown' 'missing server is unknown not 0'
+    csv_empty=$(cat <<'EOF'
+# pxname,svname,qcur,qmax,scur,smax
+warp_pool,inst3,,, ,8
+EOF
+)
+    n=$(printf '%s\n' "$csv_empty" | parse_haproxy_server_scur 3)
+    assert_eq "$n" 'unknown' 'empty scur/qcur is unknown not 0'
 
     conn=$(cat <<'EOF'
 warp_pool/inst1: 0/0 idle, 3/4096 used, 0/0 conn

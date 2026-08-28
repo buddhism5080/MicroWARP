@@ -396,8 +396,17 @@ parse_haproxy_server_scur() {
         {
             gsub(/\r/, "")
             if ($pxi == px && $sv == want) {
-                print ($sc + 0) " " ($qc + 0)
-                found = 1
+                scv = $sc
+                qcv = $qc
+                gsub(/ /, "", scv)
+                gsub(/ /, "", qcv)
+                if (scv ~ /^[0-9]+$/ && qcv ~ /^[0-9]+$/) {
+                    print scv " " qcv
+                    found = 1
+                } else {
+                    print "unknown"
+                    found = 1
+                }
                 exit
             }
         }
