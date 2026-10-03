@@ -1316,6 +1316,21 @@ test_lb_today_admin_udp_and_health() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_socks_listen_sees_tcp6() {
+    if ! printf '%s\n' '   0: 0000000000000000FFFF0000021E420A:0438 00000000000000000000000000000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'ipv6 listen on 1080 must count' >&2
+        exit 1
+    fi
+    if ! printf '%s\n' '   0: 021E420A:0438 00000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'ipv4 listen on 1080 must count' >&2
+        exit 1
+    fi
+    if printf '%s\n' '   0: 0100007F:0050 00000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'port 80 must not count as 1080' >&2
+        exit 1
+    fi
+}
+
 test_wg_handshake_live_window() {
     local NOW=1700000000 EPOCH
     EPOCH=$(printf '%s\n' $'abc\t1699999900' | wg_handshake_epoch_from_text)
@@ -1342,6 +1357,7 @@ test_wg_handshake_live_window() {
 
 test_parse_haproxy_scur_and_conn
 test_wg_handshake_live_window
+test_socks_listen_sees_tcp6
 test_lb_today_admin_udp_and_health
 test_log_mode_simple_hides_repeat_summary
 test_default_instance_count_is_one

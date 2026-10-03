@@ -1545,12 +1545,11 @@ PY
     return 1
 }
 
-# HAProxy dials TCP 1080 in the inst netns. 1080 == 0x438.
-instance_socks_listening() {
-    local NS
-    NS=$(get_instance_netns_name "$1")
-    ip netns exec "$NS" cat /proc/net/tcp 2>/dev/null | awk '
-        NR > 1 {
+# /proc/net/tcp and tcp6 rows on stdin. 1080 == 0x438, LISTEN == 0A.
+# hev binds one AF_INET6 socket (IPV6_V6ONLY=0). Linux lists it only in tcp6.
+socks_tcp_table_has_listen() {
+    awk '
+        {
             n = split($2, a, ":")
             if (n >= 2 && (a[2] == "0438" || a[2] == "438") && $4 == "0A") {
                 found = 1
@@ -1558,6 +1557,13 @@ instance_socks_listening() {
         }
         END { exit !found }
     '
+}
+
+# HAProxy dials TCP 1080 in the inst netns.
+instance_socks_listening() {
+    local NS
+    NS=$(get_instance_netns_name "$1")
+    ip netns exec "$NS" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | socks_tcp_table_has_listen
 }
 
 wait_instance_socks_listen() {
