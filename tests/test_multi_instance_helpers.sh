@@ -1933,6 +1933,81 @@ test_lock_respects_live_pid_not_age() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_haproxy_cli_reuses_one_session() {
+    local SAVED SOCK LOG FAKE START END MS PID
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    SOCK="$INSTANCE_STATE_DIR/haproxy.sock"
+    LOG="$INSTANCE_STATE_DIR/fake.log"
+    FAKE="$INSTANCE_STATE_DIR/fake_socat.py"
+    HAPROXY_SOCK=$SOCK
+    HAPROXY_FAKE_LOG=$LOG
+    export HAPROXY_FAKE_LOG
+    python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1])' "$SOCK"
+    cat > "$FAKE" << 'PY'
+import os, sys
+log = os.environ["HAPROXY_FAKE_LOG"]
+with open(log, "a") as f:
+    f.write("start\n")
+interactive = False
+while True:
+    line = sys.stdin.readline()
+    if line == "":
+        break
+    line = line.rstrip("\n")
+    with open(log, "a") as f:
+        f.write("cmd:" + line + "\n")
+    if line == "prompt" and not interactive:
+        interactive = True
+        sys.stdout.write("master> ")
+        sys.stdout.flush()
+        continue
+    if "missing" in line:
+        sys.stdout.write("No such server.\n")
+    sys.stdout.write("\n")
+    if interactive:
+        sys.stdout.write("master> ")
+        sys.stdout.flush()
+    else:
+        break
+PY
+    : > "$LOG"
+    socat() { python3 "$FAKE"; }
+    START=$(date +%s%N)
+    haproxy_runtime_cmd "set server warp_svc1/inst2 state ready"
+    if haproxy_runtime_cmd "set server warp_svc1/inst9 state missing"; then
+        echo 'rejected set server must fail' >&2
+        exit 1
+    fi
+    END=$(date +%s%N)
+    MS=$(( (END - START) / 1000000 ))
+    if [ "$MS" -gt 1000 ]; then
+        echo "admin cli took ${MS}ms; still waiting on a timeout" >&2
+        exit 1
+    fi
+    assert_eq "$(grep -c '^start$' "$LOG")" '1' 'one admin session for two commands'
+    assert_eq "$(grep -c '^cmd:prompt$' "$LOG")" '1' 'prompt sent once'
+    assert_eq "$(grep -c '^cmd:set server' "$LOG")" '2' 'both set server commands reached the open session'
+    if grep -q 'socat -T2' entrypoint.sh; then
+        echo 'socat -T2 must not be used for the admin socket' >&2
+        exit 1
+    fi
+    if [ -f "$INSTANCE_STATE_DIR/haproxy.cli.socat" ]; then
+        PID=$(tr -d ' \n' < "$INSTANCE_STATE_DIR/haproxy.cli.socat" || true)
+        kill "$PID" 2>/dev/null || true
+    fi
+    if [ -f "$INSTANCE_STATE_DIR/haproxy.cli.pid" ]; then
+        PID=$(tr -d ' \n' < "$INSTANCE_STATE_DIR/haproxy.cli.pid" || true)
+        kill "$PID" 2>/dev/null || true
+    fi
+    unset -f socat
+    unset HAPROXY_SOCK HAPROXY_FAKE_LOG
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -1986,6 +2061,7 @@ test_admin_rotate_queue_keeps_next_request
 test_promote_sets_only_the_rotated_service
 test_async_rotates_overlap_across_services
 test_lock_respects_live_pid_not_age
+test_haproxy_cli_reuses_one_session
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
