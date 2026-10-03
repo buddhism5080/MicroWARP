@@ -231,6 +231,59 @@ is_instance_socks_running() {
     [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null
 }
 
+# One instance. A running SOCKS instance owns BASE+id-1. Stopping it deletes
+# only that DNAT. Other instances are not flushed.
+sync_instance_udp_forward() {
+    local INST_ID="$1"
+    local PORT NS_IP SNAP LINE REST DROP HAVE SPEC
+    NS_IP=$(get_instance_ns_ip "$INST_ID")
+    PORT=""
+    if is_instance_socks_running "$INST_ID"; then
+        PORT=$(get_instance_public_udp_port "$INST_ID")
+    fi
+    case "$PORT" in
+        ''|*[!0-9]*) PORT="" ;;
+    esac
+    ensure_udp_nat_chain
+    if [ -n "$PORT" ]; then
+        SPEC="-A MW_UDP -p udp -m udp --dport ${PORT} -j DNAT --to-destination ${NS_IP}:${PORT}"
+    else
+        SPEC=""
+    fi
+    SNAP=$(mktemp)
+    iptables -t nat -S MW_UDP > "$SNAP" 2>/dev/null || true
+    HAVE=0
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        case "$LINE" in
+            "-A MW_UDP "*) ;;
+            *) continue ;;
+        esac
+        if [ -n "$SPEC" ] && [ "$LINE" = "$SPEC" ]; then
+            HAVE=1
+            continue
+        fi
+        DROP=0
+        case "$LINE" in
+            *"--to-destination ${NS_IP}:"*) DROP=1 ;;
+        esac
+        if [ -n "$PORT" ]; then
+            case "$LINE" in
+                *"--dport ${PORT} "*) DROP=1 ;;
+            esac
+        fi
+        if [ "$DROP" -eq 1 ]; then
+            REST=${LINE#-A MW_UDP }
+            # shellcheck disable=SC2086
+            iptables -t nat -D MW_UDP $REST 2>/dev/null || true
+        fi
+    done < "$SNAP"
+    rm -f "$SNAP"
+    if [ -n "$PORT" ] && [ "$HAVE" -eq 0 ]; then
+        iptables -t nat -A MW_UDP -p udp -m udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
+    fi
+}
+
+# Full flush. Process start only.
 rebuild_instance_udp_forward() {
     local _iid PORT NS_IP
     ensure_udp_nat_chain
@@ -242,7 +295,7 @@ rebuild_instance_udp_forward() {
             ''|*[!0-9]*) continue ;;
         esac
         NS_IP=$(get_instance_ns_ip "$_iid")
-        iptables -t nat -A MW_UDP -p udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
+        iptables -t nat -A MW_UDP -p udp -m udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
     done
 }
 
@@ -1182,13 +1235,239 @@ EOF
         _sid=${ITEM%%:*}
         # status ignored for membership — always emit the server line
         ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-        printf '    server inst%s %s check inter 15s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+        printf '    server inst%s %s check inter 15s fastinter 1s downinter 1s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
     done
     IFS=$OLD_IFS
 }
 
 get_haproxy_sock() {
     printf '%s\n' "${HAPROXY_SOCK:-$INSTANCE_STATE_DIR/haproxy.sock}"
+}
+
+current_pid() {
+    CURRENT_PID=""
+    read CURRENT_PID _ < /proc/self/stat || CURRENT_PID=$$
+    case "$CURRENT_PID" in
+        ''|*[!0-9]*) CURRENT_PID=$$ ;;
+    esac
+}
+
+lock_dir_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
+}
+
+lock_dir_held() {
+    local D="$1"
+    local PID NOW MT AGE
+    if [ ! -d "$D" ]; then
+        return 1
+    fi
+    PID=""
+    if [ -f "${D}/pid" ]; then
+        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+    fi
+    if is_live_pid "$PID"; then
+        return 0
+    fi
+    if [ -z "$PID" ]; then
+        NOW=$(date +%s)
+        MT=$(lock_dir_mtime "$D")
+        case "$MT" in
+            ''|*[!0-9]*) MT=0 ;;
+        esac
+        AGE=$((NOW - MT))
+        if [ "$AGE" -lt 2 ]; then
+            return 0
+        fi
+    fi
+    rm -rf "$D"
+    return 1
+}
+
+acquire_mkdir_lock() {
+    local D="$1"
+    local GOT
+    mkdir -p "$(dirname "$D")" 2>/dev/null || true
+    current_pid
+    if mkdir "$D" 2>/dev/null; then
+        if ! printf '%s\n' "$CURRENT_PID" > "${D}/pid"; then
+            rm -rf "$D" 2>/dev/null || true
+            return 1
+        fi
+        GOT=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+        if [ "$GOT" = "$CURRENT_PID" ]; then
+            return 0
+        fi
+        return 1
+    fi
+    if lock_dir_held "$D"; then
+        return 1
+    fi
+    current_pid
+    if mkdir "$D" 2>/dev/null; then
+        if ! printf '%s\n' "$CURRENT_PID" > "${D}/pid"; then
+            rm -rf "$D" 2>/dev/null || true
+            return 1
+        fi
+        GOT=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+        if [ "$GOT" = "$CURRENT_PID" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+release_mkdir_lock() {
+    local D="$1"
+    local PID
+    if [ ! -d "$D" ]; then
+        return 0
+    fi
+    PID=""
+    if [ -f "${D}/pid" ]; then
+        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+    fi
+    current_pid
+    if [ "$PID" = "$CURRENT_PID" ]; then
+        rm -rf "$D"
+    fi
+}
+
+# One HAProxy admin session for the whole process. Interactive mode (prompt)
+# keeps the socket open. A command is done when the next "> " prompt arrives,
+# not when the connection closes and not after an idle timeout.
+haproxy_cli_in() { printf '%s/haproxy.cli.in\n' "$INSTANCE_STATE_DIR"; }
+haproxy_cli_out() { printf '%s/haproxy.cli.out\n' "$INSTANCE_STATE_DIR"; }
+haproxy_cli_pid_file() { printf '%s/haproxy.cli.pid\n' "$INSTANCE_STATE_DIR"; }
+haproxy_cli_socat_pid_file() { printf '%s/haproxy.cli.socat\n' "$INSTANCE_STATE_DIR"; }
+haproxy_cli_ready_file() { printf '%s/haproxy.cli.ready\n' "$INSTANCE_STATE_DIR"; }
+
+haproxy_cli_bridge() {
+    local SOCK="$1"
+    local IN OUT SP
+    IN=$(haproxy_cli_in)
+    OUT=$(haproxy_cli_out)
+    rm -f "$IN" "$OUT"
+    mkfifo "$IN" "$OUT"
+    # Hold both ends so a client closing its fifo fd does not EOF socat.
+    exec 3<>"$IN"
+    exec 4<>"$OUT"
+    printf '1\n' > "$(haproxy_cli_ready_file)"
+    socat "UNIX-CONNECT:${SOCK}" - <&3 >&4 &
+    SP=$!
+    printf '%s\n' "$SP" > "$(haproxy_cli_socat_pid_file)"
+    wait "$SP" || true
+    rm -f "$(haproxy_cli_ready_file)" "$(haproxy_cli_socat_pid_file)"
+}
+
+haproxy_cli_stop() {
+    local PID SP
+    PID=""
+    SP=""
+    if [ -f "$(haproxy_cli_pid_file)" ]; then
+        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
+    fi
+    if [ -f "$(haproxy_cli_socat_pid_file)" ]; then
+        SP=$(tr -d ' \n\r\t' < "$(haproxy_cli_socat_pid_file)" 2>/dev/null || true)
+    fi
+    if is_live_pid "$SP"; then
+        kill "$SP" 2>/dev/null || true
+    fi
+    if is_live_pid "$PID"; then
+        kill "$PID" 2>/dev/null || true
+    fi
+    rm -f "$(haproxy_cli_pid_file)" "$(haproxy_cli_socat_pid_file)" "$(haproxy_cli_ready_file)"
+}
+
+haproxy_cli_alive() {
+    local PID
+    PID=""
+    if [ -f "$(haproxy_cli_pid_file)" ]; then
+        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
+    fi
+    is_live_pid "$PID" && [ -p "$(haproxy_cli_in)" ] && [ -p "$(haproxy_cli_out)" ]
+}
+
+haproxy_cli_read_until_prompt() {
+    local CHUNK BUF TAIL
+    HAPROXY_CLI_TEXT=""
+    BUF=""
+    exec 8< "$(haproxy_cli_out)" || return 1
+    while true; do
+        # Trailing x keeps a newline read by dd from being eaten by $( ).
+        CHUNK=$(dd bs=1 count=1 <&8 2>/dev/null || true; printf x)
+        CHUNK=${CHUNK%x}
+        if [ -z "$CHUNK" ]; then
+            exec 8<&-
+            return 1
+        fi
+        BUF="${BUF}${CHUNK}"
+        TAIL=${BUF##*
+}
+        case "$TAIL" in
+            '> '|*'> ')
+                HAPROXY_CLI_TEXT=${BUF%"$TAIL"}
+                exec 8<&-
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Open the session if needed. `prompt` is sent once; a second one would close it.
+haproxy_cli_session() {
+    local SOCK PID I
+    SOCK=$(get_haproxy_sock)
+    if [ ! -S "$SOCK" ]; then
+        return 1
+    fi
+    if ! haproxy_cli_alive; then
+        haproxy_cli_stop
+        haproxy_cli_bridge "$SOCK" &
+        PID=$!
+        printf '%s\n' "$PID" > "$(haproxy_cli_pid_file)"
+        I=0
+        while [ ! -f "$(haproxy_cli_ready_file)" ]; do
+            I=$((I + 1))
+            if [ "$I" -gt 100 ]; then
+                return 1
+            fi
+            if ! is_live_pid "$PID"; then
+                return 1
+            fi
+            sleep 0.01
+        done
+        printf 'prompt\n' > "$(haproxy_cli_in)" || return 1
+        haproxy_cli_read_until_prompt || return 1
+    fi
+    return 0
+}
+
+
+# One command on the long-lived admin session. Reply is in HAPROXY_CLI_TEXT.
+# Does not treat the word "failed" as an error (show stat CSV contains it).
+haproxy_cli_exchange() {
+    local CMD="$1"
+    local LOCK="${INSTANCE_STATE_DIR}/haproxy.cli.lock.d"
+    HAPROXY_CLI_TEXT=""
+    if ! acquire_mkdir_lock "$LOCK"; then
+        return 1
+    fi
+    if ! haproxy_cli_session; then
+        release_mkdir_lock "$LOCK" || true
+        return 1
+    fi
+    if ! printf '%s\n' "$CMD" > "$(haproxy_cli_in)"; then
+        release_mkdir_lock "$LOCK" || true
+        return 1
+    fi
+    if ! haproxy_cli_read_until_prompt; then
+        release_mkdir_lock "$LOCK" || true
+        haproxy_cli_stop
+        return 1
+    fi
+    release_mkdir_lock "$LOCK" || true
+    return 0
 }
 
 # Send one CLI command to the master stats socket. No reload.
@@ -1217,7 +1496,10 @@ haproxy_runtime_query() {
     fi
 
     if command -v socat >/dev/null 2>&1; then
-        OUT=$(printf '%s\n' "$CMD" | socat -T2 STDIO "UNIX-CONNECT:${SOCK}" 2>/dev/null) || return 1
+        if ! haproxy_cli_exchange "$CMD"; then
+            return 1
+        fi
+        OUT=$HAPROXY_CLI_TEXT
         case "$OUT" in
             *'Unknown command'*|*'No such server'*|*'No such backend'*)
                 return 1
@@ -1259,6 +1541,35 @@ PY
     return 1
 }
 
+# HAProxy dials TCP 1080 in the inst netns. 1080 == 0x438.
+instance_socks_listening() {
+    local NS
+    NS=$(get_instance_netns_name "$1")
+    ip netns exec "$NS" cat /proc/net/tcp 2>/dev/null | awk '
+        NR > 1 {
+            n = split($2, a, ":")
+            if (n >= 2 && (a[2] == "0438" || a[2] == "438") && $4 == "0A") {
+                found = 1
+            }
+        }
+        END { exit !found }
+    '
+}
+
+wait_instance_socks_listen() {
+    local INST_ID="$1"
+    local I=0
+    while [ "$I" -lt 50 ]; do
+        if instance_socks_listening "$INST_ID"; then
+            return 0
+        fi
+        I=$((I + 1))
+        sleep 0.02
+    done
+    echo "==> [inst${INST_ID}] [WARN] 内部 SOCKS 1080 尚未监听" >&2
+    return 1
+}
+
 # Admin state: ready | drain | maint  (HAProxy official runtime API — no reload).
 haproxy_set_server_state() {
     local INST_ID="$1"
@@ -1284,6 +1595,10 @@ haproxy_set_server_state() {
                 ;;
             ready)
                 haproxy_runtime_cmd "enable health warp_pool/inst${INST_ID}" || true
+                # state ready does not clear a failed check. The check waits 15s.
+                if instance_socks_listening "$INST_ID"; then
+                    haproxy_runtime_cmd "set server warp_pool/inst${INST_ID} health up" || true
+                fi
                 ;;
         esac
         return 0
@@ -2355,6 +2670,8 @@ enable_host_forwarding() {
         || iptables -t nat -A POSTROUTING -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null \
         || true
     ensure_udp_nat_chain
+    # Stale DNAT from a previous process only. Start/stop never flushes this chain.
+    iptables -t nat -F MW_UDP 2>/dev/null || true
 }
 
 destroy_instance_netns() {
@@ -2640,7 +2957,7 @@ stop_instance_socks() {
         rm -f "$PID_FILE"
     fi
     rm -f "$(get_instance_udp_port_file "$INST_ID")" "$(get_instance_socks_conf_path "$INST_ID")"
-    rebuild_instance_udp_forward
+    sync_instance_udp_forward "$INST_ID"
 }
 
 start_instance_socks() {
@@ -2661,7 +2978,8 @@ start_instance_socks() {
                 CUR=$(tr -d '\n' < "$(get_instance_udp_port_file "$INST_ID")")
             fi
             if [ "$CUR" = "$UDP_PORT" ]; then
-                rebuild_instance_udp_forward
+                sync_instance_udp_forward "$INST_ID"
+                wait_instance_socks_listen "$INST_ID" || true
                 return 0
             fi
             echo "==> [inst${INST_ID}] SOCKS UDP 端口 ${CUR:-?} → ${UDP_PORT}，重启 hev"
@@ -2683,7 +3001,8 @@ start_instance_socks() {
     ip netns exec "$NS_NAME" "$BIN" "$CONF" > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
     printf '%s\n' "$UDP_PORT" > "$(get_instance_udp_port_file "$INST_ID")"
-    rebuild_instance_udp_forward
+    sync_instance_udp_forward "$INST_ID"
+    wait_instance_socks_listen "$INST_ID" || true
 }
 
 ns_ensure_trace_ip() {

@@ -1231,7 +1231,93 @@ test_log_mode_simple_hides_repeat_summary() {
     rm -f "$STATE"
 }
 
+test_lb_today_admin_udp_and_health() {
+    local SAVED LOG RULES
+    if grep -q 'socat -T2' entrypoint.sh; then
+        echo 'socat -T2 must not be used for the admin socket' >&2
+        exit 1
+    fi
+    if ! grep -q 'downinter 1s' entrypoint.sh; then
+        echo 'a down server must be rechecked in 1s' >&2
+        exit 1
+    fi
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/ipt.log"
+    RULES="$INSTANCE_STATE_DIR/rules"
+    eval "$(declare -f ensure_udp_nat_chain | sed '1s/^ensure_udp_nat_chain/_saved_ensure_udp_nat_chain/')"
+    eval "$(declare -f is_instance_socks_running | sed '1s/^is_instance_socks_running/_saved_is_instance_socks_running/')"
+    eval "$(declare -f get_instance_ns_ip | sed '1s/^get_instance_ns_ip/_saved_get_instance_ns_ip/')"
+    eval "$(declare -f get_instance_public_udp_port | sed '1s/^get_instance_public_udp_port/_saved_get_instance_public_udp_port/')"
+    eval "$(declare -f haproxy_runtime_cmd | sed '1s/^haproxy_runtime_cmd/_saved_haproxy_runtime_cmd/')"
+    eval "$(declare -f instance_socks_listening | sed '1s/^instance_socks_listening/_saved_instance_socks_listening/')"
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1080 -j DNAT --to-destination 10.66.1.2:1080' > "$RULES"
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1081 -j DNAT --to-destination 10.66.2.2:1081' >> "$RULES"
+    iptables() {
+        printf '%s\n' "$*" >> "$LOG"
+        if [ "$1" = "-t" ] && [ "$3" = "-S" ]; then
+            cat "$RULES"
+        fi
+        return 0
+    }
+    ensure_udp_nat_chain() { return 0; }
+    is_instance_socks_running() { return 0; }
+    get_instance_ns_ip() { printf '10.66.3.2\n'; }
+    get_instance_public_udp_port() { printf '1082\n'; }
+    : > "$LOG"
+    sync_instance_udp_forward 3
+    if grep -q -- '-F' "$LOG"; then
+        echo 'one instance sync flushed MW_UDP' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    if grep -q '1080' "$LOG" || grep -q '1081' "$LOG"; then
+        echo 'sync touched another instance port' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    grep -q -- '-A MW_UDP -p udp -m udp --dport 1082 -j DNAT --to-destination 10.66.3.2:1082' "$LOG"
+    unset -f iptables ensure_udp_nat_chain is_instance_socks_running get_instance_ns_ip get_instance_public_udp_port
+
+    LOG="$INSTANCE_STATE_DIR/cli.log"
+    : > "$LOG"
+    haproxy_runtime_cmd() { printf '%s\n' "$1" >> "$LOG"; return 0; }
+    instance_socks_listening() { return 0; }
+    haproxy_set_server_state 4 ready >/dev/null
+    grep -q 'enable health warp_pool/inst4' "$LOG"
+    grep -q 'set server warp_pool/inst4 health up' "$LOG"
+    : > "$LOG"
+    instance_socks_listening() { return 1; }
+    haproxy_set_server_state 4 ready >/dev/null
+    if grep -q 'health up' "$LOG"; then
+        echo 'closed socks must not be forced up' >&2
+        exit 1
+    fi
+    grep -q 'enable health warp_pool/inst4' "$LOG"
+    : > "$LOG"
+    instance_socks_listening() { return 0; }
+    haproxy_set_server_state 4 drain >/dev/null
+    if grep -q 'health up' "$LOG"; then
+        echo 'drain must not force health up' >&2
+        exit 1
+    fi
+    grep -q 'disable health warp_pool/inst4' "$LOG"
+    unset -f iptables ensure_udp_nat_chain is_instance_socks_running get_instance_ns_ip get_instance_public_udp_port haproxy_runtime_cmd instance_socks_listening
+    eval "$(declare -f _saved_ensure_udp_nat_chain | sed '1s/^_saved_ensure_udp_nat_chain/ensure_udp_nat_chain/')"
+    eval "$(declare -f _saved_is_instance_socks_running | sed '1s/^_saved_is_instance_socks_running/is_instance_socks_running/')"
+    eval "$(declare -f _saved_get_instance_ns_ip | sed '1s/^_saved_get_instance_ns_ip/get_instance_ns_ip/')"
+    eval "$(declare -f _saved_get_instance_public_udp_port | sed '1s/^_saved_get_instance_public_udp_port/get_instance_public_udp_port/')"
+    eval "$(declare -f _saved_haproxy_runtime_cmd | sed '1s/^_saved_haproxy_runtime_cmd/haproxy_runtime_cmd/')"
+    eval "$(declare -f _saved_instance_socks_listening | sed '1s/^_saved_instance_socks_listening/instance_socks_listening/')"
+    unset -f _saved_ensure_udp_nat_chain _saved_is_instance_socks_running _saved_get_instance_ns_ip _saved_get_instance_public_udp_port _saved_haproxy_runtime_cmd _saved_instance_socks_listening
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_parse_haproxy_scur_and_conn
+test_lb_today_admin_udp_and_health
 test_log_mode_simple_hides_repeat_summary
 test_default_instance_count_is_one
 test_explicit_instance_count
