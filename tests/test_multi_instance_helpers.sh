@@ -23,6 +23,7 @@ else:
     raise SystemExit('entrypoint marker not found')
 PY
 )
+eval "$(declare -f haproxy_set_server_state | sed '1s/^haproxy_set_server_state/_orig_haproxy_set_server_state/')"
 
 assert_eq() {
     local actual=$1
@@ -2096,6 +2097,45 @@ PY
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_ready_forces_health_up_when_socks_listens() {
+    local SAVED LOG
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/cli.log"
+    : > "$LOG"
+    eval "$(declare -f _orig_haproxy_set_server_state | sed '1s/^_orig_haproxy_set_server_state/haproxy_set_server_state/')"
+    eval "$(declare -f haproxy_runtime_cmd | sed '1s/^haproxy_runtime_cmd/_saved_haproxy_runtime_cmd/')"
+    eval "$(declare -f instance_socks_listening | sed '1s/^instance_socks_listening/_saved_instance_socks_listening/')"
+    haproxy_runtime_cmd() { printf '%s\n' "$1" >> "$LOG"; return 0; }
+    instance_socks_listening() { return 0; }
+    haproxy_set_server_state 3 ready 2 >/dev/null
+    assert_eq "$(sed -n '1p' "$LOG")" 'set server warp_svc2/inst3 health up' 'listening spare is forced up before ready'
+    assert_eq "$(sed -n '2p' "$LOG")" 'set server warp_svc2/inst3 state ready' 'ready follows health up'
+    : > "$LOG"
+    instance_socks_listening() { return 1; }
+    haproxy_set_server_state 3 ready 2 >/dev/null
+    assert_eq "$(tr -d '\n' < "$LOG")" 'set server warp_svc2/inst3 state ready' 'closed socks is not forced up'
+    : > "$LOG"
+    instance_socks_listening() { return 0; }
+    haproxy_set_server_state 3 drain 2 >/dev/null
+    if grep -q 'health up' "$LOG"; then
+        echo 'drain must not force health up' >&2
+        exit 1
+    fi
+    if ! grep -q 'downinter 1s' entrypoint.sh; then
+        echo 'a down server must be rechecked in 1s' >&2
+        exit 1
+    fi
+    unset -f haproxy_runtime_cmd instance_socks_listening
+    eval "$(declare -f _saved_haproxy_runtime_cmd | sed '1s/^_saved_haproxy_runtime_cmd/haproxy_runtime_cmd/')"
+    eval "$(declare -f _saved_instance_socks_listening | sed '1s/^_saved_instance_socks_listening/instance_socks_listening/')"
+    unset -f _saved_haproxy_runtime_cmd _saved_instance_socks_listening
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -2151,6 +2191,7 @@ test_async_rotates_overlap_across_services
 test_lock_respects_live_pid_not_age
 test_udp_forward_touches_only_the_changed_rule
 test_haproxy_cli_reuses_one_session
+test_ready_forces_health_up_when_socks_listens
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window

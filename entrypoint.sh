@@ -1481,7 +1481,7 @@ EOF
             [ -n "$ITEM" ] || continue
             _sid=${ITEM%%:*}
             ENDPOINT=$(get_instance_socks_endpoint "$_sid")
-            printf '    server inst%s %s check inter 15s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
+            printf '    server inst%s %s check inter 15s fastinter 1s downinter 1s fall 2 rise 1\n' "$_sid" "$ENDPOINT"
         done
         IFS=$OLD_IFS
     done
@@ -1636,7 +1636,39 @@ haproxy_runtime_cmd() {
     return 0
 }
 
+# HAProxy dials TCP 1080 in the inst netns. 1080 == 0x438.
+instance_socks_listening() {
+    local NS
+    NS=$(get_instance_netns_name "$1")
+    ip netns exec "$NS" cat /proc/net/tcp 2>/dev/null | awk '
+        NR > 1 {
+            n = split($2, a, ":")
+            if (n >= 2 && (a[2] == "0438" || a[2] == "438") && $4 == "0A") {
+                found = 1
+            }
+        }
+        END { exit !found }
+    '
+}
+
+wait_instance_socks_listen() {
+    local INST_ID="$1"
+    local I=0
+    while [ "$I" -lt 50 ]; do
+        if instance_socks_listening "$INST_ID"; then
+            return 0
+        fi
+        I=$((I + 1))
+        sleep 0.02
+    done
+    echo "==> [inst${INST_ID}] [WARN] 内部 SOCKS 1080 尚未监听" >&2
+    return 1
+}
+
 # Admin state: ready | drain | maint  (HAProxy official runtime API — no reload).
+# `state ready` does not clear a failed health check. Checks are every 15s, so
+# rotate would return OK while HAProxy still refuses the port. If SOCKS is
+# already listening, force health up before ready.
 haproxy_set_server_state() {
     local INST_ID="$1"
     local STATE="$2"
@@ -1657,6 +1689,14 @@ haproxy_set_server_state() {
         TARGETS=$(get_proxy_service_ids)
     fi
     for SVC_ID in $TARGETS; do
+        if [ "$STATE" = ready ] && instance_socks_listening "$INST_ID"; then
+            CMD="set server warp_svc${SVC_ID}/inst${INST_ID} health up"
+            if haproxy_runtime_cmd "$CMD"; then
+                echo "==> [inst${INST_ID}] HAProxy warp_svc${SVC_ID} health → up（不等 15s 检查）"
+            else
+                echo "==> [inst${INST_ID}] [WARN] HAProxy warp_svc${SVC_ID} health up 失败"
+            fi
+        fi
         CMD="set server warp_svc${SVC_ID}/inst${INST_ID} state ${STATE}"
         if haproxy_runtime_cmd "$CMD"; then
             echo "==> [inst${INST_ID}] HAProxy warp_svc${SVC_ID} state → ${STATE}（无 reload）"
@@ -3897,6 +3937,7 @@ start_instance_socks() {
             fi
             if [ "$CUR" = "$UDP_PORT" ]; then
                 sync_instance_udp_forward "$INST_ID"
+                wait_instance_socks_listen "$INST_ID" || true
                 return 0
             fi
             echo "==> [inst${INST_ID}] SOCKS UDP 端口 ${CUR:-?} → ${UDP_PORT}，重启 hev"
@@ -3919,6 +3960,7 @@ start_instance_socks() {
     echo $! > "$PID_FILE"
     printf '%s\n' "$UDP_PORT" > "$(get_instance_udp_port_file "$INST_ID")"
     sync_instance_udp_forward "$INST_ID"
+    wait_instance_socks_listen "$INST_ID" || true
 }
 
 ns_ensure_trace_ip() {
