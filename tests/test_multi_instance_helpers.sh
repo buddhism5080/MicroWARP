@@ -1316,7 +1316,32 @@ test_lb_today_admin_udp_and_health() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_wg_handshake_live_window() {
+    local NOW=1700000000 EPOCH
+    EPOCH=$(printf '%s\n' $'abc\t1699999900' | wg_handshake_epoch_from_text)
+    assert_eq "$EPOCH" '1699999900' 'latest handshake epoch'
+    EPOCH=$(printf '%s\n' $'abc\t0\ndef\t1699999950' | wg_handshake_epoch_from_text)
+    assert_eq "$EPOCH" '1699999950' 'ignore a zero handshake'
+    if wg_handshake_is_live 0 "$NOW"; then
+        echo 'epoch 0 is not connected' >&2
+        exit 1
+    fi
+    if ! wg_handshake_is_live $((NOW - 10)) "$NOW"; then
+        echo 'a fresh handshake is connected' >&2
+        exit 1
+    fi
+    if wg_handshake_is_live $((NOW - 181)) "$NOW"; then
+        echo 'a handshake older than 3 minutes is dead' >&2
+        exit 1
+    fi
+    if ! grep -q 'while \[ "$I" -lt 5 \]' entrypoint.sh; then
+        echo 'handshake wait must cap at 1s' >&2
+        exit 1
+    fi
+}
+
 test_parse_haproxy_scur_and_conn
+test_wg_handshake_live_window
 test_lb_today_admin_udp_and_health
 test_log_mode_simple_hides_repeat_summary
 test_default_instance_count_is_one
