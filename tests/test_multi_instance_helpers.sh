@@ -987,8 +987,10 @@ test_instance_drain_helpers() {
     assert_contains "$out" 'drain_wait' 'background helper waits drain'
     assert_contains "$out" 'stop_socks' 'background helper stops socks'
     assert_contains "$out" 'status:down' 'status down while restarting'
-    assert_contains "$out" 'state:maint' 'runtime maint while restarting'
-    assert_eq "$(grep -c 'state:maint' "$ORDER_LOG")" '1' 'maint only the associated backend'
+    if [[ "$out" == *state:maint* ]]; then
+        echo "drain_and_stop must not set maint after drain: $out" >&2
+        exit 1
+    fi
     if [[ "$out" == *reload* ]]; then
         echo "drain_and_stop must not reload haproxy: $out" >&2
         exit 1
@@ -1099,10 +1101,10 @@ test_haproxy_desired_state_single_active() {
     set_instance_status 2 up
     set_instance_status 3 draining
     assert_eq "$(haproxy_desired_state_for_instance 2)" 'ready' 'primary up → ready'
-    assert_eq "$(haproxy_desired_state_for_instance 1)" 'maint' 'standby up → maint (not in any service ready set)'
+    assert_eq "$(haproxy_desired_state_for_instance 1)" 'drain' 'standby up → drain'
     assert_eq "$(haproxy_desired_state_for_instance 3)" 'drain' 'draining → drain'
     set_instance_status 1 down
-    assert_eq "$(haproxy_desired_state_for_instance 1)" 'maint' 'down → maint'
+    assert_eq "$(haproxy_desired_state_for_instance 1)" 'drain' 'down → drain'
     unset -f mkdir 2>/dev/null || true
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
@@ -1459,9 +1461,9 @@ test_haproxy_desired_state_per_service() {
     set_instance_status 2 up
     set_instance_status 3 up
     assert_eq "$(haproxy_desired_state_for_instance 2 1)" 'ready' 'inst2 ready only on svc1'
-    assert_eq "$(haproxy_desired_state_for_instance 2 2)" 'maint' 'inst2 maint on svc2'
+    assert_eq "$(haproxy_desired_state_for_instance 2 2)" 'drain' 'inst2 drain on svc2'
     assert_eq "$(haproxy_desired_state_for_instance 1 2)" 'ready' 'inst1 ready on svc2'
-    assert_eq "$(haproxy_desired_state_for_instance 3 1)" 'maint' 'unassigned up is maint on service backends'
+    assert_eq "$(haproxy_desired_state_for_instance 3 1)" 'drain' 'unassigned up is drain on service backends'
     set_instance_status 2 draining
     assert_eq "$(haproxy_desired_state_for_instance 2 1)" 'drain' 'old svc assignment draining'
     unset -f mkdir 2>/dev/null || true

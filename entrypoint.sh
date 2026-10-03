@@ -776,14 +776,12 @@ wait_instance_drain() {
 }
 
 # After runtime drain: wait for idle (or timeout), then stop internal SOCKS.
-# Servers stay in HAProxy config permanently; admin state goes to maint until revive.
+# HAProxy stays drain. A follow-up maint would not change who gets new connections.
 drain_and_stop_instance_socks() {
     local INST_ID="$1"
     wait_instance_drain "$INST_ID" || true
     stop_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "down"
-    # maint only the backend that was ready/drain. Others are already maint.
-    haproxy_set_associated_state "$INST_ID" "maint" || true
 }
 
 # True (0) when healthy instances are strictly less than half of WARP_INSTANCE_COUNT.
@@ -2552,46 +2550,33 @@ release_rotate_lock() {
 haproxy_desired_state_for_instance() {
     local INST_ID="$1"
     local SVC_ID="${2:-}"
-    local STATUS OWNER DRAIN_SVC
+    local STATUS OWNER
     STATUS=$(get_instance_status "$INST_ID")
     OWNER=$(get_instance_assigned_service "$INST_ID")
-    DRAIN_SVC=$(get_instance_drain_service "$INST_ID")
     case "$STATUS" in
         draining)
-            if [ -n "$SVC_ID" ]; then
-                if [ -n "$OWNER" ] && [ "$OWNER" = "$SVC_ID" ]; then
-                    printf 'drain\n'
-                elif [ -n "$DRAIN_SVC" ] && [ "$DRAIN_SVC" = "$SVC_ID" ]; then
-                    printf 'drain\n'
-                else
-                    printf 'maint\n'
-                fi
-            else
-                printf 'drain\n'
-            fi
+            # Non-ready backends stay drain. Only the service with live TCP
+            # must be drain; the others already are.
+            printf 'drain\n'
             ;;
         up)
             if [ -n "$SVC_ID" ]; then
                 if [ -n "$OWNER" ] && [ "$OWNER" = "$SVC_ID" ]; then
                     printf 'ready\n'
-                elif [ -n "$DRAIN_SVC" ] && [ "$DRAIN_SVC" = "$SVC_ID" ]; then
-                    # Just unbound: keep existing TCP until detach flips status=draining.
-                    printf 'drain\n'
                 else
-                    printf 'maint\n'
+                    # Assigned elsewhere, or just unbound: not selected.
+                    printf 'drain\n'
                 fi
             else
                 if [ -n "$OWNER" ] && [ "$OWNER" = "1" ]; then
                     printf 'ready\n'
-                elif [ -n "$DRAIN_SVC" ]; then
-                    printf 'drain\n'
                 else
-                    printf 'maint\n'
+                    printf 'drain\n'
                 fi
             fi
             ;;
         *)
-            printf 'maint\n'
+            printf 'drain\n'
             ;;
     esac
 }
@@ -2633,7 +2618,7 @@ promote_service_instance() {
     clear_instance_drain_service "$NEW"
     set_service_assigned_instance "$SID" "$NEW"
     start_instance_socks "$NEW"
-    # Only this service changes. Other backends are already maint and stay there.
+    # Only this service changes. Other backends stay drain.
     haproxy_set_server_state "$NEW" ready "$SID" || true
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         haproxy_set_server_state "$OLD" drain "$SID" || true
@@ -3763,8 +3748,8 @@ claim_first_unassigned_service() {
     printf ''
 }
 
-# Service that currently has this inst ready or drain. Empty when every
-# backend is already maint (unassigned standby).
+# Service that currently has this inst ready or drain. Empty when it is
+# already drain on every backend (unassigned standby).
 haproxy_associated_service() {
     local SID
     SID=$(get_instance_drain_service "$1")
@@ -3788,20 +3773,16 @@ haproxy_set_associated_state() {
 
 mark_instance_up() {
     local INST_ID="$1"
-    local OWNER CLAIMED PREV_DRAIN
+    local OWNER CLAIMED
     start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
     record_instance_last_healthy "$INST_ID"
-    PREV_DRAIN=$(get_instance_drain_service "$INST_ID")
     clear_instance_drain_service "$INST_ID"
     OWNER=$(get_instance_assigned_service "$INST_ID")
     if [ -n "$OWNER" ]; then
         haproxy_set_server_state "$INST_ID" ready "$OWNER" || true
-        if [ -n "$PREV_DRAIN" ] && [ "$PREV_DRAIN" != "$OWNER" ]; then
-            haproxy_set_server_state "$INST_ID" maint "$PREV_DRAIN" || true
-        fi
         echo "==> [inst${INST_ID}] ✅ 已标记健康，继续服务 svc${OWNER}（HAProxy ready）"
         return 0
     fi
@@ -3813,15 +3794,9 @@ mark_instance_up() {
     start_instance_socks "$INST_ID"
     if [ -n "$CLAIMED" ]; then
         haproxy_set_server_state "$INST_ID" ready "$CLAIMED" || true
-        if [ -n "$PREV_DRAIN" ] && [ "$PREV_DRAIN" != "$CLAIMED" ]; then
-            haproxy_set_server_state "$INST_ID" maint "$PREV_DRAIN" || true
-        fi
         echo "==> [inst${INST_ID}] ✅ 已标记健康并绑定 svc${CLAIMED}（HAProxy ready）"
-    elif [ -n "$PREV_DRAIN" ]; then
-        haproxy_set_server_state "$INST_ID" maint "$PREV_DRAIN" || true
-        echo "==> [inst${INST_ID}] ✅ 已标记健康，回到热备（svc${PREV_DRAIN} maint）"
     else
-        echo "==> [inst${INST_ID}] ✅ 已标记健康，进入共用热备（各服务 backend 保持 maint）"
+        echo "==> [inst${INST_ID}] ✅ 已标记健康，进入共用热备（保持 drain，不再 set server）"
     fi
 }
 
@@ -3834,7 +3809,7 @@ detach_instance_from_lb() {
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
     echo "==> [inst${INST_ID}] ⏸️ HAProxy state=drain（官方 drain，无 reload）：停新连接，保已有 TCP"
-    # Only the service that owns the live TCP. Other backends are already maint.
+    # Only the service that owns the live TCP. Other backends stay drain.
     if ! haproxy_set_associated_state "$INST_ID" drain; then
         # Socket unavailable (startup race): fall back to one reload so checks still work;
         # servers stay in cfg either way. Reload reapply restores every backend.
@@ -3844,15 +3819,15 @@ detach_instance_from_lb() {
     fi
 }
 
-# While SOCKS/WARP is down: maint (no traffic, no checks). Still no server add/remove.
+# SOCKS/WARP down: leave the associated backend in drain. No maint.
 hard_detach_instance_from_lb() {
     local INST_ID="$1"
 
     set_instance_status "$INST_ID" "down"
     record_instance_offline_since "$INST_ID"
     clear_instance_online_since "$INST_ID"
-    echo "==> [inst${INST_ID}] HAProxy state=maint（重启服务期间，无 reload）"
-    haproxy_set_associated_state "$INST_ID" maint || true
+    echo "==> [inst${INST_ID}] HAProxy 保持 drain（重启服务期间，无 reload，不再 set maint）"
+    haproxy_set_associated_state "$INST_ID" drain || true
     clear_instance_drain_service "$INST_ID"
 }
 
