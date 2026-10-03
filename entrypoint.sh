@@ -1345,7 +1345,11 @@ bring_up_instance_after_config() {
 
     print_warp_identity_summary "$CONF_PATH" "inst${INST_ID}"
     setup_instance_netns "$INST_ID" || true
-    start_instance_warp "$INST_ID" || true
+    if ! start_instance_warp "$INST_ID"; then
+        echo "==> [inst${INST_ID}] WireGuard 未握手，跳过健康监测，交给后台重连"
+        request_instance_recovery "$INST_ID"
+        return 1
+    fi
 
     if run_instance_health_checks "$INST_ID"; then
         mark_instance_up "$INST_ID"
@@ -3843,8 +3847,63 @@ prepare_instance_wg_conf() {
     return 0
 }
 
+# `wg show latest-handshakes`: one "pubkey <epoch>" per peer. 0 means never.
+wg_handshake_epoch_from_text() {
+    awk '{ if ($2 + 0 > max) max = $2 + 0 } END { print max + 0 }'
+}
+
+# A handshake older than 3 minutes is a dead tunnel. WireGuard rekeys about every 2.
+wg_handshake_is_live() {
+    local EPOCH="$1"
+    local NOW="$2"
+    local AGE
+    case "$EPOCH" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$NOW" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$EPOCH" -gt 0 ] || return 1
+    if [ "$EPOCH" -gt "$NOW" ]; then
+        return 0
+    fi
+    AGE=$((NOW - EPOCH))
+    [ "$AGE" -le 180 ]
+}
+
+instance_wg_handshake_epoch() {
+    local NS WG OUT
+    NS=$(get_instance_netns_name "$1")
+    WG=$(get_instance_wg_name "$1")
+    OUT=$(ip netns exec "$NS" wg show "$WG" latest-handshakes 2>/dev/null) || OUT=""
+    printf '%s\n' "$OUT" | wg_handshake_epoch_from_text
+}
+
+instance_wg_has_handshake() {
+    local EPOCH NOW
+    EPOCH=$(instance_wg_handshake_epoch "$1")
+    NOW=$(date +%s)
+    wg_handshake_is_live "$EPOCH" "$NOW"
+}
+
+# Initial handshake is immediate when the endpoint answers. Do not treat
+# "wg-quick up returned" as connected.
+wait_instance_wg_handshake() {
+    local INST_ID="$1"
+    local I=0
+    while [ "$I" -lt 25 ]; do
+        if instance_wg_has_handshake "$INST_ID"; then
+            return 0
+        fi
+        I=$((I + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
 start_instance_warp() {
     local INST_ID="$1"
+    local HANDSHAKE_RETRY="${2:-0}"
     local NS_NAME WG_NAME HOST_IP NS_VETH WG_LOG UP_OK RAW_ENDPOINT
     NS_NAME=$(get_instance_netns_name "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
@@ -3895,9 +3954,16 @@ start_instance_warp() {
         fi
     fi
 
-    sleep 2
-    echo "==> [inst${INST_ID}] 隧道已启动"
-    return 0
+    if wait_instance_wg_handshake "$INST_ID"; then
+        echo "==> [inst${INST_ID}] 隧道已握手"
+        return 0
+    fi
+    if [ "$HANDSHAKE_RETRY" = 1 ]; then
+        echo "==> [inst${INST_ID}] WireGuard 仍无握手，不当作已连接，跳过健康监测"
+        return 1
+    fi
+    echo "==> [inst${INST_ID}] WireGuard 无握手，重连"
+    start_instance_warp "$INST_ID" 1
 }
 
 stop_instance_socks() {
@@ -4030,6 +4096,10 @@ ns_check_test_urls() {
 run_instance_health_checks() {
     local INST_ID="$1"
     local IP_RC TEST_URLS_RAW TEST_URLS_LIST
+    if ! instance_wg_has_handshake "$INST_ID"; then
+        echo "==> [inst${INST_ID}] WireGuard 无握手，跳过健康监测"
+        return 1
+    fi
     ns_ensure_trace_ip "$INST_ID"
     IP_RC=$?
 
@@ -4100,7 +4170,10 @@ restart_instance_with_new_identity() {
         return 1
     fi
     print_warp_identity_summary "$CONF_PATH" "inst${INST_ID}"
-    start_instance_warp "$INST_ID"
+    if ! start_instance_warp "$INST_ID"; then
+        return 2
+    fi
+    return 0
 }
 
 claim_first_unassigned_service() {
@@ -4280,7 +4353,7 @@ instance_recovery_worker() {
     # reason is logged only. Single-active branch NEVER keeps the old WG tunnel via
     # "SOCKS-only shortcut" — every recovery must WG reconnect (or re-register).
     local REASON="${2:-}"
-    local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED CONF_PATH
+    local PID_FILE BACKOFF MAX_BACKOFF FORCE_NEW SINCE NOW_EPOCH ELAPSED CONF_PATH _id_rc
     PID_FILE=$(get_instance_recover_pid_file "$INST_ID")
     # Parent (request_instance_recovery) records the real job PID via $!.
     # Do NOT write $$ here: in BusyBox ash a backgrounded function often keeps
@@ -4347,7 +4420,9 @@ instance_recovery_worker() {
             echo "==> [inst${INST_ID}] 复活进度: 重连失败 → 重注册 WARP 身份..."
         fi
 
-        if ! restart_instance_with_new_identity "$INST_ID"; then
+        _id_rc=0
+        restart_instance_with_new_identity "$INST_ID" || _id_rc=$?
+        if [ "$_id_rc" -eq 1 ]; then
             # restart_instance_with_new_identity already enqueued config retry on register fail.
             echo "==> [inst${INST_ID}] 重注册未完成，已交配置队列；本 worker 退出避免双通道重试"
             rm -f "$PID_FILE"
@@ -4355,7 +4430,7 @@ instance_recovery_worker() {
             exit 0
         fi
 
-        if run_instance_health_checks "$INST_ID"; then
+        if [ "$_id_rc" -eq 0 ] && run_instance_health_checks "$INST_ID"; then
             mark_instance_up "$INST_ID"
             reload_haproxy_from_status
             echo "==> [inst${INST_ID}] 🎉 重注册后后台复活成功"
@@ -4522,7 +4597,13 @@ bootstrap_multi_instances() {
 
         print_warp_identity_summary "$CONF_PATH" "inst${_bid}"
         setup_instance_netns "$_bid"
-        start_instance_warp "$_bid" || true
+        if ! start_instance_warp "$_bid"; then
+            echo "==> [inst${_bid}] WireGuard 未握手，跳过健康监测，交给后台重连"
+            request_instance_recovery "$_bid"
+            reload_haproxy_from_status
+            stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
+            continue
+        fi
 
         # Progressive open: health-check + join LB as soon as this inst is up —
         # do not wait for remaining instances to finish boot.

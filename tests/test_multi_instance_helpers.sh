@@ -2136,6 +2136,26 @@ test_ready_forces_health_up_when_socks_listens() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_wg_handshake_live_window() {
+    local NOW=1700000000 EPOCH
+    EPOCH=$(printf '%s\n' $'abc\t1699999900' | wg_handshake_epoch_from_text)
+    assert_eq "$EPOCH" '1699999900' 'latest handshake epoch'
+    EPOCH=$(printf '%s\n' $'abc\t0\ndef\t1699999950' | wg_handshake_epoch_from_text)
+    assert_eq "$EPOCH" '1699999950' 'ignore a zero handshake'
+    if wg_handshake_is_live 0 "$NOW"; then
+        echo 'epoch 0 is not connected' >&2
+        exit 1
+    fi
+    if ! wg_handshake_is_live $((NOW - 10)) "$NOW"; then
+        echo 'a fresh handshake is connected' >&2
+        exit 1
+    fi
+    if wg_handshake_is_live $((NOW - 181)) "$NOW"; then
+        echo 'a handshake older than 3 minutes is dead' >&2
+        exit 1
+    fi
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -2192,6 +2212,7 @@ test_lock_respects_live_pid_not_age
 test_udp_forward_touches_only_the_changed_rule
 test_haproxy_cli_reuses_one_session
 test_ready_forces_health_up_when_socks_listens
+test_wg_handshake_live_window
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
