@@ -2654,9 +2654,11 @@ promote_primary() {
 publish_rotate_result_line() {
     local LINE="$1"
     local RES TMP
-    RES="${INSTANCE_STATE_DIR}/admin.rotate.res"
+    # Per-request path when the admin worker sets ADMIN_ROTATE_RES_FILE.
+    # Shared admin.rotate.res stays the default for direct callers and tests.
+    RES="${ADMIN_ROTATE_RES_FILE:-${INSTANCE_STATE_DIR}/admin.rotate.res}"
     TMP="${RES}.pub.$$"
-    mkdir -p "$INSTANCE_STATE_DIR"
+    mkdir -p "$(dirname "$RES")"
     printf '%s\n' "$LINE" > "$TMP"
     mv -f "$TMP" "$RES"
 }
@@ -2692,12 +2694,20 @@ request_service_rotate() {
         return 1
     fi
 
+    # Stamp draining before unlock so the next rotate cannot re-pick this inst
+    # while detach / HAProxy fan-out is still in the background.
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        set_instance_status "$OLD" draining
+    fi
+
     release_rotate_lock || true
     publish_rotate_result_line "OK id=${SID} to=${NEW}"
     printf 'OK id=%s to=%s\n' "$SID" "$NEW"
 
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         echo "==> rotate svc${SID}: 旧 inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
+        # Returns after spawning. Detach's per-backend socat must not block the
+        # next rotate. No /dev/null: the child keeps the worker's stdout.
         request_instance_recovery "$OLD" "force_rotate" || true
     fi
     return 0
@@ -2878,12 +2888,54 @@ build_status_json() {
     printf ']}'
 }
 
+admin_rotate_queue_dir() {
+    printf '%s/admin.rotate.q\n' "$INSTANCE_STATE_DIR"
+}
+
+# One .req/.res pair per HTTP rotate. Never delete a shared req file: the next
+# rotate is written while this one is still finishing, and a blanket rm drops it.
+admin_cmd_drain_rotates() {
+    local Q REQ SID RES NEXT
+    Q=$(admin_rotate_queue_dir)
+    mkdir -p "$Q" || true
+    while true; do
+        NEXT=""
+        for REQ in "$Q"/*.req; do
+            [ -f "$REQ" ] || continue
+            if [ -z "$NEXT" ]; then
+                NEXT=$REQ
+                continue
+            fi
+            # Lexicographic: names are zero-padded sequence numbers.
+            if [ "$(printf '%s\n%s\n' "$REQ" "$NEXT" | sort | sed -n '1p')" = "$REQ" ]; then
+                NEXT=$REQ
+            fi
+        done
+        [ -n "$NEXT" ] || return 0
+        REQ=$NEXT
+        SID=$(tr -d ' \r\n\t' < "$REQ" 2>/dev/null || true)
+        case "$SID" in
+            ''|*[!0-9]*) SID=1 ;;
+        esac
+        RES="${REQ%.req}.res"
+        rm -f "$RES"
+        # Do NOT redirect this call: recovery inherits fds, and /dev/null
+        # silences 下线重连 logs. HTTP stays thin via the per-request res file.
+        ADMIN_ROTATE_RES_FILE=$RES
+        request_service_rotate "$SID" || true
+        if [ ! -s "$RES" ]; then
+            publish_rotate_result_line 'ERR rotate_failed'
+        fi
+        rm -f "$REQ"
+        unset ADMIN_ROTATE_RES_FILE
+    done
+}
+
 admin_cmd_worker() {
-    local REQ_FILE RES_FILE STATUS_FILE STATUS_RES TMP
-    REQ_FILE="${INSTANCE_STATE_DIR}/admin.rotate.req"
-    RES_FILE="${INSTANCE_STATE_DIR}/admin.rotate.res"
+    local STATUS_FILE STATUS_RES TMP
     STATUS_FILE="${INSTANCE_STATE_DIR}/admin.status.req"
     STATUS_RES="${INSTANCE_STATE_DIR}/admin.status.res"
+    mkdir -p "$(admin_rotate_queue_dir)"
     while true; do
         if [ -f "$STATUS_FILE" ]; then
             # Atomic publish: avoid helper reading empty/truncated status file.
@@ -2892,20 +2944,7 @@ admin_cmd_worker() {
             mv -f "$TMP" "$STATUS_RES"
             rm -f "$STATUS_FILE"
         fi
-        if [ -f "$REQ_FILE" ]; then
-            # Result file is published atomically inside request_service_rotate
-            # (publish_rotate_result_line) as soon as promote succeeds/fails.
-            # Do NOT redirect stdout/stderr of this call: background recovery
-            # workers inherit the caller's fds — >/dev/null would silence all
-            # "下线重连" progress logs after a successful switch.
-            # HTTP body stays thin via the res file; container logs stay verbose.
-            SID=$(tr -d ' \r\n\t' < "$REQ_FILE" 2>/dev/null || true)
-            case "$SID" in
-                ''|*[!0-9]*) SID=1 ;;
-            esac
-            request_service_rotate "$SID" || true
-            rm -f "$REQ_FILE"
-        fi
+        admin_cmd_drain_rotates
         sleep 0.1
     done
 }
@@ -3095,18 +3134,56 @@ case "$METHOD $REQ_PATH" in
         rm -f "$STATUS_FILE"
         ;;
     "POST /rotate"|"POST /rotate/")
-        rm -f "$RES_FILE" "${RES_FILE}.tmp."*
+        # One file per request. A shared admin.rotate.req was removed when the
+        # previous rotate finished, so a follow-up sent right after OK 504'd.
+        QDIR="${STATE_DIR}/admin.rotate.q"
+        QLOCK="${QDIR}.lock"
+        mkdir -p "$QDIR"
+        I=0
+        while ! mkdir "$QLOCK" 2>/dev/null; do
+            if [ -f "${QLOCK}/pid" ]; then
+                LP=$(tr -d ' \r\n\t' < "${QLOCK}/pid" 2>/dev/null || true)
+                case "$LP" in
+                    ''|*[!0-9]*) rm -rf "$QLOCK" ;;
+                    *)
+                        if ! kill -0 "$LP" 2>/dev/null; then
+                            rm -rf "$QLOCK"
+                        fi
+                        ;;
+                esac
+            fi
+            I=$((I + 1))
+            if [ "$I" -gt 100 ]; then
+                respond '503 Service Unavailable' '{"ok":false,"error":"rotate_queue_busy"}'
+                exit 0
+            fi
+            sleep 0.05
+        done
+        printf '%s\n' "$$" > "${QLOCK}/pid"
+        SEQ=0
+        if [ -f "${QDIR}/seq" ]; then
+            SEQ=$(tr -d ' \r\n\t' < "${QDIR}/seq" 2>/dev/null || true)
+        fi
+        case "$SEQ" in
+            ''|*[!0-9]*) SEQ=0 ;;
+        esac
+        SEQ=$((SEQ + 1))
+        printf '%s\n' "$SEQ" > "${QDIR}/seq"
+        rm -rf "$QLOCK"
+        QBASE=$(printf '%08d' "$SEQ")
+        QREQ="${QDIR}/${QBASE}.req"
+        QRES="${QDIR}/${QBASE}.res"
         case "$ROTATE_ID" in
             ''|*[!0-9]*) ROTATE_ID=1 ;;
         esac
-        printf '%s\n' "$ROTATE_ID" > "$REQ_FILE"
+        printf '%s\n' "$ROTATE_ID" > "$QREQ"
         I=0
         while [ "$I" -lt 200 ]; do
-            if [ -s "$RES_FILE" ]; then
-                RESP=$(tr -d '\r\n' < "$RES_FILE")
+            if [ -s "$QRES" ]; then
+                RESP=$(tr -d '\r\n' < "$QRES")
                 case "$RESP" in
                     OK\ id=*|OK\ to=*|ERR\ in_progress|ERR\ no_candidate|ERR\ bad_id|ERR\ rotate_failed)
-                        rm -f "$REQ_FILE" "$RES_FILE"
+                        rm -f "$QREQ" "$QRES"
                         case "$RESP" in
                             OK\ id=*)
                                 SID=$(printf '%s' "$RESP" | sed -n 's/^OK id=\([0-9][0-9]*\).*/\1/p')
@@ -3141,7 +3218,7 @@ case "$METHOD $REQ_PATH" in
             I=$((I + 1))
         done
         respond '504 Gateway Timeout' '{"ok":false,"error":"rotate_timeout"}'
-        rm -f "$REQ_FILE"
+        rm -f "$QREQ"
         ;;
     *)
         respond '404 Not Found' '{"ok":false,"error":"not_found"}'
@@ -3923,8 +4000,18 @@ instance_recovery_worker() {
     done
 }
 
+# HAProxy fan-out then the recovery loop, as one background job.
+# Parent records $!; do not background instance_recovery_worker again or the
+# recorded pid exits as soon as detach finishes.
+_detach_then_recover() {
+    local INST_ID="$1"
+    local REASON="${2:-}"
+    detach_instance_from_lb "$INST_ID" || true
+    instance_recovery_worker "$INST_ID" "$REASON"
+}
+
 # Kick off background revival if not already running.
-# Synchronous work is intentionally minimal (status + soft-reload only).
+# Synchronous work is intentionally minimal (status + spawn only).
 # Drain / stop SOCKS / reconnect / re-register all run inside the background worker
 # so the multi-instance monitor and other instances are never blocked by long offline.
 # $2 optional reason (e.g. max_conn) — passed through to the worker.
@@ -3948,8 +4035,9 @@ request_instance_recovery() {
         return 0
     fi
 
-    # 1) Kick LB immediately (fast). SOCKS kept for existing sessions until worker drains.
-    detach_instance_from_lb "$INST_ID"
+    # Out of the candidate set before the slow per-backend HAProxy fan-out.
+    # detach_instance_from_lb repeats this stamp inside the background job.
+    set_instance_status "$INST_ID" draining
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")
     if [ -n "$REASON" ]; then
@@ -3957,8 +4045,8 @@ request_instance_recovery() {
     else
         echo "==> [inst${INST_ID}] 拉起后台复活 worker（排空连接/停 SOCKS/复活均在后台）..."
     fi
-    # Pass id as arg; worker locals it. Record $! from this shell — the real job pid.
-    instance_recovery_worker "$INST_ID" "$REASON" &
+    # Direct child of this shell (the long-lived admin worker). Record $!.
+    _detach_then_recover "$INST_ID" "$REASON" &
     _rec_pid=$!
     echo "$_rec_pid" > "$_pid_file"
     echo "==> [inst${INST_ID}] 后台复活 worker 已记录 PID ${_rec_pid}"
@@ -4272,12 +4360,14 @@ multi_cleanup_on_exit() {
     rm -f \
         "${INSTANCE_STATE_DIR}/admin.rotate.req" \
         "${INSTANCE_STATE_DIR}/admin.rotate.res" \
+        "${INSTANCE_STATE_DIR}/admin.rotate.q.lock" \
         "${INSTANCE_STATE_DIR}/admin.status.req" \
         "${INSTANCE_STATE_DIR}/admin.status.res" \
         "${INSTANCE_STATE_DIR}/admin_http_handler.sh" \
         "${INSTANCE_STATE_DIR}/admin_http.secret" \
         "${INSTANCE_STATE_DIR}/admin_cmd.worker.pid" \
         "$(get_admin_http_pid_file)" 2>/dev/null || true
+    rm -rf "${INSTANCE_STATE_DIR}/admin.rotate.q" 2>/dev/null || true
 
     refresh_haproxy_pid || true
     if is_live_pid "$HAPROXY_PID"; then

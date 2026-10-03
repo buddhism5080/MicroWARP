@@ -1276,7 +1276,7 @@ test_rotate_recovery_not_silenced() {
     # Regression: admin_cmd_worker must not redirect rotate to /dev/null (workers
     # inherit fds → old-primary 下线重连 logs vanished after successful switch).
     if awk '
-        /admin_cmd_worker\(\)/ { infn=1 }
+        /admin_cmd_drain_rotates\(\)|admin_cmd_worker\(\)/ { infn=1 }
         infn && /request_service_rotate/ {
             line=$0
             if (line ~ /\/dev\/null/) { bad=1 }
@@ -1492,9 +1492,12 @@ test_request_service_rotate_by_id() {
     assert_eq "$(get_service_assigned_instance 2)" '3' 'svc2 rebound'
     assert_eq "$(get_service_assigned_instance 1)" '1' 'svc1 untouched'
     assert_eq "$(cat "$RECS")" 'rec:2:force_rotate' 'old svc2 instance force_rotate'
+    assert_eq "$(get_instance_status 2)" 'draining' 'rotated-off inst is not selectable'
 
-    # cannot steal svc1 instance
+    # cannot steal svc1 instance, and must not re-pick the inst just rotated off
+    # even if it still has the freshest last_healthy (recovery has not finished).
     printf '999\n' > "$(get_instance_last_healthy_file 1)"
+    printf '1000\n' > "$(get_instance_last_healthy_file 2)"
     : > "$RECS"
     OUT=$(request_service_rotate 2 2>/dev/null)
     assert_eq "$OUT" 'OK id=2 to=4' 'next rotate skips inst assigned to svc1'
@@ -1553,6 +1556,10 @@ test_admin_rotate_req_carries_service_id() {
     # handler must write service id into rotate req; worker must pass it through
     if ! grep -q 'parse_rotate_service_id' entrypoint.sh; then
         echo 'admin path must parse rotate service id' >&2
+        exit 1
+    fi
+    if ! grep -q 'admin.rotate.q' entrypoint.sh; then
+        echo 'rotate HTTP must use a per-request queue, not one shared req file' >&2
         exit 1
     fi
     if ! grep -q 'request_service_rotate' entrypoint.sh; then
@@ -1687,6 +1694,45 @@ test_hev_socks_config_and_udp_ports() {
     unset PROXY_PORTS
 }
 
+test_admin_rotate_queue_keeps_next_request() {
+    local SAVED Q LOG i
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    Q=$(admin_rotate_queue_dir)
+    command mkdir -p "$Q"
+    LOG="$INSTANCE_STATE_DIR/order"
+    : > "$LOG"
+    request_service_rotate() {
+        echo "$1" >> "$LOG"
+        publish_rotate_result_line "OK id=$1 to=9"
+        sleep 0.2
+        return 0
+    }
+    printf '1\n' > "$Q/00000001.req"
+    admin_cmd_drain_rotates &
+    i=0
+    while [ "$i" -lt 40 ]; do
+        if [ -s "$Q/00000001.res" ]; then
+            break
+        fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+    printf '2\n' > "$Q/00000002.req"
+    wait || true
+    assert_eq "$(paste -sd' ' "$LOG")" '1 2' 'second rotate is processed, not dropped'
+    assert_eq "$(tr -d '\n' < "$Q/00000002.res")" 'OK id=2 to=9' 'second result is its own file'
+    if [ -e "$Q/00000001.req" ] || [ -e "$Q/00000002.req" ]; then
+        echo 'processed rotate req files should be removed' >&2
+        exit 1
+    fi
+    unset -f request_service_rotate mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -1736,6 +1782,7 @@ test_haproxy_desired_state_per_service
 test_request_service_rotate_by_id
 test_status_json_lists_services
 test_admin_rotate_req_carries_service_id
+test_admin_rotate_queue_keeps_next_request
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
