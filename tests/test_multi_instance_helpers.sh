@@ -1201,6 +1201,7 @@ test_request_primary_rotate_thin_ok() {
     printf '50\n' > "$(get_instance_last_healthy_file 2)"
     printf '40\n' > "$(get_instance_last_healthy_file 3)"
     is_instance_recovering() { return 1; }
+    eval "$(declare -f is_live_pid | sed '1s/^is_live_pid/_saved_is_live_pid/')"
     is_live_pid() { return 1; }  # no stale rotate lock
     haproxy_set_server_state() { return 0; }
     RECS="$INSTANCE_STATE_DIR/rec.log"
@@ -1229,6 +1230,8 @@ test_request_primary_rotate_thin_ok() {
 
     unset -f is_instance_recovering is_live_pid haproxy_set_server_state \
         request_instance_recovery mkdir 2>/dev/null || true
+    eval "$(declare -f _saved_is_live_pid | sed '1s/^_saved_is_live_pid/is_live_pid/')"
+    unset -f _saved_is_live_pid
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -1490,6 +1493,7 @@ test_request_service_rotate_by_id() {
     printf '80\n' > "$(get_instance_last_healthy_file 3)"
     printf '40\n' > "$(get_instance_last_healthy_file 4)"
     is_instance_recovering() { return 1; }
+    eval "$(declare -f is_live_pid | sed '1s/^is_live_pid/_saved_is_live_pid/')"
     is_live_pid() { return 1; }
     haproxy_set_server_state() { return 0; }
     RECS="$INSTANCE_STATE_DIR/rec.log"
@@ -1527,6 +1531,8 @@ test_request_service_rotate_by_id() {
 
     unset -f is_instance_recovering is_live_pid haproxy_set_server_state \
         request_instance_recovery mkdir 2>/dev/null || true
+    eval "$(declare -f _saved_is_live_pid | sed '1s/^_saved_is_live_pid/is_live_pid/')"
+    unset -f _saved_is_live_pid
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -1839,6 +1845,94 @@ test_async_rotates_overlap_across_services() {
     unset PROXY_PORTS
 }
 
+test_lock_respects_live_pid_not_age() {
+    local SAVED D LOG SP F
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    D="${INSTANCE_STATE_DIR}/rotate.lock.d"
+    command mkdir -p "$D"
+    # Just created, pid not written yet: still held, directory stays.
+    if ! is_rotate_in_progress; then
+        echo 'fresh rotate lock without a pid was treated as free' >&2
+        exit 1
+    fi
+    if [ ! -d "$D" ]; then
+        echo 'fresh rotate lock was deleted' >&2
+        exit 1
+    fi
+
+    sleep 30 &
+    SP=$!
+    printf '%s\n' "$SP" > "${D}/pid"
+    if acquire_rotate_lock; then
+        echo 'acquire took a lock whose owner is still alive' >&2
+        kill "$SP" 2>/dev/null || true
+        exit 1
+    fi
+    if [ ! -d "$D" ]; then
+        echo 'live rotate lock was deleted' >&2
+        kill "$SP" 2>/dev/null || true
+        exit 1
+    fi
+    kill "$SP" 2>/dev/null || true
+    wait "$SP" 2>/dev/null || true
+    if is_rotate_in_progress; then
+        echo 'dead rotate lock was still held' >&2
+        exit 1
+    fi
+    if [ -d "$D" ]; then
+        echo 'dead rotate lock was not cleared' >&2
+        exit 1
+    fi
+
+    mark_service_rotate_inflight "$$" 1
+    F=$(service_rotate_inflight_file 1)
+    touch -d '5 minutes ago' "$F"
+    if ! service_rotate_inflight 1; then
+        echo 'live inflight pid was expired because the file was old' >&2
+        exit 1
+    fi
+    printf '999999\n' > "$F"
+    if service_rotate_inflight 1; then
+        echo 'dead inflight pid stayed in progress' >&2
+        exit 1
+    fi
+    if [ -f "$F" ]; then
+        echo 'dead inflight file was not removed' >&2
+        exit 1
+    fi
+
+    LOG="${INSTANCE_STATE_DIR}/udp.log"
+    : > "$LOG"
+    _rebuild_instance_udp_forward_unlocked() {
+        echo start >> "$LOG"
+        sleep 0.4
+        echo end >> "$LOG"
+    }
+    rebuild_instance_udp_forward &
+    rebuild_instance_udp_forward &
+    wait
+    awk '
+        /start/ { n++; if (n > 1) bad = 1 }
+        /end/ { n--; ends++ }
+        END { exit !(ends == 2 && !bad) }
+    ' "$LOG" || {
+        echo 'udp rebuilds overlapped or did not both finish' >&2
+        cat "$LOG" >&2
+        exit 1
+    }
+    if [ -d "${INSTANCE_STATE_DIR}/udp-forward.lock.d" ]; then
+        echo 'udp lock left behind after both rebuilds' >&2
+        exit 1
+    fi
+
+    unset -f _rebuild_instance_udp_forward_unlocked mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -1891,6 +1985,7 @@ test_admin_rotate_req_carries_service_id
 test_admin_rotate_queue_keeps_next_request
 test_promote_sets_only_the_rotated_service
 test_async_rotates_overlap_across_services
+test_lock_respects_live_pid_not_age
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window

@@ -387,21 +387,117 @@ is_instance_socks_running() {
     [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null
 }
 
+# mkdir lock. A live pid is never deleted. A directory whose pid file is not
+# written yet is held for 2s so the owner can finish the write; only then is
+# it stale. Callers must not rm -rf a lock just because they waited.
+# Sets CURRENT_PID in this shell to the process running this function.
+# busybox/dash keep $$ as the worker inside a background function; /proc/self
+# is that function's process. read is a builtin, so this is not a subshell.
+current_pid() {
+    CURRENT_PID=""
+    read CURRENT_PID _ < /proc/self/stat || CURRENT_PID=$$
+    case "$CURRENT_PID" in
+        ''|*[!0-9]*) CURRENT_PID=$$ ;;
+    esac
+}
+
+lock_dir_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
+}
+
+lock_dir_held() {
+    local D="$1"
+    local PID NOW MT AGE
+    if [ ! -d "$D" ]; then
+        return 1
+    fi
+    PID=""
+    if [ -f "${D}/pid" ]; then
+        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+    fi
+    if is_live_pid "$PID"; then
+        return 0
+    fi
+    if [ -z "$PID" ]; then
+        NOW=$(date +%s)
+        MT=$(lock_dir_mtime "$D")
+        case "$MT" in
+            ''|*[!0-9]*) MT=0 ;;
+        esac
+        AGE=$((NOW - MT))
+        if [ "$AGE" -lt 2 ]; then
+            return 0
+        fi
+    fi
+    rm -rf "$D"
+    return 1
+}
+
+acquire_mkdir_lock() {
+    local D="$1"
+    local GOT
+    mkdir -p "$(dirname "$D")" 2>/dev/null || true
+    current_pid
+    if mkdir "$D" 2>/dev/null; then
+        if ! printf '%s\n' "$CURRENT_PID" > "${D}/pid"; then
+            rm -rf "$D" 2>/dev/null || true
+            return 1
+        fi
+        GOT=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+        if [ "$GOT" = "$CURRENT_PID" ]; then
+            return 0
+        fi
+        return 1
+    fi
+    if lock_dir_held "$D"; then
+        return 1
+    fi
+    current_pid
+    if mkdir "$D" 2>/dev/null; then
+        if ! printf '%s\n' "$CURRENT_PID" > "${D}/pid"; then
+            rm -rf "$D" 2>/dev/null || true
+            return 1
+        fi
+        GOT=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+        if [ "$GOT" = "$CURRENT_PID" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+release_mkdir_lock() {
+    local D="$1"
+    local PID
+    if [ ! -d "$D" ]; then
+        return 0
+    fi
+    PID=""
+    if [ -f "${D}/pid" ]; then
+        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
+    fi
+    current_pid
+    if [ "$PID" = "$CURRENT_PID" ]; then
+        rm -rf "$D"
+    fi
+}
+
 rebuild_instance_udp_forward() {
     local LOCK I
     LOCK="${INSTANCE_STATE_DIR}/udp-forward.lock.d"
-    mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
     I=0
-    while ! mkdir "$LOCK" 2>/dev/null; do
+    while ! acquire_mkdir_lock "$LOCK"; do
+        # Held by a live rebuild. Wait. Never delete that directory: two
+        # iptables -F MW_UDP at once drop or duplicate DNAT rules.
         I=$((I + 1))
-        if [ "$I" -gt 100 ]; then
-            rm -rf "$LOCK"
-            I=0
+        if [ "$I" -gt 600 ]; then
+            echo "==> [WARN] UDP forward lock still held after 30s; skip this rebuild" >&2
+            return 0
         fi
         sleep 0.05
     done
     _rebuild_instance_udp_forward_unlocked || true
-    rm -rf "$LOCK"
+    release_mkdir_lock "$LOCK"
 }
 
 _rebuild_instance_udp_forward_unlocked() {
@@ -2517,49 +2613,17 @@ find_latest_healthy_standby() {
 }
 
 is_rotate_in_progress() {
-    local D PID
-    D="${INSTANCE_STATE_DIR}/rotate.lock.d"
-    if [ ! -d "$D" ]; then
-        return 1
-    fi
-    PID=""
-    if [ -f "${D}/pid" ]; then
-        PID=$(tr -d ' \n\r\t' < "${D}/pid" 2>/dev/null || true)
-    fi
-    if is_live_pid "$PID"; then
-        return 0
-    fi
-    # Stale lock dir from crashed process
-    rm -rf "$D"
-    return 1
+    lock_dir_held "${INSTANCE_STATE_DIR}/rotate.lock.d"
 }
 
-# Atomic-ish lock via mkdir (portable; better than plain pid file race).
+# Atomic-ish lock via mkdir. The pid is written before the lock is visible
+# as free: a missing pid is held for 2s, and a live pid is never removed.
 acquire_rotate_lock() {
-    local D
-    D="${INSTANCE_STATE_DIR}/rotate.lock.d"
-    mkdir -p "$INSTANCE_STATE_DIR"
-    if is_rotate_in_progress; then
-        return 1
-    fi
-    if mkdir "$D" 2>/dev/null; then
-        printf '%s\n' "$$" > "${D}/pid"
-        return 0
-    fi
-    # Lost race or leftover empty dir
-    if is_rotate_in_progress; then
-        return 1
-    fi
-    rm -rf "$D" 2>/dev/null || true
-    if mkdir "$D" 2>/dev/null; then
-        printf '%s\n' "$$" > "${D}/pid"
-        return 0
-    fi
-    return 1
+    acquire_mkdir_lock "${INSTANCE_STATE_DIR}/rotate.lock.d"
 }
 
 release_rotate_lock() {
-    rm -rf "${INSTANCE_STATE_DIR}/rotate.lock.d"
+    release_mkdir_lock "${INSTANCE_STATE_DIR}/rotate.lock.d"
 }
 
 # Optional $2 = service id. Without it, returns the global/compat desired
@@ -2679,16 +2743,18 @@ publish_rotate_result_line() {
     mv -f "$TMP" "$RES"
 }
 
-# Same service stays exclusive until its dataplane set server finishes.
-# Other services are not blocked. File is cleared by the finisher; a crashed
-# finisher expires after 60s so the service cannot stick in_progress.
+# Same service stays exclusive while its finisher pid is alive.
+# The file stores that pid, not the worker's, and not a timestamp.
+# A dead pid is cleared immediately. A live pid is never expired by age.
 service_rotate_inflight_file() {
     printf '%s/rotate.inflight.%s\n' "$INSTANCE_STATE_DIR" "$1"
 }
 
 mark_service_rotate_inflight() {
+    local PID="$1"
+    local SID="$2"
     mkdir -p "$INSTANCE_STATE_DIR"
-    printf '%s\n' "$$" > "$(service_rotate_inflight_file "$1")"
+    printf '%s\n' "$PID" > "$(service_rotate_inflight_file "$SID")"
 }
 
 clear_service_rotate_inflight() {
@@ -2696,16 +2762,28 @@ clear_service_rotate_inflight() {
 }
 
 service_rotate_inflight() {
-    local F
+    local F PID NOW MT AGE
     F=$(service_rotate_inflight_file "$1")
     if [ ! -f "$F" ]; then
         return 1
     fi
-    if [ -n "$(find "$F" -mmin +1 2>/dev/null)" ]; then
-        rm -f "$F"
-        return 1
+    PID=$(tr -d ' \n\r\t' < "$F" 2>/dev/null || true)
+    if is_live_pid "$PID"; then
+        return 0
     fi
-    return 0
+    if [ -z "$PID" ]; then
+        NOW=$(date +%s)
+        MT=$(lock_dir_mtime "$F")
+        case "$MT" in
+            ''|*[!0-9]*) MT=0 ;;
+        esac
+        AGE=$((NOW - MT))
+        if [ "$AGE" -lt 2 ]; then
+            return 0
+        fi
+    fi
+    rm -f "$F"
+    return 1
 }
 
 _finish_service_rotate() {
@@ -2771,13 +2849,15 @@ request_service_rotate() {
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         set_instance_status "$OLD" draining
     fi
-    mark_service_rotate_inflight "$SID"
-    release_rotate_lock || true
-
     if [ "${ROTATE_ASYNC:-0}" = 1 ]; then
+        # Finisher pid is on disk before the assign lock is released.
         _finish_service_rotate "$SID" "$OLD" "$NEW" &
+        mark_service_rotate_inflight "$!" "$SID"
+        release_rotate_lock || true
         return 0
     fi
+    mark_service_rotate_inflight "$$" "$SID"
+    release_rotate_lock || true
     _finish_service_rotate "$SID" "$OLD" "$NEW"
 }
 
@@ -3209,17 +3289,26 @@ case "$METHOD $REQ_PATH" in
         mkdir -p "$QDIR"
         I=0
         while ! mkdir "$QLOCK" 2>/dev/null; do
+            LP=""
             if [ -f "${QLOCK}/pid" ]; then
                 LP=$(tr -d ' \r\n\t' < "${QLOCK}/pid" 2>/dev/null || true)
-                case "$LP" in
-                    ''|*[!0-9]*) rm -rf "$QLOCK" ;;
-                    *)
-                        if ! kill -0 "$LP" 2>/dev/null; then
-                            rm -rf "$QLOCK"
-                        fi
-                        ;;
-                esac
             fi
+            case "$LP" in
+                ''|*[!0-9]*)
+                    # Pid not written yet, or corrupt. Do not delete a lock
+                    # that was just created; the owner is between mkdir and write.
+                    QMT=$(stat -c %Y "$QLOCK" 2>/dev/null || stat -f %m "$QLOCK" 2>/dev/null || printf '0')
+                    case "$QMT" in ''|*[!0-9]*) QMT=0 ;; esac
+                    if [ $(( $(date +%s) - QMT )) -ge 2 ]; then
+                        rm -rf "$QLOCK"
+                    fi
+                    ;;
+                *)
+                    if ! kill -0 "$LP" 2>/dev/null; then
+                        rm -rf "$QLOCK"
+                    fi
+                    ;;
+            esac
             I=$((I + 1))
             if [ "$I" -gt 100 ]; then
                 respond '503 Service Unavailable' '{"ok":false,"error":"rotate_queue_busy"}'
@@ -3237,7 +3326,10 @@ case "$METHOD $REQ_PATH" in
         esac
         SEQ=$((SEQ + 1))
         printf '%s\n' "$SEQ" > "${QDIR}/seq"
-        rm -rf "$QLOCK"
+        QHELD=$(tr -d ' \r\n\t' < "${QLOCK}/pid" 2>/dev/null || true)
+        if [ "$QHELD" = "$$" ]; then
+            rm -rf "$QLOCK"
+        fi
         QBASE=$(printf '%08d' "$SEQ")
         QREQ="${QDIR}/${QBASE}.req"
         QRES="${QDIR}/${QBASE}.res"
