@@ -963,11 +963,13 @@ test_instance_drain_helpers() {
     haproxy_set_server_state() { echo "state:$2" >> "$ORDER_LOG"; return 0; }
     wait_instance_drain() { echo "drain_wait" >> "$ORDER_LOG"; return 0; }
     stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
+    set_service_assigned_instance 1 7
 
     mark_instance_down 7 >/dev/null 2>&1
     out=$(tr '\n' ' ' < "$ORDER_LOG")
     assert_contains "$out" 'status:draining' 'marks draining'
     assert_contains "$out" 'state:drain' 'runtime drain (no cfg rewrite)'
+    assert_eq "$(grep -c 'state:drain' "$ORDER_LOG")" '1' 'drain only the associated backend'
     if [[ "$out" == *reload* ]]; then
         echo "mark_instance_down must not reload when runtime drain works: $out" >&2
         exit 1
@@ -986,6 +988,7 @@ test_instance_drain_helpers() {
     assert_contains "$out" 'stop_socks' 'background helper stops socks'
     assert_contains "$out" 'status:down' 'status down while restarting'
     assert_contains "$out" 'state:maint' 'runtime maint while restarting'
+    assert_eq "$(grep -c 'state:maint' "$ORDER_LOG")" '1' 'maint only the associated backend'
     if [[ "$out" == *reload* ]]; then
         echo "drain_and_stop must not reload haproxy: $out" >&2
         exit 1
@@ -1126,7 +1129,11 @@ test_mark_instance_up_primary_then_standby_drain() {
 
     mark_instance_up 2 >/dev/null
     assert_eq "$(get_primary_id)" '1' 'primary unchanged'
-    assert_contains "$(tr '\n' ' ' < "$LOG")" '2:maint' 'second up is unassigned maint'
+    if grep -q '^2:' "$LOG"; then
+        echo 'unassigned standby must not set server on every backend' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
     # last_healthy stamped
     [ -f "$(get_instance_last_healthy_file 1)" ] || { echo 'missing last_healthy 1' >&2; exit 1; }
     [ -f "$(get_instance_last_healthy_file 2)" ] || { echo 'missing last_healthy 2' >&2; exit 1; }
@@ -1161,15 +1168,12 @@ test_mark_up_reapplies_only_self() {
     haproxy_set_server_state() { echo "$1:$2${3:+:$3}" >> "$LOG"; return 0; }
 
     mark_instance_up 5 >/dev/null
-    # Only inst5 should appear in the log (3 service backends).
-    if grep -E '^[1234]:' "$LOG"; then
-        echo 'mark_up of inst5 must not reapply other instances' >&2
+    # Unassigned standby is already maint on every backend. Do not set server.
+    if [ -s "$LOG" ]; then
+        echo 'mark_up of unassigned inst5 must not set server' >&2
         cat "$LOG" >&2
         exit 1
     fi
-    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:1' 'unassigned recovered inst5 maint on svc1'
-    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:2' 'unassigned recovered inst5 maint on svc2'
-    assert_contains "$(tr '\n' ' ' < "$LOG")" '5:maint:3' 'unassigned recovered inst5 maint on svc3'
     assert_eq "$(get_service_assigned_instance 1)" '1' 'svc1 assignment unchanged'
     assert_eq "$(get_instance_status 5)" 'up' 'inst5 now up standby'
 
@@ -1247,6 +1251,7 @@ test_failover_primary_excludes_failed() {
     DETACHES="$INSTANCE_STATE_DIR/detach.log"
     : > "$RECS"
     : > "$DETACHES"
+    eval "$(declare -f detach_instance_from_lb | sed '1s/^detach_instance_from_lb/_saved_detach_instance_from_lb/')"
     detach_instance_from_lb() {
         echo "detach:$1" >> "$DETACHES"
         set_instance_status "$1" draining
@@ -1267,6 +1272,8 @@ test_failover_primary_excludes_failed() {
 
     unset -f is_instance_recovering detach_instance_from_lb request_instance_recovery \
         haproxy_set_server_state mkdir 2>/dev/null || true
+    eval "$(declare -f _saved_detach_instance_from_lb | sed '1s/^_saved_detach_instance_from_lb/detach_instance_from_lb/')"
+    unset -f _saved_detach_instance_from_lb
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -1733,6 +1740,41 @@ test_admin_rotate_queue_keeps_next_request() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_promote_sets_only_the_rotated_service() {
+    local SAVED="$INSTANCE_STATE_DIR" LOG
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/states.log"
+    : > "$LOG"
+    PROXY_PORTS='1080,1081,1082'
+    WARP_INSTANCE_COUNT=4
+    set_service_assigned_instance 1 1
+    set_service_assigned_instance 2 2
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    set_instance_status 4 up
+    start_instance_socks() { :; }
+    is_instance_recovering() { return 1; }
+    haproxy_set_server_state() { echo "$1:$2:$3" >> "$LOG"; return 0; }
+
+    promote_service_instance 2 3 >/dev/null
+    assert_eq "$(sort "$LOG" | paste -sd' ' -)" '2:drain:2 3:ready:2' 'rotate svc2 touches only that backend'
+
+    : > "$LOG"
+    record_instance_offline_since() { :; }
+    clear_instance_online_since() { :; }
+    detach_instance_from_lb 2 >/dev/null
+    assert_eq "$(tr -d '\n' < "$LOG")" '2:drain:2' 'detach drains only the service with live TCP'
+
+    unset -f start_instance_socks is_instance_recovering haproxy_set_server_state \
+        record_instance_offline_since clear_instance_online_since mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
 test_count_busy_tcp_one_ss_dump() {
     local SS_LOG n
     SS_LOG=$(mktemp)
@@ -1783,6 +1825,7 @@ test_request_service_rotate_by_id
 test_status_json_lists_services
 test_admin_rotate_req_carries_service_id
 test_admin_rotate_queue_keeps_next_request
+test_promote_sets_only_the_rotated_service
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
