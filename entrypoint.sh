@@ -1559,12 +1559,16 @@ haproxy_cli_read_until_prompt() {
     BUF=""
     exec 8< "$(haproxy_cli_out)" || return 1
     while true; do
-        # Trailing x keeps a newline read by dd from being eaten by $( ).
-        CHUNK=$(dd bs=1 count=1 <&8 2>/dev/null || true; printf x)
-        CHUNK=${CHUNK%x}
-        if [ -z "$CHUNK" ]; then
+        CHUNK=""
+        # One shell read per byte. A newline comes back empty; keep it,
+        # or the prompt match swallows the whole reply.
+        if ! IFS= read -r -n 1 CHUNK <&8; then
             exec 8<&-
             return 1
+        fi
+        if [ -z "$CHUNK" ]; then
+            CHUNK='
+'
         fi
         BUF="${BUF}${CHUNK}"
         TAIL=${BUF##*
@@ -1612,11 +1616,18 @@ haproxy_cli_session() {
 # Returns 0 when HAProxy accepts it. Does not wait for the socket to close.
 haproxy_runtime_cmd() {
     local CMD="$1"
-    local OUT LOCK
+    local OUT LOCK I
     LOCK="${INSTANCE_STATE_DIR}/haproxy.cli.lock.d"
-    if ! acquire_mkdir_lock "$LOCK"; then
-        return 1
-    fi
+    I=0
+    while ! acquire_mkdir_lock "$LOCK"; do
+        # Another command is reading the one session. Wait out that reply,
+        # do not skip the update. A dead holder is cleared by acquire itself.
+        I=$((I + 1))
+        if [ "$I" -gt 200 ]; then
+            return 1
+        fi
+        sleep 0.01
+    done
     if ! haproxy_cli_session; then
         release_mkdir_lock "$LOCK" || true
         return 1
