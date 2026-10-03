@@ -2075,11 +2075,18 @@ PY
         echo "admin cli took ${MS}ms; still waiting on a timeout" >&2
         exit 1
     fi
-    assert_eq "$(grep -c '^start$' "$LOG")" '1' 'one admin session for two commands'
-    assert_eq "$(grep -c '^cmd:prompt$' "$LOG")" '1' 'prompt sent once'
-    assert_eq "$(grep -c '^cmd:set server' "$LOG")" '2' 'both set server commands reached the open session'
-    if grep -q 'socat -T2' entrypoint.sh; then
-        echo 'socat -T2 must not be used for the admin socket' >&2
+    assert_eq "$(grep -c '^start$' "$LOG")" '2' 'each command opens its own connection'
+    if grep -q '^cmd:prompt$' "$LOG"; then
+        echo 'one-shot admin command must not send prompt' >&2
+        exit 1
+    fi
+    assert_eq "$(grep -c '^cmd:set server' "$LOG")" '2' 'both set server commands were sent'
+    if awk '/^haproxy_runtime_cmd\(\)/,/^}/' entrypoint.sh | grep -q 'socat -T'; then
+        echo 'admin socket must not use socat -T' >&2
+        exit 1
+    fi
+    if grep -q 'haproxy_cli_read_until_prompt' entrypoint.sh; then
+        echo 'admin socket must not keep a prompt session' >&2
         exit 1
     fi
     if [ -f "$INSTANCE_STATE_DIR/haproxy.cli.socat" ]; then
@@ -2095,6 +2102,55 @@ PY
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_mark_up_starts_once_and_unbinds_when_admin_fails() {
+    local SAVED N LOG
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    PROXY_PORTS='1081,1082'
+    WARP_INSTANCE_COUNT=2
+    N=0
+    LOG="$INSTANCE_STATE_DIR/up.log"
+    : > "$LOG"
+    start_instance_socks() { N=$((N + 1)); printf '%s\n' "$(get_instance_socks_udp_port "$1")" >> "$LOG"; }
+    clear_instance_offline_since() { :; }
+    record_instance_online_since() { :; }
+    haproxy_set_server_state() { return 0; }
+    mark_instance_up 1 >"$INSTANCE_STATE_DIR/out" 
+    assert_eq "$N" '1' 'claim then one hev start'
+    assert_eq "$(tr -d " \\n" < "$LOG")" '1081' 'first start already uses the service port'
+    assert_eq "$(get_service_assigned_instance 1)" '1' 'bound after admin accepts'
+    if ! grep -q '已标记健康并绑定' "$INSTANCE_STATE_DIR/out"; then
+        echo 'success line missing' >&2
+        exit 1
+    fi
+
+    N=0
+    : > "$LOG"
+    haproxy_set_server_state() { return 1; }
+    mark_instance_up 2 >"$INSTANCE_STATE_DIR/out2"
+    assert_eq "$(get_service_assigned_instance 1)" '1' 'failed bind must not steal svc1'
+    assert_eq "$(get_service_assigned_instance 2)" '' 'failed bind drops the new claim'
+    assert_eq "$N" '2' 'unbind restarts hev onto the standby port'
+    assert_eq "$(tr -d ' \n' < "$LOG")" '10821080' 'service port, then standby 1080'
+    if grep -q '已标记健康并绑定' "$INSTANCE_STATE_DIR/out2"; then
+        echo 'failed admin must not say bound' >&2
+        exit 1
+    fi
+    if ! grep -q '进入共用热备' "$INSTANCE_STATE_DIR/out2"; then
+        echo 'failed admin should leave a standby' >&2
+        cat "$INSTANCE_STATE_DIR/out2" >&2
+        exit 1
+    fi
+
+    unset -f start_instance_socks clear_instance_offline_since record_instance_online_since \
+        haproxy_set_server_state mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
 }
 
 test_ready_forces_health_up_when_socks_listens() {
@@ -2226,6 +2282,7 @@ test_async_rotates_overlap_across_services
 test_lock_respects_live_pid_not_age
 test_udp_forward_touches_only_the_changed_rule
 test_haproxy_cli_reuses_one_session
+test_mark_up_starts_once_and_unbinds_when_admin_fails
 test_ready_forces_health_up_when_socks_listens
 test_socks_listen_sees_tcp6
 test_wg_handshake_live_window

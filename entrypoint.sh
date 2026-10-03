@@ -1498,151 +1498,22 @@ get_haproxy_sock() {
     printf '%s\n' "${HAPROXY_SOCK:-$INSTANCE_STATE_DIR/haproxy.sock}"
 }
 
-# One HAProxy admin session for the whole process. Interactive mode (prompt)
-# keeps the socket open. A command is done when the next "> " prompt arrives,
-# not when the connection closes and not after an idle timeout.
-haproxy_cli_in() { printf '%s/haproxy.cli.in\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_out() { printf '%s/haproxy.cli.out\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_pid_file() { printf '%s/haproxy.cli.pid\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_socat_pid_file() { printf '%s/haproxy.cli.socat\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_ready_file() { printf '%s/haproxy.cli.ready\n' "$INSTANCE_STATE_DIR"; }
-
-haproxy_cli_bridge() {
-    local SOCK="$1"
-    local IN OUT SP
-    IN=$(haproxy_cli_in)
-    OUT=$(haproxy_cli_out)
-    rm -f "$IN" "$OUT"
-    mkfifo "$IN" "$OUT"
-    # Hold both ends so a client closing its fifo fd does not EOF socat.
-    exec 3<>"$IN"
-    exec 4<>"$OUT"
-    printf '1\n' > "$(haproxy_cli_ready_file)"
-    socat "UNIX-CONNECT:${SOCK}" - <&3 >&4 &
-    SP=$!
-    printf '%s\n' "$SP" > "$(haproxy_cli_socat_pid_file)"
-    wait "$SP" || true
-    rm -f "$(haproxy_cli_ready_file)" "$(haproxy_cli_socat_pid_file)"
-}
-
-haproxy_cli_stop() {
-    local PID SP
-    PID=""
-    SP=""
-    if [ -f "$(haproxy_cli_pid_file)" ]; then
-        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
-    fi
-    if [ -f "$(haproxy_cli_socat_pid_file)" ]; then
-        SP=$(tr -d ' \n\r\t' < "$(haproxy_cli_socat_pid_file)" 2>/dev/null || true)
-    fi
-    if is_live_pid "$SP"; then
-        kill "$SP" 2>/dev/null || true
-    fi
-    if is_live_pid "$PID"; then
-        kill "$PID" 2>/dev/null || true
-    fi
-    rm -f "$(haproxy_cli_pid_file)" "$(haproxy_cli_socat_pid_file)" "$(haproxy_cli_ready_file)"
-}
-
-haproxy_cli_alive() {
-    local PID
-    PID=""
-    if [ -f "$(haproxy_cli_pid_file)" ]; then
-        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
-    fi
-    is_live_pid "$PID" && [ -p "$(haproxy_cli_in)" ] && [ -p "$(haproxy_cli_out)" ]
-}
-
-haproxy_cli_read_until_prompt() {
-    local CHUNK BUF TAIL
-    HAPROXY_CLI_TEXT=""
-    BUF=""
-    exec 8< "$(haproxy_cli_out)" || return 1
-    while true; do
-        CHUNK=""
-        # One shell read per byte. A newline comes back empty; keep it,
-        # or the prompt match swallows the whole reply.
-        if ! IFS= read -r -n 1 CHUNK <&8; then
-            exec 8<&-
-            return 1
-        fi
-        if [ -z "$CHUNK" ]; then
-            CHUNK='
-'
-        fi
-        BUF="${BUF}${CHUNK}"
-        TAIL=${BUF##*
-}
-        case "$TAIL" in
-            '> '|*'> ')
-                HAPROXY_CLI_TEXT=${BUF%"$TAIL"}
-                exec 8<&-
-                return 0
-                ;;
-        esac
-    done
-}
-
-# Open the session if needed. `prompt` is sent once; a second one would close it.
-haproxy_cli_session() {
-    local SOCK PID I
+# One connection per command. Write the line and close the write side.
+# HAProxy answers and closes. The read ends on that close, not on an idle
+# timer and not on a prompt. Empty output is success. Connections are
+# independent, so one reply cannot hold the others.
+haproxy_runtime_cmd() {
+    local CMD="$1"
+    local SOCK OUT
     SOCK=$(get_haproxy_sock)
     if [ ! -S "$SOCK" ]; then
         return 1
     fi
-    if ! haproxy_cli_alive; then
-        haproxy_cli_stop
-        haproxy_cli_bridge "$SOCK" &
-        PID=$!
-        printf '%s\n' "$PID" > "$(haproxy_cli_pid_file)"
-        I=0
-        while [ ! -f "$(haproxy_cli_ready_file)" ]; do
-            I=$((I + 1))
-            if [ "$I" -gt 100 ]; then
-                return 1
-            fi
-            if ! is_live_pid "$PID"; then
-                return 1
-            fi
-            sleep 0.01
-        done
-        printf 'prompt\n' > "$(haproxy_cli_in)" || return 1
-        haproxy_cli_read_until_prompt || return 1
-    fi
-    return 0
-}
-
-# Send one CLI command on the open admin session. No reload.
-# Returns 0 when HAProxy accepts it. Does not wait for the socket to close.
-haproxy_runtime_cmd() {
-    local CMD="$1"
-    local OUT LOCK I
-    LOCK="${INSTANCE_STATE_DIR}/haproxy.cli.lock.d"
-    I=0
-    while ! acquire_mkdir_lock "$LOCK"; do
-        # Another command is reading the one session. Wait out that reply,
-        # do not skip the update. A dead holder is cleared by acquire itself.
-        I=$((I + 1))
-        if [ "$I" -gt 200 ]; then
-            return 1
-        fi
-        sleep 0.01
-    done
-    if ! haproxy_cli_session; then
-        release_mkdir_lock "$LOCK" || true
+    if ! command -v socat >/dev/null 2>&1; then
         return 1
     fi
-    if ! printf '%s\n' "$CMD" > "$(haproxy_cli_in)"; then
-        release_mkdir_lock "$LOCK" || true
-        return 1
-    fi
-    if ! haproxy_cli_read_until_prompt; then
-        release_mkdir_lock "$LOCK" || true
-        haproxy_cli_stop
-        return 1
-    fi
-    OUT=$HAPROXY_CLI_TEXT
-    release_mkdir_lock "$LOCK" || true
+    # stdin EOF shuts the write side. socat reads until HAProxy closes. No idle timeout.
+    OUT=$(printf '%s\n' "$CMD" | socat STDIO "UNIX-CONNECT:${SOCK}" 2>/dev/null) || return 1
     case "$OUT" in
         *'Unknown command'*|*'No such'*|*'failed'*)
             return 1
@@ -1650,7 +1521,6 @@ haproxy_runtime_cmd() {
     esac
     return 0
 }
-
 # /proc/net/tcp and tcp6 rows on stdin. 1080 == 0x438, LISTEN == 0A.
 # hev binds one AF_INET6 socket (IPV6_V6ONLY=0). Linux lists it only in tcp6.
 socks_tcp_table_has_listen() {
@@ -1716,6 +1586,7 @@ haproxy_set_server_state() {
                 echo "==> [inst${INST_ID}] HAProxy warp_svc${SVC_ID} health → up（不等 15s 检查）"
             else
                 echo "==> [inst${INST_ID}] [WARN] HAProxy warp_svc${SVC_ID} health up 失败"
+                OK=0
             fi
         fi
         CMD="set server warp_svc${SVC_ID}/inst${INST_ID} state ${STATE}"
@@ -4233,29 +4104,39 @@ haproxy_set_associated_state() {
 mark_instance_up() {
     local INST_ID="$1"
     local OWNER CLAIMED
-    start_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "up"
     clear_instance_offline_since "$INST_ID"
     record_instance_online_since "$INST_ID"
     record_instance_last_healthy "$INST_ID"
     clear_instance_drain_service "$INST_ID"
     OWNER=$(get_instance_assigned_service "$INST_ID")
-    if [ -n "$OWNER" ]; then
-        haproxy_set_server_state "$INST_ID" ready "$OWNER" || true
-        echo "==> [inst${INST_ID}] ✅ 已标记健康，继续服务 svc${OWNER}（HAProxy ready）"
+    if [ -z "$OWNER" ]; then
+        CLAIMED=""
+        if acquire_rotate_lock; then
+            CLAIMED=$(claim_first_unassigned_service "$INST_ID")
+            release_rotate_lock || true
+        fi
+        # Claim first so hev binds the service UDP port on the first start.
+        start_instance_socks "$INST_ID"
+        if [ -z "$CLAIMED" ]; then
+            echo "==> [inst${INST_ID}] ✅ 已标记健康，进入共用热备（保持 drain，不再 set server）"
+            return 0
+        fi
+        if haproxy_set_server_state "$INST_ID" ready "$CLAIMED"; then
+            echo "==> [inst${INST_ID}] ✅ 已标记健康并绑定 svc${CLAIMED}（HAProxy ready）"
+            return 0
+        fi
+        clear_service_assigned_instance "$CLAIMED"
+        # Standby UDP is 1080. Restart only when the claimed port was different.
+        start_instance_socks "$INST_ID"
+        echo "==> [inst${INST_ID}] [WARN] 管理口没接上，取消 svc${CLAIMED}，进入共用热备"
         return 0
     fi
-    CLAIMED=""
-    if acquire_rotate_lock; then
-        CLAIMED=$(claim_first_unassigned_service "$INST_ID")
-        release_rotate_lock || true
-    fi
     start_instance_socks "$INST_ID"
-    if [ -n "$CLAIMED" ]; then
-        haproxy_set_server_state "$INST_ID" ready "$CLAIMED" || true
-        echo "==> [inst${INST_ID}] ✅ 已标记健康并绑定 svc${CLAIMED}（HAProxy ready）"
+    if haproxy_set_server_state "$INST_ID" ready "$OWNER"; then
+        echo "==> [inst${INST_ID}] ✅ 已标记健康，继续服务 svc${OWNER}（HAProxy ready）"
     else
-        echo "==> [inst${INST_ID}] ✅ 已标记健康，进入共用热备（保持 drain，不再 set server）"
+        echo "==> [inst${INST_ID}] [WARN] 管理口没接上，svc${OWNER} 没有 ready"
     fi
 }
 
