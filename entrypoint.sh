@@ -388,6 +388,23 @@ is_instance_socks_running() {
 }
 
 rebuild_instance_udp_forward() {
+    local LOCK I
+    LOCK="${INSTANCE_STATE_DIR}/udp-forward.lock.d"
+    mkdir -p "$INSTANCE_STATE_DIR" 2>/dev/null || true
+    I=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        I=$((I + 1))
+        if [ "$I" -gt 100 ]; then
+            rm -rf "$LOCK"
+            I=0
+        fi
+        sleep 0.05
+    done
+    _rebuild_instance_udp_forward_unlocked || true
+    rm -rf "$LOCK"
+}
+
+_rebuild_instance_udp_forward_unlocked() {
     local _iid PORT NS_IP
     ensure_udp_nat_chain
     iptables -t nat -F MW_UDP 2>/dev/null || true
@@ -2599,7 +2616,7 @@ haproxy_reapply_instance_states() {
     done
 }
 
-promote_service_instance() {
+promote_service_assignment() {
     local SID="$1"
     local NEW="$2"
     local OLD
@@ -2617,18 +2634,32 @@ promote_service_instance() {
     fi
     clear_instance_drain_service "$NEW"
     set_service_assigned_instance "$SID" "$NEW"
-    start_instance_socks "$NEW"
+    return 0
+}
+
+promote_service_dataplane() {
+    local SID="$1"
+    local NEW="$2"
+    local OLD="$3"
+    start_instance_socks "$NEW" || true
     # Only this service changes. Other backends stay drain.
     haproxy_set_server_state "$NEW" ready "$SID" || true
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         haproxy_set_server_state "$OLD" drain "$SID" || true
-    fi
-    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         echo "==> svc${SID}: inst${OLD} → inst${NEW}" >&2
     else
         echo "==> svc${SID} 绑定 inst${NEW}" >&2
     fi
     return 0
+}
+
+promote_service_instance() {
+    local SID="$1"
+    local NEW="$2"
+    local OLD
+    OLD=$(get_service_assigned_instance "$SID")
+    promote_service_assignment "$SID" "$NEW" || return 1
+    promote_service_dataplane "$SID" "$NEW" "$OLD"
 }
 
 promote_primary() {
@@ -2648,7 +2679,53 @@ publish_rotate_result_line() {
     mv -f "$TMP" "$RES"
 }
 
+# Same service stays exclusive until its dataplane set server finishes.
+# Other services are not blocked. File is cleared by the finisher; a crashed
+# finisher expires after 60s so the service cannot stick in_progress.
+service_rotate_inflight_file() {
+    printf '%s/rotate.inflight.%s\n' "$INSTANCE_STATE_DIR" "$1"
+}
+
+mark_service_rotate_inflight() {
+    mkdir -p "$INSTANCE_STATE_DIR"
+    printf '%s\n' "$$" > "$(service_rotate_inflight_file "$1")"
+}
+
+clear_service_rotate_inflight() {
+    rm -f "$(service_rotate_inflight_file "$1")"
+}
+
+service_rotate_inflight() {
+    local F
+    F=$(service_rotate_inflight_file "$1")
+    if [ ! -f "$F" ]; then
+        return 1
+    fi
+    if [ -n "$(find "$F" -mmin +1 2>/dev/null)" ]; then
+        rm -f "$F"
+        return 1
+    fi
+    return 0
+}
+
+_finish_service_rotate() {
+    local SID="$1"
+    local OLD="$2"
+    local NEW="$3"
+    promote_service_dataplane "$SID" "$NEW" "$OLD" || true
+    clear_service_rotate_inflight "$SID"
+    publish_rotate_result_line "OK id=${SID} to=${NEW}"
+    printf 'OK id=%s to=%s\n' "$SID" "$NEW"
+    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+        echo "==> rotate svc${SID}: 旧 inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
+        # No /dev/null: recovery logs stay on this process's stdout.
+        request_instance_recovery "$OLD" "force_rotate" || true
+    fi
+}
+
 # Prints: OK id=S to=N | ERR no_candidate | ERR in_progress | ERR bad_id
+# ROTATE_ASYNC=1 returns after the spare is claimed so another service can
+# claim the next spare while this one is still in set server / iptables.
 request_service_rotate() {
     local SID="$1"
     local OLD NEW
@@ -2657,7 +2734,18 @@ request_service_rotate() {
         printf 'ERR bad_id\n'
         return 1
     fi
+    if service_rotate_inflight "$SID"; then
+        publish_rotate_result_line 'ERR in_progress'
+        printf 'ERR in_progress\n'
+        return 1
+    fi
     if ! acquire_rotate_lock; then
+        publish_rotate_result_line 'ERR in_progress'
+        printf 'ERR in_progress\n'
+        return 1
+    fi
+    if service_rotate_inflight "$SID"; then
+        release_rotate_lock || true
         publish_rotate_result_line 'ERR in_progress'
         printf 'ERR in_progress\n'
         return 1
@@ -2672,30 +2760,25 @@ request_service_rotate() {
         return 1
     fi
 
-    if ! promote_service_instance "$SID" "$NEW"; then
+    if ! promote_service_assignment "$SID" "$NEW"; then
         release_rotate_lock || true
         publish_rotate_result_line 'ERR no_candidate'
         printf 'ERR no_candidate\n'
         return 1
     fi
 
-    # Stamp draining before unlock so the next rotate cannot re-pick this inst
-    # while detach / HAProxy fan-out is still in the background.
+    # Stamp draining before unlock so the next rotate cannot re-pick this inst.
     if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         set_instance_status "$OLD" draining
     fi
-
+    mark_service_rotate_inflight "$SID"
     release_rotate_lock || true
-    publish_rotate_result_line "OK id=${SID} to=${NEW}"
-    printf 'OK id=%s to=%s\n' "$SID" "$NEW"
 
-    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
-        echo "==> rotate svc${SID}: 旧 inst${OLD} → force_rotate 下线重连（后台 worker）" >&2
-        # Returns after spawning. Detach's per-backend socat must not block the
-        # next rotate. No /dev/null: the child keeps the worker's stdout.
-        request_instance_recovery "$OLD" "force_rotate" || true
+    if [ "${ROTATE_ASYNC:-0}" = 1 ]; then
+        _finish_service_rotate "$SID" "$OLD" "$NEW" &
+        return 0
     fi
-    return 0
+    _finish_service_rotate "$SID" "$OLD" "$NEW"
 }
 
 request_primary_rotate() {
@@ -2904,13 +2987,13 @@ admin_cmd_drain_rotates() {
         esac
         RES="${REQ%.req}.res"
         rm -f "$RES"
-        # Do NOT redirect this call: recovery inherits fds, and /dev/null
-        # silences 下线重连 logs. HTTP stays thin via the per-request res file.
         ADMIN_ROTATE_RES_FILE=$RES
+        # Claim is serial and takes one spare. Dataplane overlaps, so another
+        # service can rotate while this set server / iptables is still running.
+        # Do not treat a missing res as failure here: the async finisher writes it.
+        ROTATE_ASYNC=1
         request_service_rotate "$SID" || true
-        if [ ! -s "$RES" ]; then
-            publish_rotate_result_line 'ERR rotate_failed'
-        fi
+        unset ROTATE_ASYNC
         rm -f "$REQ"
         unset ADMIN_ROTATE_RES_FILE
     done

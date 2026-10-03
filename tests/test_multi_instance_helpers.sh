@@ -1712,6 +1712,7 @@ test_admin_rotate_queue_keeps_next_request() {
     command mkdir -p "$Q"
     LOG="$INSTANCE_STATE_DIR/order"
     : > "$LOG"
+    eval "$(declare -f request_service_rotate | sed '1s/^request_service_rotate/_saved_request_service_rotate/')"
     request_service_rotate() {
         echo "$1" >> "$LOG"
         publish_rotate_result_line "OK id=$1 to=9"
@@ -1737,6 +1738,8 @@ test_admin_rotate_queue_keeps_next_request() {
         exit 1
     fi
     unset -f request_service_rotate mkdir 2>/dev/null || true
+    eval "$(declare -f _saved_request_service_rotate | sed '1s/^_saved_request_service_rotate/request_service_rotate/')"
+    unset -f _saved_request_service_rotate
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -1771,6 +1774,65 @@ test_promote_sets_only_the_rotated_service() {
 
     unset -f start_instance_socks is_instance_recovering haproxy_set_server_state \
         record_instance_offline_since clear_instance_online_since mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+    unset PROXY_PORTS
+}
+
+test_async_rotates_overlap_across_services() {
+    local SAVED="$INSTANCE_STATE_DIR" LOG OUT
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/overlap.log"
+    : > "$LOG"
+    PROXY_PORTS='1080,1081'
+    WARP_INSTANCE_COUNT=4
+    set_service_assigned_instance 1 1
+    set_service_assigned_instance 2 2
+    set_instance_status 1 up
+    set_instance_status 2 up
+    set_instance_status 3 up
+    set_instance_status 4 up
+    printf '10\n' > "$(get_instance_last_healthy_file 1)"
+    printf '20\n' > "$(get_instance_last_healthy_file 2)"
+    printf '100\n' > "$(get_instance_last_healthy_file 3)"
+    printf '90\n' > "$(get_instance_last_healthy_file 4)"
+    start_instance_socks() { :; }
+    request_instance_recovery() { echo "rec:$1" >> "$LOG"; }
+    haproxy_set_server_state() {
+        echo "enter:$3" >> "$LOG"
+        sleep 0.3
+        echo "leave:$3" >> "$LOG"
+        return 0
+    }
+
+    ROTATE_ASYNC=1
+    ADMIN_ROTATE_RES_FILE="$INSTANCE_STATE_DIR/svc1.res"
+    request_service_rotate 1 >/dev/null 2>&1 || true
+    OUT=$(request_service_rotate 1 2>/dev/null || true)
+    assert_eq "$OUT" 'ERR in_progress' 'same service stays exclusive while dataplane runs'
+    ADMIN_ROTATE_RES_FILE="$INSTANCE_STATE_DIR/svc2.res"
+    request_service_rotate 2 >/dev/null 2>&1 || true
+    wait || true
+    unset ROTATE_ASYNC
+    unset ADMIN_ROTATE_RES_FILE
+
+    assert_eq "$(get_service_assigned_instance 1)" '3' 'svc1 took the freshest spare'
+    assert_eq "$(get_service_assigned_instance 2)" '4' 'svc2 took the next spare while svc1 was still switching'
+    assert_eq "$(tr -d '\n' < "$INSTANCE_STATE_DIR/svc1.res")" 'OK id=1 to=3' 'svc1 result'
+    assert_eq "$(tr -d '\n' < "$INSTANCE_STATE_DIR/svc2.res")" 'OK id=2 to=4' 'svc2 result'
+    awk '
+        /^enter:2$/ { if (!seen2) seen2 = NR }
+        /^leave:1$/ { if (!left1) left1 = NR }
+        END { exit !(seen2 && left1 && seen2 < left1) }
+    ' "$LOG" || {
+        echo 'svc2 dataplane did not overlap svc1' >&2
+        cat "$LOG" >&2
+        exit 1
+    }
+
+    unset -f start_instance_socks request_instance_recovery haproxy_set_server_state mkdir 2>/dev/null || true
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -1828,6 +1890,7 @@ test_status_json_lists_services
 test_admin_rotate_req_carries_service_id
 test_admin_rotate_queue_keeps_next_request
 test_promote_sets_only_the_rotated_service
+test_async_rotates_overlap_across_services
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
 test_admin_hmac_timestamp_window
