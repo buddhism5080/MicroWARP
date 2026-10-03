@@ -1231,10 +1231,46 @@ test_log_mode_simple_hides_repeat_summary() {
     rm -f "$STATE"
 }
 
+test_lb_show_stat_failed_is_not_a_command_error() {
+    local SAVED SOCK OUT
+    SAVED="$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    SOCK="$INSTANCE_STATE_DIR/haproxy.sock"
+    python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1])' "$SOCK"
+    HAPROXY_SOCK=$SOCK
+    socat() {
+        IFS= read -r line
+        case "$line" in
+            *missing*) printf '%s\n' 'No such server.' ;;
+            *) printf '%s\n' 'pxname,svname,check_status' 'warp_pool,inst1,FAILED' ;;
+        esac
+    }
+    OUT=$(haproxy_runtime_query "show stat") || {
+        echo 'show stat with FAILED must still succeed' >&2
+        exit 1
+    }
+    if ! printf '%s\n' "$OUT" | grep -q 'FAILED'; then
+        echo 'show stat body was dropped' >&2
+        exit 1
+    fi
+    if haproxy_runtime_cmd "set server warp_pool/inst9 state missing"; then
+        echo 'No such server must still fail' >&2
+        exit 1
+    fi
+    unset -f socat
+    unset HAPROXY_SOCK
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
 test_lb_today_admin_udp_and_health() {
     local SAVED LOG RULES
     if grep -q 'socat -T2' entrypoint.sh; then
         echo 'socat -T2 must not be used for the admin socket' >&2
+        exit 1
+    fi
+    if grep -q 'haproxy_cli_read_until_prompt' entrypoint.sh; then
+        echo 'admin socket must not keep a prompt session' >&2
         exit 1
     fi
     if ! grep -q 'downinter 1s' entrypoint.sh; then
@@ -1355,6 +1391,7 @@ test_wg_handshake_live_window() {
     fi
 }
 
+test_lb_show_stat_failed_is_not_a_command_error
 test_parse_haproxy_scur_and_conn
 test_wg_handshake_live_window
 test_socks_listen_sees_tcp6

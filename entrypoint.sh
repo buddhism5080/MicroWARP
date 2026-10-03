@@ -1337,143 +1337,10 @@ release_mkdir_lock() {
     fi
 }
 
-# One HAProxy admin session for the whole process. Interactive mode (prompt)
-# keeps the socket open. A command is done when the next "> " prompt arrives,
-# not when the connection closes and not after an idle timeout.
-haproxy_cli_in() { printf '%s/haproxy.cli.in\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_out() { printf '%s/haproxy.cli.out\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_pid_file() { printf '%s/haproxy.cli.pid\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_socat_pid_file() { printf '%s/haproxy.cli.socat\n' "$INSTANCE_STATE_DIR"; }
-haproxy_cli_ready_file() { printf '%s/haproxy.cli.ready\n' "$INSTANCE_STATE_DIR"; }
-
-haproxy_cli_bridge() {
-    local SOCK="$1"
-    local IN OUT SP
-    IN=$(haproxy_cli_in)
-    OUT=$(haproxy_cli_out)
-    rm -f "$IN" "$OUT"
-    mkfifo "$IN" "$OUT"
-    # Hold both ends so a client closing its fifo fd does not EOF socat.
-    exec 3<>"$IN"
-    exec 4<>"$OUT"
-    printf '1\n' > "$(haproxy_cli_ready_file)"
-    socat "UNIX-CONNECT:${SOCK}" - <&3 >&4 &
-    SP=$!
-    printf '%s\n' "$SP" > "$(haproxy_cli_socat_pid_file)"
-    wait "$SP" || true
-    rm -f "$(haproxy_cli_ready_file)" "$(haproxy_cli_socat_pid_file)"
-}
-
-haproxy_cli_stop() {
-    local PID SP
-    PID=""
-    SP=""
-    if [ -f "$(haproxy_cli_pid_file)" ]; then
-        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
-    fi
-    if [ -f "$(haproxy_cli_socat_pid_file)" ]; then
-        SP=$(tr -d ' \n\r\t' < "$(haproxy_cli_socat_pid_file)" 2>/dev/null || true)
-    fi
-    if is_live_pid "$SP"; then
-        kill "$SP" 2>/dev/null || true
-    fi
-    if is_live_pid "$PID"; then
-        kill "$PID" 2>/dev/null || true
-    fi
-    rm -f "$(haproxy_cli_pid_file)" "$(haproxy_cli_socat_pid_file)" "$(haproxy_cli_ready_file)"
-}
-
-haproxy_cli_alive() {
-    local PID
-    PID=""
-    if [ -f "$(haproxy_cli_pid_file)" ]; then
-        PID=$(tr -d ' \n\r\t' < "$(haproxy_cli_pid_file)" 2>/dev/null || true)
-    fi
-    is_live_pid "$PID" && [ -p "$(haproxy_cli_in)" ] && [ -p "$(haproxy_cli_out)" ]
-}
-
-haproxy_cli_read_until_prompt() {
-    local CHUNK BUF TAIL
-    HAPROXY_CLI_TEXT=""
-    BUF=""
-    exec 8< "$(haproxy_cli_out)" || return 1
-    while true; do
-        # Trailing x keeps a newline read by dd from being eaten by $( ).
-        CHUNK=$(dd bs=1 count=1 <&8 2>/dev/null || true; printf x)
-        CHUNK=${CHUNK%x}
-        if [ -z "$CHUNK" ]; then
-            exec 8<&-
-            return 1
-        fi
-        BUF="${BUF}${CHUNK}"
-        TAIL=${BUF##*
-}
-        case "$TAIL" in
-            '> '|*'> ')
-                HAPROXY_CLI_TEXT=${BUF%"$TAIL"}
-                exec 8<&-
-                return 0
-                ;;
-        esac
-    done
-}
-
-# Open the session if needed. `prompt` is sent once; a second one would close it.
-haproxy_cli_session() {
-    local SOCK PID I
-    SOCK=$(get_haproxy_sock)
-    if [ ! -S "$SOCK" ]; then
-        return 1
-    fi
-    if ! haproxy_cli_alive; then
-        haproxy_cli_stop
-        haproxy_cli_bridge "$SOCK" &
-        PID=$!
-        printf '%s\n' "$PID" > "$(haproxy_cli_pid_file)"
-        I=0
-        while [ ! -f "$(haproxy_cli_ready_file)" ]; do
-            I=$((I + 1))
-            if [ "$I" -gt 100 ]; then
-                return 1
-            fi
-            if ! is_live_pid "$PID"; then
-                return 1
-            fi
-            sleep 0.01
-        done
-        printf 'prompt\n' > "$(haproxy_cli_in)" || return 1
-        haproxy_cli_read_until_prompt || return 1
-    fi
-    return 0
-}
-
-
-# One command on the long-lived admin session. Reply is in HAPROXY_CLI_TEXT.
-# Does not treat the word "failed" as an error (show stat CSV contains it).
-haproxy_cli_exchange() {
-    local CMD="$1"
-    local LOCK="${INSTANCE_STATE_DIR}/haproxy.cli.lock.d"
-    HAPROXY_CLI_TEXT=""
-    if ! acquire_mkdir_lock "$LOCK"; then
-        return 1
-    fi
-    if ! haproxy_cli_session; then
-        release_mkdir_lock "$LOCK" || true
-        return 1
-    fi
-    if ! printf '%s\n' "$CMD" > "$(haproxy_cli_in)"; then
-        release_mkdir_lock "$LOCK" || true
-        return 1
-    fi
-    if ! haproxy_cli_read_until_prompt; then
-        release_mkdir_lock "$LOCK" || true
-        haproxy_cli_stop
-        return 1
-    fi
-    release_mkdir_lock "$LOCK" || true
-    return 0
-}
-
+# One connection per command. Write the line and close the write side.
+# HAProxy answers and closes. The read ends on that close, not on an idle
+# timer and not on a prompt. show stat CSV may contain FAILED; that is not
+# a command error. Connections are independent, so they do not queue.
 # Send one CLI command to the master stats socket. No reload.
 # Returns 0 if the socket accepts the command (HAProxy replies).
 haproxy_runtime_cmd() {
@@ -1500,10 +1367,8 @@ haproxy_runtime_query() {
     fi
 
     if command -v socat >/dev/null 2>&1; then
-        if ! haproxy_cli_exchange "$CMD"; then
-            return 1
-        fi
-        OUT=$HAPROXY_CLI_TEXT
+        # stdin EOF shuts the write side. Read until HAProxy closes. No idle timeout.
+        OUT=$(printf '%s\n' "$CMD" | socat STDIO "UNIX-CONNECT:${SOCK}" 2>/dev/null) || return 1
         case "$OUT" in
             *'Unknown command'*|*'No such server'*|*'No such backend'*)
                 return 1
@@ -1518,18 +1383,15 @@ haproxy_runtime_query() {
 import socket, sys
 sock_path, cmd = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(2)
 s.connect(sock_path)
 s.sendall((cmd + "\n").encode())
+s.shutdown(socket.SHUT_WR)
 data = b""
-try:
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-except Exception:
-    pass
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
 s.close()
 text = data.decode(errors="replace")
 if "Unknown command" in text or "No such server" in text or "No such backend" in text:
@@ -1607,7 +1469,10 @@ haproxy_set_server_state() {
                 haproxy_runtime_cmd "enable health warp_pool/inst${INST_ID}" || true
                 # state ready does not clear a failed check. The check waits 15s.
                 if instance_socks_listening "$INST_ID"; then
-                    haproxy_runtime_cmd "set server warp_pool/inst${INST_ID} health up" || true
+                    if ! haproxy_runtime_cmd "set server warp_pool/inst${INST_ID} health up"; then
+                        echo "==> [inst${INST_ID}] [WARN] HAProxy health up 失败"
+                        return 1
+                    fi
                 fi
                 ;;
         esac
