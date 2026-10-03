@@ -1808,7 +1808,7 @@ test_async_rotates_overlap_across_services() {
     request_instance_recovery() { echo "rec:$1" >> "$LOG"; }
     haproxy_set_server_state() {
         echo "enter:$3" >> "$LOG"
-        sleep 0.3
+        sleep 1
         echo "leave:$3" >> "$LOG"
         return 0
     }
@@ -1928,6 +1928,94 @@ test_lock_respects_live_pid_not_age() {
     fi
 
     unset -f _rebuild_instance_udp_forward_unlocked mkdir 2>/dev/null || true
+    mkdir() { return 0; }
+    rm -rf "$INSTANCE_STATE_DIR"
+    INSTANCE_STATE_DIR="$SAVED"
+}
+
+test_udp_forward_touches_only_the_changed_rule() {
+    local SAVED LOG RULES OLD_PREFIX
+    SAVED="$INSTANCE_STATE_DIR"
+    OLD_PREFIX="${INSTANCE_SUBNET_PREFIX-}"
+    INSTANCE_STATE_DIR=$(mktemp -d)
+    mkdir() { command mkdir "$@"; }
+    LOG="$INSTANCE_STATE_DIR/ipt.log"
+    RULES="$INSTANCE_STATE_DIR/rules"
+    INSTANCE_SUBNET_PREFIX=10.66
+    iptables() {
+        printf '%s\n' "$*" >> "$LOG"
+        if [ "$1" = "-t" ] && [ "$3" = "-S" ]; then
+            cat "$RULES"
+        fi
+        return 0
+    }
+    eval "$(declare -f ensure_udp_nat_chain | sed '1s/^ensure_udp_nat_chain/_saved_ensure_udp_nat_chain/')"
+    ensure_udp_nat_chain() { return 0; }
+    eval "$(declare -f is_instance_socks_running | sed '1s/^is_instance_socks_running/_saved_is_instance_socks_running/')"
+    eval "$(declare -f get_instance_public_udp_port | sed '1s/^get_instance_public_udp_port/_saved_get_instance_public_udp_port/')"
+    is_instance_socks_running() { return 0; }
+    get_instance_public_udp_port() { printf '%s\n' "$UDP_PUBLIC"; }
+
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1081 -j DNAT --to-destination 10.66.2.2:1081' > "$RULES"
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1082 -j DNAT --to-destination 10.66.4.2:1082' >> "$RULES"
+    : > "$LOG"
+    UDP_PUBLIC=""
+    _sync_instance_udp_forward_unlocked 9
+    if grep -q -- '-F' "$LOG" || grep -q -- '-A MW_UDP' "$LOG" || grep -q -- '-D MW_UDP' "$LOG"; then
+        echo 'unassigned spare rewrote iptables' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+
+    : > "$LOG"
+    UDP_PUBLIC=1081
+    _sync_instance_udp_forward_unlocked 3
+    if grep -q -- '-F' "$LOG"; then
+        echo 'assigned sync flushed MW_UDP' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    if grep -q '1082' "$LOG"; then
+        echo 'sync touched another service port' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    grep -q -- '-D MW_UDP -p udp -m udp --dport 1081 -j DNAT --to-destination 10.66.2.2:1081' "$LOG"
+    grep -q -- '-A MW_UDP -p udp -m udp --dport 1081 -j DNAT --to-destination 10.66.3.2:1081' "$LOG"
+
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1081 -j DNAT --to-destination 10.66.3.2:1081' > "$RULES"
+    : > "$LOG"
+    _sync_instance_udp_forward_unlocked 3
+    if grep -Eq -- '-A MW_UDP|-D MW_UDP|-F ' "$LOG"; then
+        echo 'unchanged rule was rewritten' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+
+    is_instance_socks_running() { return 1; }
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1080 -j DNAT --to-destination 10.66.9.2:1080' > "$RULES"
+    printf '%s\n' '-A MW_UDP -p udp -m udp --dport 1082 -j DNAT --to-destination 10.66.4.2:1082' >> "$RULES"
+    : > "$LOG"
+    _sync_instance_udp_forward_unlocked 9
+    grep -q -- '-D MW_UDP -p udp -m udp --dport 1080 -j DNAT --to-destination 10.66.9.2:1080' "$LOG"
+    if grep -q '1082' "$LOG" || grep -q -- '-A MW_UDP' "$LOG" || grep -q -- '-F' "$LOG"; then
+        echo 'offline instance changed another rule or flushed' >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+
+    unset -f iptables ensure_udp_nat_chain 2>/dev/null || true
+    eval "$(declare -f _saved_ensure_udp_nat_chain | sed '1s/^_saved_ensure_udp_nat_chain/ensure_udp_nat_chain/')"
+    unset -f _saved_ensure_udp_nat_chain
+    eval "$(declare -f _saved_is_instance_socks_running | sed '1s/^_saved_is_instance_socks_running/is_instance_socks_running/')"
+    eval "$(declare -f _saved_get_instance_public_udp_port | sed '1s/^_saved_get_instance_public_udp_port/get_instance_public_udp_port/')"
+    unset -f _saved_is_instance_socks_running _saved_get_instance_public_udp_port
+    unset UDP_PUBLIC
+    if [ -n "$OLD_PREFIX" ]; then
+        INSTANCE_SUBNET_PREFIX=$OLD_PREFIX
+    else
+        unset INSTANCE_SUBNET_PREFIX
+    fi
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED"
@@ -2061,6 +2149,7 @@ test_admin_rotate_queue_keeps_next_request
 test_promote_sets_only_the_rotated_service
 test_async_rotates_overlap_across_services
 test_lock_respects_live_pid_not_age
+test_udp_forward_touches_only_the_changed_rule
 test_haproxy_cli_reuses_one_session
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch

@@ -482,22 +482,26 @@ release_mkdir_lock() {
     fi
 }
 
-rebuild_instance_udp_forward() {
+with_udp_forward_lock() {
     local LOCK I
     LOCK="${INSTANCE_STATE_DIR}/udp-forward.lock.d"
     I=0
     while ! acquire_mkdir_lock "$LOCK"; do
-        # Held by a live rebuild. Wait. Never delete that directory: two
-        # iptables -F MW_UDP at once drop or duplicate DNAT rules.
+        # Held by a live update. Wait. Never delete that directory.
         I=$((I + 1))
         if [ "$I" -gt 600 ]; then
-            echo "==> [WARN] UDP forward lock still held after 30s; skip this rebuild" >&2
+            echo "==> [WARN] UDP forward lock still held after 30s; skip this update" >&2
             return 0
         fi
         sleep 0.05
     done
-    _rebuild_instance_udp_forward_unlocked || true
+    "$@" || true
     release_mkdir_lock "$LOCK"
+}
+
+# Full flush. Process start only — a rotate must not use this.
+rebuild_instance_udp_forward() {
+    with_udp_forward_lock _rebuild_instance_udp_forward_unlocked
 }
 
 _rebuild_instance_udp_forward_unlocked() {
@@ -511,8 +515,64 @@ _rebuild_instance_udp_forward_unlocked() {
             ''|*[!0-9]*) continue ;;
         esac
         NS_IP=$(get_instance_ns_ip "$_iid")
-        iptables -t nat -A MW_UDP -p udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
+        iptables -t nat -A MW_UDP -p udp -m udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
     done
+}
+
+# One instance. Unassigned standby (no public port) deletes nothing of
+# anyone else and adds nothing. Taking a service replaces that dport only.
+sync_instance_udp_forward() {
+    with_udp_forward_lock _sync_instance_udp_forward_unlocked "$1"
+}
+
+_sync_instance_udp_forward_unlocked() {
+    local INST_ID="$1"
+    local PORT NS_IP SNAP LINE REST DROP HAVE SPEC
+    NS_IP=$(get_instance_ns_ip "$INST_ID")
+    PORT=""
+    if is_instance_socks_running "$INST_ID"; then
+        PORT=$(get_instance_public_udp_port "$INST_ID")
+    fi
+    case "$PORT" in
+        ''|*[!0-9]*) PORT="" ;;
+    esac
+    ensure_udp_nat_chain
+    if [ -n "$PORT" ]; then
+        SPEC="-A MW_UDP -p udp -m udp --dport ${PORT} -j DNAT --to-destination ${NS_IP}:${PORT}"
+    else
+        SPEC=""
+    fi
+    SNAP=$(mktemp)
+    iptables -t nat -S MW_UDP > "$SNAP" 2>/dev/null || true
+    HAVE=0
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        case "$LINE" in
+            "-A MW_UDP "*) ;;
+            *) continue ;;
+        esac
+        if [ -n "$SPEC" ] && [ "$LINE" = "$SPEC" ]; then
+            HAVE=1
+            continue
+        fi
+        DROP=0
+        case "$LINE" in
+            *"--to-destination ${NS_IP}:"*) DROP=1 ;;
+        esac
+        if [ -n "$PORT" ]; then
+            case "$LINE" in
+                *"--dport ${PORT} "*) DROP=1 ;;
+            esac
+        fi
+        if [ "$DROP" -eq 1 ]; then
+            REST=${LINE#-A MW_UDP }
+            # shellcheck disable=SC2086
+            iptables -t nat -D MW_UDP $REST 2>/dev/null || true
+        fi
+    done < "$SNAP"
+    rm -f "$SNAP"
+    if [ -n "$PORT" ] && [ "$HAVE" -eq 0 ]; then
+        iptables -t nat -A MW_UDP -p udp -m udp --dport "$PORT" -j DNAT --to-destination "${NS_IP}:${PORT}" 2>/dev/null || true
+    fi
 }
 
 count_busy_udp_sockets() {
@@ -3528,6 +3588,8 @@ enable_host_forwarding() {
         || iptables -t nat -A POSTROUTING -s "${INSTANCE_SUBNET_PREFIX}.0.0/16" -j MASQUERADE 2>/dev/null \
         || true
     ensure_udp_nat_chain
+    # Stale DNAT from a previous process only. Rotate never flushes this chain.
+    iptables -t nat -F MW_UDP 2>/dev/null || true
 }
 
 destroy_instance_netns() {
@@ -3813,7 +3875,7 @@ stop_instance_socks() {
         rm -f "$PID_FILE"
     fi
     rm -f "$(get_instance_udp_port_file "$INST_ID")" "$(get_instance_socks_conf_path "$INST_ID")"
-    rebuild_instance_udp_forward
+    sync_instance_udp_forward "$INST_ID"
 }
 
 start_instance_socks() {
@@ -3834,7 +3896,7 @@ start_instance_socks() {
                 CUR=$(tr -d '\n' < "$(get_instance_udp_port_file "$INST_ID")")
             fi
             if [ "$CUR" = "$UDP_PORT" ]; then
-                rebuild_instance_udp_forward
+                sync_instance_udp_forward "$INST_ID"
                 return 0
             fi
             echo "==> [inst${INST_ID}] SOCKS UDP 端口 ${CUR:-?} → ${UDP_PORT}，重启 hev"
@@ -3856,7 +3918,7 @@ start_instance_socks() {
     ip netns exec "$NS_NAME" "$BIN" "$CONF" > "$LOG" 2>&1 &
     echo $! > "$PID_FILE"
     printf '%s\n' "$UDP_PORT" > "$(get_instance_udp_port_file "$INST_ID")"
-    rebuild_instance_udp_forward
+    sync_instance_udp_forward "$INST_ID"
 }
 
 ns_ensure_trace_ip() {
