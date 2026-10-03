@@ -2136,6 +2136,21 @@ test_ready_forces_health_up_when_socks_listens() {
     INSTANCE_STATE_DIR="$SAVED"
 }
 
+test_socks_listen_sees_tcp6() {
+    if ! printf '%s\n' '   0: 0000000000000000FFFF0000021E420A:0438 00000000000000000000000000000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'ipv6 listen on 1080 must count' >&2
+        exit 1
+    fi
+    if ! printf '%s\n' '   0: 021E420A:0438 00000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'ipv4 listen on 1080 must count' >&2
+        exit 1
+    fi
+    if printf '%s\n' '   0: 0100007F:0050 00000000:0000 0A 00000000:00000000' | socks_tcp_table_has_listen; then
+        echo 'port 80 must not count as 1080' >&2
+        exit 1
+    fi
+}
+
 test_wg_handshake_live_window() {
     local NOW=1700000000 EPOCH
     EPOCH=$(printf '%s\n' $'abc\t1699999900' | wg_handshake_epoch_from_text)
@@ -2212,6 +2227,7 @@ test_lock_respects_live_pid_not_age
 test_udp_forward_touches_only_the_changed_rule
 test_haproxy_cli_reuses_one_session
 test_ready_forces_health_up_when_socks_listens
+test_socks_listen_sees_tcp6
 test_wg_handshake_live_window
 test_recovery_worker_has_no_socks_only_shortcut
 test_probe_disables_max_conn_on_this_branch
