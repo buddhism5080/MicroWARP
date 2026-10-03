@@ -3886,12 +3886,12 @@ instance_wg_has_handshake() {
     wg_handshake_is_live "$EPOCH" "$NOW"
 }
 
-# Initial handshake is immediate when the endpoint answers. Do not treat
-# "wg-quick up returned" as connected.
+# Handshake is one UDP round trip. A working path finishes in well under a second.
+# 1s is only the cap when nobody answers; a live handshake returns immediately.
 wait_instance_wg_handshake() {
     local INST_ID="$1"
     local I=0
-    while [ "$I" -lt 25 ]; do
+    while [ "$I" -lt 5 ]; do
         if instance_wg_has_handshake "$INST_ID"; then
             return 0
         fi
