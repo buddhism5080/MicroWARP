@@ -771,11 +771,30 @@ wait_instance_drain() {
     done
 }
 
-# After runtime drain: wait for idle (or timeout), then stop internal SOCKS.
-# Servers stay in HAProxy config permanently; admin state goes to maint until revive.
+# After runtime drain: make HAProxy close any stream still on this server,
+# then stop internal SOCKS. scur+qcur==0 is only the counter. The client
+# gets FIN/RST when HAProxy shuts the session down. Do that before hev or
+# the netns disappears, or the close never leaves this host.
+# $2: max_conn|force|force_rotate — path still works, wait for the transfer
+# to finish, then close anything left. Anything else (health fail, no conf)
+# closes first: the egress is already unusable, and waiting leaves the
+# client hung until its own timeout.
 drain_and_stop_instance_socks() {
     local INST_ID="$1"
-    wait_instance_drain "$INST_ID" || true
+    local REASON="${2:-}"
+
+    case "$REASON" in
+        max_conn|force_rotate|force)
+            wait_instance_drain "$INST_ID" || true
+            ;;
+        *)
+            haproxy_shutdown_server_sessions "$INST_ID" || true
+            wait_instance_drain "$INST_ID" || true
+            ;;
+    esac
+    # Race: a stream can still be attached after the idle read. Close it
+    # before the backend socket is gone.
+    haproxy_shutdown_server_sessions "$INST_ID" || true
     stop_instance_socks "$INST_ID"
     set_instance_status "$INST_ID" "down"
     # maint: no new traffic + stop health-checks while we restart WARP/SOCKS (no reload).
@@ -1479,6 +1498,24 @@ haproxy_set_server_state() {
         return 0
     fi
     echo "==> [inst${INST_ID}] [WARN] HAProxy runtime state ${STATE} 失败（socket 不可用或命令被拒）"
+    return 1
+}
+
+# Close every stream HAProxy still has on this server. The client socket
+# is on the host, so FIN/RST goes out even when the instance path is dead.
+# No stats socket (boot, before HAProxy is up) means there is nothing to close.
+haproxy_shutdown_server_sessions() {
+    local INST_ID="$1"
+    local SOCK
+    SOCK=$(get_haproxy_sock)
+    if [ ! -S "$SOCK" ]; then
+        return 0
+    fi
+    if haproxy_runtime_cmd "shutdown sessions server warp_pool/inst${INST_ID}"; then
+        echo "==> [inst${INST_ID}] 拆掉已有连接"
+        return 0
+    fi
+    echo "==> [inst${INST_ID}] [WARN] 拆连接失败"
     return 1
 }
 
@@ -2556,6 +2593,8 @@ destroy_instance_netns() {
     HOST_VETH=$(get_instance_host_veth "$INST_ID")
     WG_NAME=$(get_instance_wg_name "$INST_ID")
 
+    # Client FIN/RST has to leave before the veth is deleted.
+    haproxy_shutdown_server_sessions "$INST_ID" || true
     stop_instance_socks "$INST_ID"
 
     ip netns exec "$NS_NAME" wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
@@ -3257,9 +3296,10 @@ instance_recovery_worker() {
     esac
     print_health_summary
 
-    # Parent already set HAProxy drain. Wait until scur=0 (or drain timeout), then
-    # stop internal SOCKS before we touch the tunnel / re-register.
-    drain_and_stop_instance_socks "$INST_ID"
+    # Parent already set HAProxy drain. Health-fail closes client sessions
+    # first; max_conn waits until idle. Either way, shutdown sessions runs
+    # again before SOCKS stops. Then the tunnel / re-register.
+    drain_and_stop_instance_socks "$INST_ID" "$REASON"
     echo "==> [inst${INST_ID}] 复活进度: 排空结束，SOCKS 已停 → 开始 WG 重连/重注册"
 
     while true; do
@@ -3379,8 +3419,9 @@ request_instance_recovery() {
         return 0
     fi
 
-    # 1) Drain immediately so HAProxy stops NEW picks. Existing TCP stay.
-    # 2) Worker waits until show stat scur=0 (or INSTANCE_DRAIN_TIMEOUT), then stop SOCKS.
+    # 1) Drain immediately so HAProxy stops NEW picks.
+    # 2) Worker closes remaining client sessions (health-fail now, max_conn
+    #    after idle), then stops SOCKS. scur==0 alone is not the close.
     detach_instance_from_lb "$INST_ID"
 
     _pid_file=$(get_instance_recover_pid_file "$INST_ID")

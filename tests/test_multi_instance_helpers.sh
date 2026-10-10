@@ -985,6 +985,7 @@ test_instance_drain_helpers() {
     clear_instance_online_since() { echo "clear_online" >> "$ORDER_LOG"; }
     reload_haproxy_from_status() { echo "reload" >> "$ORDER_LOG"; }
     haproxy_set_server_state() { echo "state:$2" >> "$ORDER_LOG"; return 0; }
+    haproxy_shutdown_server_sessions() { echo "shutdown" >> "$ORDER_LOG"; return 0; }
     wait_instance_drain() { echo "drain_wait" >> "$ORDER_LOG"; return 0; }
     stop_instance_socks() { echo "stop_socks" >> "$ORDER_LOG"; }
 
@@ -1001,23 +1002,28 @@ test_instance_drain_helpers() {
         exit 1
     fi
 
-    # drain_and_stop (real): wait + stop socks + maint (no reload)
+    # drain_and_stop default = health-fail: close, then wait, then close again before stop.
     : > "$ORDER_LOG"
     get_instance_status() { printf 'draining\n'; }
     drain_and_stop_instance_socks 7
     out=$(tr '\n' ' ' < "$ORDER_LOG")
-    assert_contains "$out" 'drain_wait' 'background helper waits drain'
-    assert_contains "$out" 'stop_socks' 'background helper stops socks'
-    assert_contains "$out" 'status:down' 'status down while restarting'
-    assert_contains "$out" 'state:maint' 'runtime maint while restarting'
+    assert_eq "$out" 'shutdown drain_wait shutdown stop_socks status:down state:maint ' \
+        'health-fail closes sessions before wait and again before stop'
     if [[ "$out" == *reload* ]]; then
         echo "drain_and_stop must not reload haproxy: $out" >&2
         exit 1
     fi
 
+    # max_conn: do not cut a live transfer. Close only after the idle wait, still before stop.
+    : > "$ORDER_LOG"
+    drain_and_stop_instance_socks 7 max_conn
+    out=$(tr '\n' ' ' < "$ORDER_LOG")
+    assert_eq "$out" 'drain_wait shutdown stop_socks status:down state:maint ' \
+        'max_conn waits, then closes anything left before stop'
+
     unset -f set_instance_status record_instance_offline_since clear_instance_online_since \
         reload_haproxy_from_status wait_instance_drain stop_instance_socks \
-        get_instance_status haproxy_set_server_state 2>/dev/null || true
+        get_instance_status haproxy_set_server_state haproxy_shutdown_server_sessions 2>/dev/null || true
     rm -rf "$INSTANCE_STATE_DIR"
     INSTANCE_STATE_DIR="$SAVED_STATE_DIR"
     INSTANCE_DRAIN_TIMEOUT=30
