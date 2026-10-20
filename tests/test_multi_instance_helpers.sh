@@ -141,20 +141,6 @@ test_haproxy_config_with_no_healthy_backends_still_binds() {
     assert_contains "$cfg" 'backend warp_pool' 'backend section remains'
 }
 
-test_stagger_skips_after_last_instance() {
-    local calls=0
-    sleep() {
-        calls=$((calls + 1))
-    }
-
-    INSTANCE_START_STAGGER_SECONDS=1
-    stagger_next_instance_start 3 3
-    assert_eq "$calls" '0' 'last instance should not sleep'
-
-    stagger_next_instance_start 2 3
-    assert_eq "$calls" '1' 'non-last instance should sleep once'
-}
-
 test_health_check_stagger_is_interval_div_count() {
     TEST_URLS_CHECK_INTERVAL=900
     assert_eq "$(get_health_check_stagger_seconds 3)" '300' '900/3 should be 300'
@@ -421,20 +407,6 @@ test_reload_uses_soft_path_when_pidfile_live() {
         with_dir_lock haproxy_try_soft_reload haproxy_cold_start record_socks_online_started_at mkdir 2>/dev/null || true
     mkdir() { return 0; }
     rm -rf "$INSTANCE_STATE_DIR"
-}
-
-test_stagger_skips_after_last_instance() {
-    local calls=0
-    sleep() {
-        calls=$((calls + 1))
-    }
-
-    INSTANCE_START_STAGGER_SECONDS=1
-    stagger_next_instance_start 3 3
-    assert_eq "$calls" '0' 'last instance should not sleep'
-
-    stagger_next_instance_start 2 3
-    assert_eq "$calls" '1' 'non-last instance should sleep once'
 }
 
 test_health_check_stagger_is_interval_div_count() {
@@ -1426,7 +1398,6 @@ test_haproxy_config_only_includes_healthy_servers
 test_haproxy_config_with_no_healthy_backends_still_binds
 test_refresh_haproxy_pid_prefers_live_pidfile_over_stale_shell
 test_reload_uses_soft_path_when_pidfile_live
-test_stagger_skips_after_last_instance
 test_health_check_stagger_is_interval_div_count
 test_config_stale_offline_threshold
 test_max_conn_duration_helpers

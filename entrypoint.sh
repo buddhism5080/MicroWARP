@@ -27,7 +27,6 @@ HAPROXY_SOCK="/var/run/microwarp/haproxy.sock"
 INSTANCE_STATE_DIR="/var/run/microwarp"
 MAX_WARP_INSTANCES=100
 INSTANCE_SUBNET_PREFIX="10.66"
-INSTANCE_START_STAGGER_SECONDS=1
 # If an instance stays offline this long, treat its WARP conf as stale and force re-register.
 # Default 7200s = 2 hours. Set 0 to disable.
 CONFIG_STALE_OFFLINE_SECONDS="${CONFIG_STALE_OFFLINE_SECONDS:-7200}"
@@ -3457,22 +3456,10 @@ ensure_instance_ready() {
     return 1
 }
 
-stagger_next_instance_start() {
-    CURRENT_ID=$1
-    TOTAL_COUNT=$2
-
-    # No delay after the last instance.
-    [ "$CURRENT_ID" -lt "$TOTAL_COUNT" ] || return 0
-    [ "$INSTANCE_START_STAGGER_SECONDS" -gt 0 ] 2>/dev/null || return 0
-
-    echo "==> 启动错峰：inst${CURRENT_ID} 完成，等待 ${INSTANCE_START_STAGGER_SECONDS}s 后再启动下一个实例"
-    sleep "$INSTANCE_START_STAGGER_SECONDS"
-}
-
 bootstrap_multi_instances() {
     enable_host_forwarding
     mkdir -p "$INSTANCE_STATE_DIR" /etc/wireguard/instances
-    echo "==> 多实例串行启动（实例间错开 ${INSTANCE_START_STAGGER_SECONDS}s，避免并发注册/建隧）"
+    echo "==> 多实例串行启动"
     echo "==> 首个实例就绪后即开放服务并开始测活；配置失败的实例进入后台串行重试队列"
 
     # Open frontend immediately (may have zero backends). Clients get refuse/reset
@@ -3515,7 +3502,6 @@ bootstrap_multi_instances() {
                 echo "==> [inst${_bid}] 启动期配置获取失败（不退出容器），加入后台串行重试队列"
                 enqueue_instance_config_retry "$_bid"
                 reload_haproxy_from_status
-                stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
                 continue
             fi
         fi
@@ -3523,7 +3509,6 @@ bootstrap_multi_instances() {
         if [ "$_config_ok" -ne 1 ]; then
             enqueue_instance_config_retry "$_bid"
             reload_haproxy_from_status
-            stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
             continue
         fi
 
@@ -3532,7 +3517,6 @@ bootstrap_multi_instances() {
             echo "==> [inst${_bid}] WireGuard 未握手，跳过健康监测，交给后台重连"
             request_instance_recovery "$_bid"
             reload_haproxy_from_status
-            stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
             continue
         fi
 
@@ -3541,7 +3525,6 @@ bootstrap_multi_instances() {
         ensure_instance_ready "$_bid" 1 || true
         reload_haproxy_from_status
 
-        stagger_next_instance_start "$_bid" "$WARP_INSTANCE_COUNT"
     done
 
     HEALTHY=$(count_healthy_instances)
